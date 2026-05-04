@@ -86,6 +86,18 @@ class WorkflowContext:
     workflow_inputs: dict[str, Any] = field(default_factory=dict)
     """Inputs provided at workflow start."""
 
+    workflow_dir: str = ""
+    """Directory containing the workflow YAML file (resolved absolute path).
+    Available in templates as ``{{ workflow.dir }}``."""
+
+    workflow_file: str = ""
+    """Absolute path to the workflow YAML file.
+    Available in templates as ``{{ workflow.file }}``."""
+
+    workflow_name: str = ""
+    """Name of the workflow from the YAML config.
+    Available in templates as ``{{ workflow.name }}``."""
+
     agent_outputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     """Outputs from executed agents, keyed by agent name."""
 
@@ -176,6 +188,15 @@ class WorkflowContext:
         Raises:
             KeyError: If explicit mode is used and a required (non-optional) input is missing.
         """
+        # Build workflow metadata available in all modes
+        workflow_meta: dict[str, Any] = {}
+        if self.workflow_dir:
+            workflow_meta["dir"] = self.workflow_dir
+        if self.workflow_file:
+            workflow_meta["file"] = self.workflow_file
+        if self.workflow_name:
+            workflow_meta["name"] = self.workflow_name
+
         # For explicit mode, start with empty workflow inputs
         # For other modes, include all workflow inputs
         if mode == "explicit":
@@ -185,7 +206,7 @@ class WorkflowContext:
                 self.workflow_inputs.copy() if agent_type in _LOCAL_RENDER_AGENT_TYPES else {}
             )
             ctx: dict[str, Any] = {
-                "workflow": {"input": initial_workflow_inputs},
+                "workflow": {"input": initial_workflow_inputs, **workflow_meta},
                 "context": {
                     "iteration": self.current_iteration,
                     "history": self.execution_history.copy(),
@@ -196,7 +217,7 @@ class WorkflowContext:
                 self._add_explicit_input(ctx, input_ref)
         else:
             ctx = {
-                "workflow": {"input": self.workflow_inputs.copy()},
+                "workflow": {"input": self.workflow_inputs.copy(), **workflow_meta},
                 "context": {
                     "iteration": self.current_iteration,
                     "history": self.execution_history.copy(),
