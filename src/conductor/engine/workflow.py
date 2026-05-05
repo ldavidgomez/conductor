@@ -287,6 +287,7 @@ class WorkflowEngine:
         _subworkflow_depth: int = 0,
         run_context: RunContext | None = None,
         _dashboard_context_path: list[str] | None = None,
+        instructions_preamble: str | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -323,6 +324,10 @@ class WorkflowEngine:
                 ``subworkflow_path`` on outgoing events so the dashboard can
                 route per-context state under concurrency. Callers should not
                 set this directly.
+            instructions_preamble: Optional workspace instructions text to prepend
+                to every agent's rendered prompt. Built from auto-discovered
+                workspace files, YAML ``instructions`` field, and/or CLI
+                ``--instructions`` flags. Inherited by sub-workflows.
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -357,10 +362,17 @@ class WorkflowEngine:
         self._registry = registry
         self._single_provider = provider
 
+        # Workspace instructions preamble (inherited by sub-workflows)
+        self._instructions_preamble = instructions_preamble
+
         # For backward compatibility, create a default executor with single provider
         # This is used when registry is None
         if provider is not None:
-            self.executor = AgentExecutor(provider, workflow_tools=config.tools)
+            self.executor = AgentExecutor(
+                provider,
+                workflow_tools=config.tools,
+                instructions_preamble=self._instructions_preamble,
+            )
             self.provider = provider  # Keep for backward compatibility
         else:
             # Create a placeholder - will be created per-agent when using registry
@@ -557,7 +569,11 @@ class WorkflowEngine:
         if self._registry is not None:
             # Multi-provider mode: get provider from registry
             provider = await self._registry.get_provider(agent)
-            return AgentExecutor(provider, workflow_tools=self.config.tools)
+            return AgentExecutor(
+                provider,
+                workflow_tools=self.config.tools,
+                instructions_preamble=self._instructions_preamble,
+            )
         elif self.executor is not None:
             # Single provider mode (backward compatibility)
             return self.executor
@@ -704,6 +720,28 @@ class WorkflowEngine:
         # Build sub-workflow inputs from the parent context
         sub_inputs = self._build_subworkflow_inputs(agent, context)
 
+        # Merge instructions preamble: parent preamble + sub-workflow's own instructions.
+        # Uses inner (unwrapped) content to avoid nested <workspace_instructions> tags,
+        # then wraps once at the outermost layer.
+        child_preamble = self._instructions_preamble
+        if sub_config.workflow.instructions:
+            from conductor.config.instructions import (
+                _unwrap_preamble,
+                _wrap_preamble,
+                build_inner_instructions,
+            )
+
+            sub_inner = build_inner_instructions(
+                yaml_instructions=sub_config.workflow.instructions,
+            )
+            if sub_inner:
+                if child_preamble:
+                    # Parent preamble is already wrapped — unwrap, merge, re-wrap
+                    parent_inner = _unwrap_preamble(child_preamble)
+                    child_preamble = _wrap_preamble(parent_inner + "\n\n---\n\n" + sub_inner)
+                else:
+                    child_preamble = _wrap_preamble(sub_inner)
+
         # Create child engine inheriting provider/registry but with deeper depth
         child_engine = WorkflowEngine(
             config=sub_config,
@@ -720,6 +758,7 @@ class WorkflowEngine:
                 *self._dashboard_context_path,
                 slot_key or agent.name,
             ],
+            instructions_preamble=child_preamble,
         )
 
         return await child_engine.run(sub_inputs)
@@ -811,6 +850,27 @@ class WorkflowEngine:
                 *dashboard_path,
                 slot_key or agent.name,
             ]
+
+        # Merge instructions preamble: parent preamble + sub-workflow's own instructions
+        child_preamble = self._instructions_preamble
+        if sub_config.workflow.instructions:
+            from conductor.config.instructions import (
+                _unwrap_preamble,
+                _wrap_preamble,
+                build_inner_instructions,
+            )
+
+            sub_inner = build_inner_instructions(
+                yaml_instructions=sub_config.workflow.instructions,
+            )
+            if sub_inner:
+                if child_preamble:
+                    parent_inner = _unwrap_preamble(child_preamble)
+                    child_preamble = _wrap_preamble(parent_inner + "\n\n---\n\n" + sub_inner)
+                else:
+                    child_preamble = _wrap_preamble(sub_inner)
+        child_engine_kwargs["instructions_preamble"] = child_preamble
+
         child_engine = WorkflowEngine(**child_engine_kwargs)
 
         output = await child_engine.run(sub_inputs)
@@ -1005,6 +1065,7 @@ class WorkflowEngine:
             inputs=self.context.workflow_inputs,
             copilot_session_ids=copilot_session_ids,
             system_metadata=self._system_metadata,
+            instructions_preamble=self._instructions_preamble,
         )
         self._last_checkpoint_path = checkpoint_path
         if checkpoint_path is not None:
