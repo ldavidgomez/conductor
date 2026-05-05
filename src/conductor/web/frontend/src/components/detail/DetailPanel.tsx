@@ -6,7 +6,6 @@ import { AgentDetail } from './AgentDetail';
 import { ScriptDetail } from './ScriptDetail';
 import { GateDetail } from './GateDetail';
 import { GroupDetail } from './GroupDetail';
-import { DialogDetail } from './DialogDetail';
 import { DialogEngagementPrompt } from './DialogEngagementPrompt';
 import { SubworkflowDetail } from './SubworkflowDetail';
 import { cn } from '@/lib/utils';
