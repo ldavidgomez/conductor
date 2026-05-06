@@ -443,6 +443,47 @@ class TimeoutError(ExecutionError):
         super().__init__(message, suggestion, file_path, line_number)
 
 
+class AgentTimeoutError(TimeoutError):
+    """Raised when an individual agent exceeds its per-agent timeout_seconds limit.
+
+    This is distinct from the workflow-level TimeoutError. An AgentTimeoutError
+    is raised when an agent's ``timeout_seconds`` configuration causes a hard
+    cancellation via ``asyncio.wait_for()``.
+
+    The timed-out agent name is available via ``current_agent`` (inherited
+    from ``TimeoutError``) and ``agent_name`` (inherited from
+    ``ExecutionError``). Both are set to the same value for consistency
+    with consumers that check either attribute.
+    """
+
+    def __init__(
+        self,
+        *,
+        agent_name: str,
+        elapsed_seconds: float,
+        timeout_seconds: float,
+    ) -> None:
+        """Initialize an AgentTimeoutError.
+
+        Args:
+            agent_name: Name of the agent that timed out.
+            elapsed_seconds: The time elapsed before the timeout.
+            timeout_seconds: The configured per-agent timeout limit.
+        """
+        message = f"Agent '{agent_name}' exceeded its timeout ({timeout_seconds}s)"
+        suggestion = f"Increase timeout_seconds for agent '{agent_name}' or optimize its execution"
+        super().__init__(
+            message,
+            elapsed_seconds=elapsed_seconds,
+            timeout_seconds=timeout_seconds,
+            current_agent=agent_name,
+            suggestion=suggestion,
+        )
+        # ExecutionError.__init__ defaults agent_name to None — set it here
+        # so both .agent_name and .current_agent resolve to the same value.
+        self.agent_name = agent_name
+
+
 class HumanGateError(ExecutionError):
     """Raised when a human gate encounters an error.
 
