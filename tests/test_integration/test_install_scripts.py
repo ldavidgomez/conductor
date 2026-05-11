@@ -24,6 +24,7 @@ import time
 import pytest
 
 from .install_scripts_helpers import (
+    INSTALL_PS1,
     IS_WINDOWS,
     InstallResult,
     Sandbox,
@@ -43,7 +44,7 @@ pytestmark = pytest.mark.install_scripts
 
 def _assert_install_ok(result: InstallResult, version: str) -> None:
     assert result.returncode == 0, f"install script failed:\n{result.combined}"
-    # The script prints "✓ Verified: conductor v0.0.2 …" or similar; tolerate
+    # The script prints "[OK] Verified: conductor v0.0.2 ..." or similar; tolerate
     # cases where post-install verify fell back to a warning.
     assert "Conductor" in (result.stdout + result.stderr) or "conductor" in (
         result.stdout + result.stderr
@@ -76,6 +77,30 @@ def _kill(proc: subprocess.Popen) -> None:
         proc.wait(timeout=10)
     except Exception:
         pass
+
+
+def _run_pwsh(script: str) -> subprocess.CompletedProcess[str]:
+    """Run a PowerShell snippet via ``powershell.exe -Command`` (Windows-only).
+
+    Sets the standard non-interactive flags so the snippet can't pop a prompt
+    or load a profile. Returns the completed process; callers do their own
+    assertion on returncode/stdout/stderr.
+    """
+    return subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -203,3 +228,100 @@ def test_running_process_auto_stop_kills_and_continues(sandbox: Sandbox, wheels:
 
     _assert_install_ok(result, "0.0.2")
     assert get_installed_version(sandbox) == "0.0.2", result.combined
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="PowerShell required to test irm | iex parse path")
+def test_install_ps1_parses_via_iex_pipeline() -> None:
+    """``install.ps1`` must parse cleanly when delivered via ``irm | iex``.
+
+    The README install command is::
+
+        irm https://aka.ms/conductor/install.ps1 | iex
+
+    ``Invoke-RestMethod`` returns the body as a single string. If the file
+    starts with a UTF-8 BOM (``EF BB BF``), the BOM survives as ``U+FEFF``
+    at index 0 and PowerShell's in-memory parser (``Invoke-Expression`` /
+    ``[ScriptBlock]::Create``) chokes on the first real token after the
+    comment header, producing::
+
+        Unexpected attribute 'CmdletBinding'.
+
+    The existing tests in this module all use ``powershell.exe -File
+    install.ps1``, which uses PowerShell's file loader. The file loader
+    detects the BOM as an encoding sniff and *strips* it from the string
+    before parsing.  ``Invoke-RestMethod``, by contrast, decodes the HTTP
+    body without that special handling, so the U+FEFF survives as a
+    literal character that ``iex`` / ``[ScriptBlock]::Create`` then sees
+    at offset 0.  This test mirrors the ``irm`` path exactly by reading
+    the raw bytes with ``ReadAllBytes`` and decoding via
+    ``Encoding.UTF8.GetString`` (which preserves the BOM in the returned
+    string), then handing the result to ``[ScriptBlock]::Create``, which
+    is what ``Invoke-Expression`` uses internally to parse its input.
+    It does **not** execute the script, so it's safe and fast.
+
+    DO NOT swap ``ReadAllBytes`` + ``UTF8.GetString`` for ``ReadAllText``:
+    the one-arg ``ReadAllText`` overload constructs a ``StreamReader`` with
+    ``detectEncodingFromByteOrderMarks: true``, which silently *consumes*
+    the BOM. That would make this test a tautology and miss the regression.
+    """
+    # Build the PowerShell snippet via a Python f-string, embedding the
+    # script path inside a PowerShell single-quoted string. Escape any ``'``
+    # in the path per PowerShell single-quoted-string rules (a single
+    # quote is doubled) so paths containing one don't break the snippet.
+    escaped_path = str(INSTALL_PS1).replace("'", "''")
+    ps_script = (
+        "$ErrorActionPreference = 'Stop'; "
+        # ReadAllBytes + UTF8.GetString preserves a leading BOM as U+FEFF
+        # in the resulting string, exactly as Invoke-RestMethod would.
+        # See the docstring above -- do NOT replace this with ReadAllText.
+        f"$bytes = [System.IO.File]::ReadAllBytes('{escaped_path}'); "
+        "$content = [System.Text.Encoding]::UTF8.GetString($bytes); "
+        "try { "
+        "  [void][ScriptBlock]::Create($content); "
+        "  Write-Output 'PARSE_OK' "
+        "} catch { "
+        '  Write-Error "PARSE_FAIL: $_"; '
+        "  exit 1 "
+        "}"
+    )
+    proc = _run_pwsh(ps_script)
+    assert proc.returncode == 0 and "PARSE_OK" in proc.stdout, (
+        "install.ps1 failed to parse via the `irm | iex` code path "
+        "(`[ScriptBlock]::Create`). This usually means the file has a "
+        "leading UTF-8 BOM (EF BB BF) that breaks `irm <url> | iex`. "
+        f"\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="PowerShell required to test the test")
+def test_iex_pipeline_test_actually_catches_bom_regression() -> None:
+    """Test-the-test: prepending a UTF-8 BOM must make the parse path fail.
+
+    This proves the harness in :func:`test_install_ps1_parses_via_iex_pipeline`
+    actually catches a regressed BOM.  We read the (BOM-free) install script,
+    prepend a BOM byte sequence in PowerShell, and assert that
+    ``[ScriptBlock]::Create`` rejects the result.  If this test ever starts
+    passing without raising, the parse-path test above has rotted into a
+    tautology and must be re-checked.
+    """
+    escaped_path = str(INSTALL_PS1).replace("'", "''")
+    ps_script = (
+        "$ErrorActionPreference = 'Stop'; "
+        f"$bytes = [System.IO.File]::ReadAllBytes('{escaped_path}'); "
+        "$content = [System.Text.Encoding]::UTF8.GetString($bytes); "
+        # Prepend a literal U+FEFF, simulating a BOM that survived `irm`.
+        "$withBom = [char]0xFEFF + $content; "
+        "try { "
+        "  [void][ScriptBlock]::Create($withBom); "
+        "  Write-Output 'UNEXPECTED_PASS' "
+        "} catch { "
+        "  Write-Output 'EXPECTED_FAIL' "
+        "}"
+    )
+    proc = _run_pwsh(ps_script)
+    assert "EXPECTED_FAIL" in proc.stdout, (
+        "Expected `[ScriptBlock]::Create` to reject install.ps1 when a BOM "
+        "is prepended, but it did not. The parse-path test in this file is "
+        "no longer protecting against the issue #175 regression. "
+        f"\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
