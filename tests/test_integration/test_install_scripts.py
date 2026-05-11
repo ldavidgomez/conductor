@@ -18,8 +18,12 @@ parity sanity check.
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
+import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -51,32 +55,71 @@ def _assert_install_ok(result: InstallResult, version: str) -> None:
     )
 
 
-def _spawn_long_running_conductor(sandbox: Sandbox) -> subprocess.Popen:
-    """Spawn a long-running process inside the sandbox venv that locks files.
+_SHIM_SOURCE = Path(__file__).parent / "_uv_shim.py"
 
-    Importing ``conductor`` loads the package and its DLLs, so the venv's
-    ``python.exe`` plus its loaded ``python3xx.dll`` are locked for the
-    lifetime of the process — exactly the scenario that fails in production.
 
-    Uses ``-I`` (isolated mode) so the source tree at the repo cwd is not
-    accidentally picked up over the installed package.
+def _install_uv_shim(sandbox: Sandbox) -> dict[str, str]:
+    """Install a ``uv`` shim that fakes a lock-error on the first install.
+
+    Returns an ``extra_env`` mapping that callers should merge into the
+    ``install.ps1`` invocation's environment. The mapping prepends the
+    shim's directory to ``PATH`` (so PowerShell's bare-``uv`` resolution
+    finds ``uv.bat`` first), captures the real ``uv`` path for the shim
+    to defer to, and points the shim at a per-sandbox state file.
+
+    The shim itself lives in ``_uv_shim.py`` next to this file; see that
+    module's docstring for behavior. The shim intercepts only the first
+    ``uv tool install --force`` call and forwards every other ``uv``
+    invocation to the real binary.
+
+    Why this approach (Option B from issue #174): no synthetic Win32 file
+    handle can simultaneously trigger ``Test-LockError`` AND let
+    ``Move-ConductorToolDirAside`` succeed against modern uv on Windows.
+    Without ``FILE_SHARE_DELETE``, NTFS blocks the parent-directory
+    rename; with it, Rust ≥ 1.66's POSIX-semantics unlinks bypass the
+    lock entirely. See PR #177 for the full investigation. The shim
+    trades fidelity-to-real-Windows-locks for a deterministic test of
+    install.ps1's control flow — which is the actually load-bearing
+    invariant the test should protect.
     """
-    code = "import conductor; import time; time.sleep(120)"
-    return subprocess.Popen(
-        [str(sandbox.python_exe), "-I", "-c", code],
-        env=sandbox.env(),
-        cwd=str(sandbox.root),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    real_uv = shutil.which("uv")
+    if not real_uv:
+        raise RuntimeError("could not locate `uv` on PATH for shim setup")
+
+    shim_dir = sandbox.root / "uv-shim"
+    shim_dir.mkdir()
+    shim_py = shim_dir / "_uv_shim.py"
+    shutil.copy(_SHIM_SOURCE, shim_py)
+
+    # uv.bat: PowerShell's bare-command resolution finds .bat via PATHEXT.
+    # Use the test runner's sys.executable (absolute path) so the shim
+    # works regardless of what's on PATH inside install.ps1's env.
+    (shim_dir / "uv.bat").write_text(
+        f'@echo off\r\n"{sys.executable}" "{shim_py}" %*\r\n',
+        encoding="utf-8",
     )
+
+    return {
+        "PATH": str(shim_dir) + os.pathsep + os.environ.get("PATH", ""),
+        "CONDUCTOR_TEST_REAL_UV": real_uv,
+        "CONDUCTOR_TEST_SHIM_STATE": str(shim_dir / "state"),
+    }
 
 
 def _kill(proc: subprocess.Popen) -> None:
+    """Best-effort kill + reap. Surfaces leaks to stderr instead of swallowing."""
     try:
         proc.kill()
+    except OSError as exc:
+        print(f"WARNING: kill(pid={proc.pid}) failed: {exc!r}", file=sys.stderr)
+    try:
         proc.wait(timeout=10)
-    except Exception:
-        pass
+    except subprocess.TimeoutExpired:
+        print(
+            f"WARNING: subprocess pid={proc.pid} did not exit within 10s after kill; "
+            f"may leak a file handle into pytest tmp_path teardown",
+            file=sys.stderr,
+        )
 
 
 def _run_pwsh(script: str) -> subprocess.CompletedProcess[str]:
@@ -150,36 +193,56 @@ def test_upgrade_clears_stale_old_files(sandbox: Sandbox, wheels: WheelPair) -> 
     assert not stale.exists(), f"stale .old file survived install:\n{result.combined}"
 
 
-@pytest.mark.skipif(not IS_WINDOWS, reason="file-lock fallback is Windows-specific")
+@pytest.mark.skipif(not IS_WINDOWS, reason="install.ps1 rename-fallback is Windows-specific")
 def test_upgrade_with_running_process_uses_rename_fallback(
     sandbox: Sandbox, wheels: WheelPair
 ) -> None:
-    """Upgrade while a venv-internal process holds file locks.
+    """Verify the install.ps1 rename-fallback control flow end-to-end.
 
-    Spawns a child Python from the seeded venv that imports ``conductor`` and
-    sleeps. This locks ``python.exe`` and ``python3xx.dll`` inside the
-    sandbox's ``Scripts`` dir — exactly the situation that breaks
-    ``conductor update`` in production. Must succeed via the rename-fallback.
+    Installs a ``uv`` shim (see ``_install_uv_shim``) that intercepts the
+    first ``uv tool install --force`` call and returns a canned lock-error
+    matching ``Test-LockError``'s needles. ``install.ps1`` must then:
 
-    Uses ``-Force`` to skip the running-process safety check (the running
-    process is intentional for this test) so the script actually attempts
-    the install.
+    1. Detect the lock error and log ``"Install blocked by a file lock"``.
+    2. Call ``Move-ConductorToolDirAside`` and log
+       ``"Moved existing install to <path>"`` once the rename succeeds.
+    3. Retry ``uv tool install --force`` — which now hits the real ``uv``
+       (the shim only fakes attempt #1) and installs into a fresh
+       ``conductor-cli`` directory.
+    4. Report success and verify the new version responds.
+
+    All three assertions below are load-bearing — see issue #174 for what
+    happens when they're missing (the test passes whenever ``uv tool
+    install --force`` happens to succeed on the first attempt, silently
+    masking regressions in ``Test-LockError`` or
+    ``Move-ConductorToolDirAside``).
+
+    Uses ``-Force`` to skip the running-process safety check; the shim
+    deliberately produces only the lock-error diagnostic and isn't a
+    ``conductor.exe`` process so wouldn't trip that check anyway.
     """
     seed_install(sandbox, wheels.old)
-    proc = _spawn_long_running_conductor(sandbox)
-    try:
-        # Give it time to fully load the DLLs
-        time.sleep(2.0)
-        result = run_install_script(sandbox, source=wheels.new, force=True)
-    finally:
-        _kill(proc)
+
+    result = run_install_script(
+        sandbox, source=wheels.new, force=True, extra_env=_install_uv_shim(sandbox)
+    )
 
     _assert_install_ok(result, "0.0.2")
-    # After fallback, the freshly installed conductor should report 0.0.2.
-    # Note: the running child process still holds the OLD venv (now renamed
-    # aside), but a fresh invocation hits the new venv.
     version = get_installed_version(sandbox)
     assert version == "0.0.2", f"expected 0.0.2, got {version!r}\n{result.combined}"
+
+    # Load-bearing assertions for issue #174 — these prove the fallback
+    # ran end-to-end. Without them, this test would pass even if
+    # Test-LockError or Move-ConductorToolDirAside silently regressed.
+    assert "Install blocked by a file lock" in result.combined, (
+        "rename-fallback did not trigger; install.ps1 didn't recognize the "
+        "shim's canned lock-error as a lock-shaped failure. Did "
+        f"Test-LockError's needle list change?\n{result.combined}"
+    )
+    assert "Moved existing install to" in result.combined, (
+        "Move-ConductorToolDirAside did not log the renamed-aside path; "
+        f"the rename either failed or the success log was removed:\n{result.combined}"
+    )
 
 
 def test_running_process_auto_stop_kills_and_continues(sandbox: Sandbox, wheels: WheelPair) -> None:
