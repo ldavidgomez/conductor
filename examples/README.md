@@ -152,6 +152,23 @@ conductor run examples/context-tier.yaml \
 
 See [Context Tier](../docs/configuration.md#context-tier) for details. This is a Copilot-only capability.
 
+## Output Validation
+
+### validator.yaml
+
+A code-review workflow that demonstrates the `validator:` block — a second LLM call that grades an agent's output against a rubric and re-runs the agent once with feedback when it fails. Demonstrates:
+- A `validator.criteria` rubric checking for a real bug, actionable suggestions, and no fabricated names
+- Optional `validator.model` (defaults to the primary agent's model)
+- `max_retries: 1` (hard cap; `0` validates-and-reports without re-running)
+- Validator cost appears as a separate `code_reviewer (validator)` usage row
+
+```bash
+conductor run examples/validator.yaml
+conductor run examples/validator.yaml --input diff="$(git diff HEAD~1)"
+```
+
+See [Validator](../docs/workflow-syntax.md#validator) for the full field reference and behavior notes.
+
 ## Multi-Agent Workflows
 
 ### research-assistant.yaml
