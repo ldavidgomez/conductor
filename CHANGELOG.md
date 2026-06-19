@@ -278,6 +278,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#225](https://github.com/microsoft/conductor/pull/225),
   [#136](https://github.com/microsoft/conductor/issues/136)).
 
+### Added
+- New `output_mode` field on `AgentDef` (`raw` | `envelope`). Setting
+  `output_mode: raw` bypasses JSON schema injection and parse-recovery entirely,
+  wrapping the model's response as `{"result": "<text>"}`. Useful for agents
+  that produce large Markdown, prose, or code output that should not be
+  JSON-extracted. `output_mode: raw` is incompatible with `output:` — declaring
+  both raises a `ValidationError` at config load time.
+- New `max_parse_recovery_attempts` field on `RetryPolicy` (YAML `retry:`
+  block, per-agent or workflow-level). Overrides the provider default (Copilot:
+  5, Claude: 2) for agents that need tighter or looser in-session parse-recovery
+  budgets. Accepts integer 0–10; `0` disables all recovery attempts and lets
+  the first parse failure propagate immediately. Threaded through both the
+  Copilot and Claude providers.
+- New `POST /api/gate-respond` and `GET /api/gate-status` HTTP API endpoints
+  on the web dashboard server. `GET /api/gate-status` returns whether a
+  `human_gate` agent is currently waiting, and which agent name it is.
+  `POST /api/gate-respond` resolves the parked gate by injecting a
+  `GateResponse` into the engine's queue. When the optional
+  `CONDUCTOR_GATE_TOKEN` secret is configured on the server, `POST
+  /api/gate-respond` requires an `Authorization: Bearer <token>` header
+  matching it (compared in constant time) — requests with a missing or
+  mismatched token are rejected with HTTP 403. `GET /api/gate-status` is
+  unauthenticated. The matching WebSocket `gate_response` path enforces the
+  same token and waiting-state checks so it cannot be used to bypass auth.
+- New `conductor gate-respond` CLI command for resolving a parked human gate
+  from the command line without opening a browser. Accepts `--port`, `--choice`,
+  `--agent` (auto-discovered via `/api/gate-status` when omitted), `--input`,
+  and `--token` / `CONDUCTOR_GATE_TOKEN` env var. Designed for SSH or headless
+  environments where the web dashboard UI is unreachable.
+- `script` steps now resolve a bare command name (e.g. `python`) or an
+  extension-less path against the executable search path before launching, so
+  the binary the shell would pick is the one that runs (and a Windows path
+  missing its `.exe`/`.cmd` suffix resolves correctly). Resolution uses the
+  subprocess's own `PATH` — including any `env.PATH` override on the step — so
+  the resolved binary matches what the child process would execute. Relative
+  paths containing a separator are left untouched so they keep resolving against
+  `working_dir`, and an unresolvable command falls back to the rendered value so
+  the existing not-found error still fires.
+
+### Changed
+- **Breaking (Claude provider):** `ClaudeProvider._extract_text_content` now
+  returns `{"result": "<text>"}` instead of `{"text": "<text>"}`. This aligns
+  the Claude provider with the Copilot provider (cross-provider parity). Any
+  existing Claude workflow that references `{{ <agent>.output.text }}` must be
+  updated to `{{ <agent>.output.result }}`. Workflows that declare an `output:`
+  schema are unaffected (the schema fields take precedence). See the new
+  `output_mode: raw` feature if you need to consume unstructured text output
+  reliably across both providers.
+
 ### Fixed
 - `_verbose_console` is now silent-aware at the source: a `_SilentAwareConsole`
   subclass no-ops every `.print(...)` when `is_verbose()` is False, so the
@@ -291,6 +340,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bytes on stderr
   ([#223](https://github.com/microsoft/conductor/pull/223),
   closes [#209](https://github.com/microsoft/conductor/issues/209)).
+- Parse-exhaustion `ProviderError` (after all in-session recovery attempts
+  are spent) is now marked `is_retryable=False` in both Copilot and Claude
+  providers. Previously Copilot marked it `is_retryable=True`, causing the
+  outer retry loop to re-run the entire agent up to 3× on deterministic
+  parse failures — burning tokens with no chance of success.
+- Parse-exhaustion error messages now include the first 500 characters of the
+  model's response (up from 200) and suggest `output_mode: raw` as a fix.
 - `parse_json_output` and the Copilot provider's `_extract_json` now use a
   two-stage fenced-block extraction (non-greedy `re.findall` + per-candidate
   try-parse, then a greedy single-capture fallback) so JSON whose string

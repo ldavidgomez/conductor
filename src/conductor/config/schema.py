@@ -436,6 +436,18 @@ class RetryPolicy(BaseModel):
     they indicate prompt/schema issues, not transience.
     """
 
+    max_parse_recovery_attempts: int | None = Field(default=None, ge=0, le=10)
+    """Maximum in-session parse-recovery attempts before giving up.
+
+    When an agent's response fails JSON extraction, Conductor sends a correction
+    prompt in the same session. This field controls how many correction prompts
+    to send.
+
+    - ``None`` (default): Use the provider default (Copilot=5, Claude=2).
+    - ``0``: Disable parse recovery entirely (fail immediately on bad JSON).
+    - ``1-10``: Custom limit.
+    """
+
 
 class DialogConfig(BaseModel):
     """Configuration for agent dialog mode.
@@ -665,6 +677,23 @@ class AgentDef(BaseModel):
 
     output: dict[str, OutputField] | None = None
     """Expected output schema for validation."""
+
+    output_mode: Literal["raw", "envelope"] | None = None
+    """Controls how the provider handles this agent's response.
+
+    - ``raw``: The provider skips schema instruction injection and JSON
+      extraction entirely. The model's response is wrapped as
+      ``{"result": "<raw text>"}``. Incompatible with ``output:`` — if
+      both are set, validation raises an error.
+    - ``envelope``: Explicit opt-in to the default structured-output
+      pipeline. Equivalent to the current behavior when ``output:`` is
+      declared.
+    - ``None`` (default): Infer behavior from whether ``output:`` is
+      declared (backward compatible).
+
+    Only valid on provider-backed agents (type is ``None`` / omitted).
+    Script, human_gate, and workflow agents cannot set ``output_mode``.
+    """
 
     routes: list[RouteDef] = Field(default_factory=list)
     """Routing rules evaluated in order after execution."""
@@ -1079,6 +1108,8 @@ class AgentDef(BaseModel):
                 raise ValueError(
                     "human_gate agents cannot have 'output_type' (only 'set' agents do)"
                 )
+            if self.output_mode is not None:
+                raise ValueError("human_gate agents cannot have 'output_mode'")
         elif self.type == "script":
             if not self.command:
                 raise ValueError("script agents require 'command'")
@@ -1123,6 +1154,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'values' (only 'set' agents do)")
             if self.output_type is not None:
                 raise ValueError("script agents cannot have 'output_type' (only 'set' agents do)")
+            if self.output_mode is not None:
+                raise ValueError("script agents cannot have 'output_mode'")
         elif self.type == "workflow":
             if not self.workflow:
                 raise ValueError("workflow agents require 'workflow' path")
@@ -1158,6 +1191,8 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'values' (only 'set' agents do)")
             if self.output_type is not None:
                 raise ValueError("workflow agents cannot have 'output_type' (only 'set' agents do)")
+            if self.output_mode is not None:
+                raise ValueError("workflow agents cannot have 'output_mode'")
         elif self.type == "wait":
             if self.duration is None:
                 raise ValueError("wait agents require 'duration'")
@@ -1215,6 +1250,8 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'values' (only 'set' agents do)")
             if self.output_type is not None:
                 raise ValueError("wait agents cannot have 'output_type' (only 'set' agents do)")
+            if self.output_mode is not None:
+                raise ValueError("wait agents cannot have 'output_mode'")
             self._validate_wait_duration()
         elif self.type == "set":
             if (self.value is None) == (self.values is None):
@@ -1270,6 +1307,8 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'timeout_seconds'")
             if self.duration is not None:
                 raise ValueError("set agents cannot have 'duration' (only 'wait' agents do)")
+            if self.output_mode is not None:
+                raise ValueError("set agents cannot have 'output_mode'")
         elif self.type == "terminate":
             # Required fields
             if self.status is None:
@@ -1349,6 +1388,8 @@ class AgentDef(BaseModel):
                 )
             if self.duration is not None:
                 raise ValueError("terminate agents cannot have 'duration' (only 'wait' agents do)")
+            if self.output_mode is not None:
+                raise ValueError("terminate agents cannot have 'output_mode'")
         else:
             # Regular agent or human_gate — input_mapping is not valid
             if self.input_mapping is not None:
@@ -1396,7 +1437,26 @@ class AgentDef(BaseModel):
                     f"'{self.type or 'agent'}' agents cannot have 'reason' "
                     "(only 'terminate' and 'wait' agents support this field)"
                 )
+        if self.output_mode == "raw" and self.output:
+            raise ValueError(
+                "output_mode 'raw' is incompatible with output schema; "
+                "remove the output: block or use output_mode: envelope"
+            )
         return self
+
+    def effective_output_schema(self) -> dict[str, OutputField] | None:
+        """Return the structured-output schema providers should enforce, or None.
+
+        Centralizes the rule shared by every provider: an agent has an
+        effective output schema only when ``output:`` is a non-empty mapping
+        *and* ``output_mode`` is not ``raw``. An empty ``output: {}`` is
+        treated as "no schema" so all providers agree (Copilot previously
+        used a truthiness check while Claude used an ``is not None`` check,
+        diverging on the empty-dict case).
+        """
+        if self.output and self.output_mode != "raw":
+            return self.output
+        return None
 
     def _validate_wait_duration(self) -> None:
         """Validate ``duration`` for a ``wait`` agent.

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -138,6 +140,23 @@ class ScriptExecutor:
         base_env = {**os.environ, "PYTHONUTF8": "1"}
         env = {**base_env, **agent.env} if agent.env else base_env
 
+        # Resolve bare command names and absolute paths against PATH so that a
+        # bare name (e.g. "python") finds the executable the shell would, and a
+        # path missing an extension resolves correctly. Resolution uses the
+        # subprocess's own ``PATH`` (``env`` may override it via ``agent.env``),
+        # so the resolved binary matches the one the child would have executed.
+        # Relative paths containing a separator are left untouched so they keep
+        # resolving against ``working_dir``. Resolution is non-destructive: when
+        # ``which`` cannot resolve the command we fall back to the rendered value
+        # and let the FileNotFoundError handler below produce a clear error.
+        has_separator = os.sep in rendered_command or (
+            os.altsep is not None and os.altsep in rendered_command
+        )
+        if os.path.isabs(rendered_command) or not has_separator:
+            rendered_command = (
+                shutil.which(rendered_command, path=env.get("PATH")) or rendered_command
+            )
+
         _verbose_log(f"  Script: {rendered_command} {' '.join(rendered_args)}")
         if stdin_payload is not None:
             _verbose_log(f"  Script stdin: {len(stdin_payload)} bytes")
@@ -154,10 +173,17 @@ class ScriptExecutor:
                 env=env,
             )
         except FileNotFoundError as exc:
+            hint = ""
+            if sys.platform == "win32":
+                hint = (
+                    " Hint: on Windows, include the file extension (e.g. .exe) "
+                    "or use an absolute path."
+                )
             raise ExecutionError(
-                f"Script '{agent.name}': command not found: '{rendered_command}'",
+                f"Script '{agent.name}': command not found: '{rendered_command}'"
+                f" (working_dir={rendered_working_dir or 'cwd'}){hint}",
                 agent_name=agent.name,
-                suggestion=f"Ensure '{rendered_command}' is installed and in PATH",
+                suggestion=f"Ensure '{rendered_command}' is installed and on PATH",
             ) from exc
         except OSError as e:
             raise ExecutionError(
