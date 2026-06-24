@@ -1747,3 +1747,127 @@ class TestContextTier:
         await provider.execute(agent=agent, context={}, rendered_prompt="Analyze")
         assert captured["create_session_kwargs"]["context_tier"] == "long_context"
         assert captured["create_session_kwargs"]["reasoning_effort"] == "high"
+
+
+class TestCopilotProviderResolvedModel:
+    """Tests for SDKResponse.resolved_model propagation into AgentOutput.model."""
+
+    # These are mocked tests; model availability in the live Copilot environment is not required.
+    # claude-sonnet-4 is used in pricing/usage tests as the canonical model and exists in the
+    # Conductor pricing table, so it satisfies both propagation and cost-calculation tests.
+    _RESOLVED_MODEL_FROM_SDK = "claude-sonnet-4"
+    _PRICEABLE_MODEL = "claude-sonnet-4"
+
+    class _FakeSession:
+        session_id = "session-fake"
+
+        async def disconnect(self) -> None:
+            return None
+
+    class _FakeClient:
+        async def create_session(self, **kwargs: Any) -> Any:
+            return TestCopilotProviderResolvedModel._FakeSession()
+
+    @pytest.mark.asyncio
+    async def test_resolved_model_from_sdk_overrides_auto(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SDKResponse.resolved_model propagates into AgentOutput.model for model='auto'."""
+        provider = CopilotProvider(retry_config=RetryConfig(max_attempts=1))
+        provider._client = self._FakeClient()
+        agent = AgentDef(name="a", model="auto", prompt="p")
+
+        async def fake_send(*args: Any, **kwargs: Any) -> SDKResponse:
+            return SDKResponse(
+                content='{"result":"ok"}', resolved_model=self._RESOLVED_MODEL_FROM_SDK
+            )
+
+        async def noop() -> None:
+            return None
+
+        monkeypatch.setattr(provider, "_ensure_client_started", noop)
+        monkeypatch.setattr(provider, "_send_and_wait", fake_send)
+
+        result = await provider.execute(agent=agent, context={}, rendered_prompt="p")
+        assert result.model == self._RESOLVED_MODEL_FROM_SDK
+
+    @pytest.mark.asyncio
+    async def test_resolved_model_fallback_when_absent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When resolved_model is None, AgentOutput.model falls back to agent.model."""
+        provider = CopilotProvider(retry_config=RetryConfig(max_attempts=1))
+        provider._client = self._FakeClient()
+        agent = AgentDef(name="a", model="auto", prompt="p")
+
+        async def fake_send(*args: Any, **kwargs: Any) -> SDKResponse:
+            return SDKResponse(content='{"result":"ok"}', resolved_model=None)
+
+        async def noop() -> None:
+            return None
+
+        monkeypatch.setattr(provider, "_ensure_client_started", noop)
+        monkeypatch.setattr(provider, "_send_and_wait", fake_send)
+
+        result = await provider.execute(agent=agent, context={}, rendered_prompt="p")
+        assert result.model == "auto"
+
+    def test_resolved_model_enables_cost_calculation(self) -> None:
+        """AgentOutput with a resolved priceable model produces non-null cost_usd."""
+        from conductor.engine.usage import UsageTracker
+        from conductor.providers.base import AgentOutput
+
+        tracker = UsageTracker()
+        output = AgentOutput(
+            content={},
+            raw_response="",
+            input_tokens=1000,
+            output_tokens=500,
+            model=self._PRICEABLE_MODEL,  # only needs to be in Conductor pricing table
+        )
+        usage = tracker.record("agent", output, elapsed=1.0)
+        assert usage.cost_usd is not None
+        assert usage.cost_usd > 0
+
+    @pytest.mark.asyncio
+    async def test_send_and_wait_captures_model_from_usage_event(self) -> None:
+        """_send_and_wait extracts event.data.model from assistant.usage into resolved_model."""
+        from unittest.mock import Mock as _Mock
+
+        provider = CopilotProvider(retry_config=RetryConfig(max_attempts=1))
+        captured_cb: list[Any] = []
+
+        # Build assistant.usage event with explicit token counts and model name.
+        usage_ev = _Mock()
+        usage_ev.type.value = "assistant.usage"
+        usage_ev.data.input_tokens = 100
+        usage_ev.data.output_tokens = 50
+        usage_ev.data.cache_read_tokens = None
+        usage_ev.data.cache_write_tokens = None
+        usage_ev.data.model = self._RESOLVED_MODEL_FROM_SDK
+
+        # session.idle tells _send_and_wait the turn is complete.
+        idle_ev = _Mock()
+        idle_ev.type.value = "session.idle"
+
+        def on_event(callback: Any) -> None:
+            captured_cb.append(callback)
+
+        session = _Mock()
+        session.on = on_event
+
+        async def fake_send(prompt: str) -> None:
+            assert captured_cb, "Expected _send_and_wait to register a session event callback"
+            callback = captured_cb[0]
+            for ev in (usage_ev, idle_ev):
+                callback(ev)
+
+        session.send = fake_send
+
+        result = await provider._send_and_wait(
+            session=session,
+            prompt="hello",
+            verbose_enabled=False,
+            full_enabled=False,
+        )
+        assert result.resolved_model == self._RESOLVED_MODEL_FROM_SDK

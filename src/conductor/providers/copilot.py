@@ -121,6 +121,8 @@ class SDKResponse:
         cache_read_tokens: Tokens read from cache (if available).
         cache_write_tokens: Tokens written to cache (if available).
         partial: Whether this response is partial (from a mid-agent interrupt).
+        resolved_model: Actual model name reported by the SDK in the assistant.usage
+            event. None if the event was not emitted (e.g., error paths).
     """
 
     content: str
@@ -129,6 +131,7 @@ class SDKResponse:
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
     partial: bool = False
+    resolved_model: str | None = None
 
 
 class CopilotProvider(AgentProvider):
@@ -574,7 +577,9 @@ class CopilotProvider(AgentProvider):
                     output_tokens=output_tokens,
                     cache_read_tokens=cache_read,
                     cache_write_tokens=cache_write,
-                    model=agent.model or self._default_model,
+                    model=(sdk_response.resolved_model if sdk_response else None)
+                    or agent.model
+                    or self._default_model,
                     partial=is_partial,
                 )
             except ProviderError as e:
@@ -888,6 +893,7 @@ class CopilotProvider(AgentProvider):
                         cache_read_tokens=sdk_response.cache_read_tokens,
                         cache_write_tokens=sdk_response.cache_write_tokens,
                         partial=True,
+                        resolved_model=sdk_response.resolved_model,
                     )
                     return partial_content, partial_usage
 
@@ -896,6 +902,7 @@ class CopilotProvider(AgentProvider):
                 total_output_tokens = sdk_response.output_tokens
                 cache_read_tokens = sdk_response.cache_read_tokens
                 cache_write_tokens = sdk_response.cache_write_tokens
+                current_resolved_model = sdk_response.resolved_model
 
                 # If no output schema (or output_mode is raw), we're done
                 if output_schema is None:
@@ -905,6 +912,7 @@ class CopilotProvider(AgentProvider):
                         output_tokens=total_output_tokens,
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
+                        resolved_model=current_resolved_model,
                     )
                     return {"result": response_content}, final_usage
 
@@ -921,6 +929,7 @@ class CopilotProvider(AgentProvider):
                             output_tokens=total_output_tokens,
                             cache_read_tokens=cache_read_tokens,
                             cache_write_tokens=cache_write_tokens,
+                            resolved_model=current_resolved_model,
                         )
                         return parsed_content, final_usage
                     except (json.JSONDecodeError, ValueError) as e:
@@ -965,6 +974,9 @@ class CopilotProvider(AgentProvider):
                             total_output_tokens = (
                                 total_output_tokens or 0
                             ) + recovery_response.output_tokens
+                        # Keep the latest resolved model (recovery uses the same session/model)
+                        if recovery_response.resolved_model:
+                            current_resolved_model = recovery_response.resolved_model
 
                 # All recovery attempts exhausted
                 expected_fields = list(output_schema.keys())
@@ -1049,6 +1061,9 @@ class CopilotProvider(AgentProvider):
         # Mutable container for usage data: [input_tokens, output_tokens, cache_read, cache_write]
         usage_ref: list[int | None] = [None, None, None, None]
 
+        # Mutable container for the resolved model name (from assistant.usage event)
+        resolved_model_ref: list[str | None] = [None]
+
         # Mutable container for tool iteration counting
         tool_iteration_ref: list[int] = [0]
 
@@ -1093,6 +1108,10 @@ class CopilotProvider(AgentProvider):
                     usage_ref[2] = int(cache_read)
                 if cache_write is not None:
                     usage_ref[3] = int(cache_write)
+                # Capture the actual model resolved by the SDK (e.g., when model="auto")
+                sdk_model = getattr(event.data, "model", None)
+                if sdk_model:
+                    resolved_model_ref[0] = sdk_model
             elif event_type == "session.idle":
                 done.set()
             elif event_type == "error" or event_type == "session.error":
@@ -1148,6 +1167,7 @@ class CopilotProvider(AgentProvider):
                 cache_read_tokens=usage_ref[2],
                 cache_write_tokens=usage_ref[3],
                 partial=True,
+                resolved_model=resolved_model_ref[0],
             )
 
         if error_message:
@@ -1162,6 +1182,7 @@ class CopilotProvider(AgentProvider):
             output_tokens=usage_ref[1],
             cache_read_tokens=usage_ref[2],
             cache_write_tokens=usage_ref[3],
+            resolved_model=resolved_model_ref[0],
         )
 
     async def _abort_session(self, session: Any, done: asyncio.Event) -> None:
@@ -1271,7 +1292,7 @@ class CopilotProvider(AgentProvider):
                 output_tokens=sdk_response.output_tokens,
                 cache_read_tokens=sdk_response.cache_read_tokens,
                 cache_write_tokens=sdk_response.cache_write_tokens,
-                model=self._default_model,
+                model=sdk_response.resolved_model or self._default_model,
             )
         finally:
             await session.disconnect()
