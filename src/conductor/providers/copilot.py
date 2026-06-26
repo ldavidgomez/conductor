@@ -577,6 +577,7 @@ class CopilotProvider(AgentProvider):
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cache_read_tokens=cache_read,
+                    cache_write_tokens=cache_write,
                     model=(
                         sdk_response.resolved_model
                         if sdk_response and agent.model in (None, "auto")
@@ -1299,11 +1300,7 @@ class CopilotProvider(AgentProvider):
                 output_tokens=sdk_response.output_tokens,
                 cache_read_tokens=sdk_response.cache_read_tokens,
                 cache_write_tokens=sdk_response.cache_write_tokens,
-                model=(
-                    sdk_response.resolved_model
-                    if agent_model in (None, "auto")
-                    else None
-                )
+                model=(sdk_response.resolved_model if agent_model in (None, "auto") else None)
                 or agent_model
                 or self._default_model,
             )
