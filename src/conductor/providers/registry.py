@@ -14,7 +14,7 @@ from conductor.providers.base import AgentProvider
 from conductor.providers.factory import create_provider
 
 if TYPE_CHECKING:
-    from conductor.config.schema import AgentDef, WorkflowConfig
+    from conductor.config.schema import AgentDef, ProviderSettings, WorkflowConfig
 
 
 ProviderType = ProviderName
@@ -75,7 +75,7 @@ class ProviderRegistry:
         """Get the default provider type from workflow config."""
         return self._default_provider_type
 
-    def _get_provider_type_for_agent(self, agent: AgentDef) -> ProviderType:
+    def provider_type_for(self, agent: AgentDef) -> ProviderType:
         """Determine which provider type an agent should use.
 
         Args:
@@ -104,7 +104,7 @@ class ProviderRegistry:
         Raises:
             ProviderError: If provider creation fails.
         """
-        provider_type = self._get_provider_type_for_agent(agent)
+        provider_type = self.provider_type_for(agent)
         return await self._get_or_create_provider(provider_type)
 
     async def _get_or_create_provider(self, provider_type: ProviderType) -> AgentProvider:
@@ -167,6 +167,20 @@ class ProviderRegistry:
 
             self._providers[provider_type] = provider
             return provider
+
+    def provider_settings_for(self, provider_type: ProviderType) -> ProviderSettings | None:
+        """Return the structured settings this registry constructs a provider with.
+
+        Sub-workflow engines share this registry, so the answer reflects the
+        root configuration that actually built the provider instance — not
+        the child workflow's own ``runtime.provider``, which may carry no
+        connection settings at all (e.g. an inherited external Copilot
+        ``runtime_url``). Mirrors the matching-name rule in
+        ``_get_or_create_provider``: settings apply only to the provider they
+        name.
+        """
+        provider = self._config.workflow.runtime.provider
+        return provider if provider.name == provider_type else None
 
     async def close(self) -> None:
         """Close all provider instances.
