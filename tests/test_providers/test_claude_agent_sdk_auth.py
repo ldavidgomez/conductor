@@ -59,7 +59,7 @@ class TestClaudeAuthStatusAutoMode:
     async def test_auto_with_api_key_resolves_to_api_key_without_subprocess(self) -> None:
         provider = ClaudeAgentSdkProvider(auth_mode="auto")
         with (
-            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}, clear=False),
+            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}, clear=True),
             patch(
                 "conductor.providers.claude_agent_sdk._find_claude_cli",
                 return_value=FAKE_CLI,
@@ -85,7 +85,7 @@ class TestClaudeAuthStatusAutoMode:
         """
         provider = ClaudeAgentSdkProvider(auth_mode="auto")
         with (
-            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}, clear=False),
+            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}, clear=True),
             # No CLI binary discoverable anywhere.
             patch("shutil.which", return_value=None),
             patch("pathlib.Path.exists", return_value=False),
@@ -130,13 +130,13 @@ class TestClaudeAuthStatusSubscriptionMode:
         """A conflicting ANTHROPIC_API_KEY no longer fails readiness closed.
 
         subscription mode selects the child process's authentication path via a
-        per-call ``ClaudeAgentOptions.env`` override (see ``_auth_env_override``),
+        finalized child environment (see ``EffectiveAuthContext``),
         not by refusing to run — readiness proceeds to the CLI check as usual.
         """
         provider = ClaudeAgentSdkProvider(auth_mode="subscription")
         auth_json = json.dumps({"loggedIn": True, "authMethod": "claude.ai"}).encode()
         with (
-            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}, clear=False),
+            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}, clear=True),
             patch(
                 "conductor.providers.claude_agent_sdk._find_claude_cli",
                 return_value=FAKE_CLI,
@@ -284,7 +284,7 @@ class TestClaudeAuthStatusApiKeyMode:
     async def test_api_key_present_passes_without_key_value(self) -> None:
         provider = ClaudeAgentSdkProvider(auth_mode="api_key")
         with (
-            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-real"}, clear=False),
+            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-real"}, clear=True),
             patch(
                 "conductor.providers.claude_agent_sdk._find_claude_cli",
                 return_value=FAKE_CLI,
@@ -312,7 +312,7 @@ class TestClaudeAuthStatusApiKeyMode:
     async def test_api_key_blank_treated_as_absent(self) -> None:
         provider = ClaudeAgentSdkProvider(auth_mode="api_key")
         with (
-            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "   "}, clear=False),
+            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "   "}, clear=True),
             patch(
                 "conductor.providers.claude_agent_sdk._find_claude_cli",
                 return_value=FAKE_CLI,
@@ -487,7 +487,7 @@ class TestAuthSubprocessSpawnRobustness:
             return proc
 
         with patch("asyncio.create_subprocess_exec", slow_create):
-            task = asyncio.create_task(_run_auth_status_subprocess(FAKE_CLI))
+            task = asyncio.create_task(_run_auth_status_subprocess(FAKE_CLI, {}, "/work"))
             await spawn_started.wait()
             # Still inside the spawn await — no process handle exists yet in
             # the caller's frame. Cancel here, then let the shielded spawn
@@ -523,10 +523,31 @@ class TestAuthSubprocessSpawnRobustness:
             patch("conductor.providers.claude_agent_sdk._CLAUDE_AUTH_TIMEOUT", 0.01),
             pytest.raises(TimeoutError),
         ):
-            await _run_auth_status_subprocess(FAKE_CLI)
+            await _run_auth_status_subprocess(FAKE_CLI, {}, "/work")
 
         proc.kill.assert_called_once()
         proc.wait.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_env_and_cwd_are_exactly_the_ones_given(self) -> None:
+        """The helper passes its arguments through; it never reads live state."""
+        captured: dict[str, object] = {}
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"{}", b""))
+
+        async def recording_create(*args: object, **kwargs: object) -> MagicMock:
+            captured.update(kwargs)
+            return proc
+
+        with (
+            patch.dict(os.environ, {"LIVE_ONLY": "1"}, clear=True),
+            patch("asyncio.create_subprocess_exec", recording_create),
+        ):
+            await _run_auth_status_subprocess(FAKE_CLI, {"GIVEN": "1"}, "/given/cwd")
+
+        assert captured["env"] == {"GIVEN": "1"}
+        assert captured["cwd"] == "/given/cwd"
 
 
 @pytest.mark.claude_auth_readiness_mocked
@@ -612,7 +633,7 @@ class TestSecretHygiene:
         canary = "sk-ant-CANARY-VALUE-12345"
         provider = ClaudeAgentSdkProvider(auth_mode="api_key")
         with (
-            patch.dict(os.environ, {"ANTHROPIC_API_KEY": canary}, clear=False),
+            patch.dict(os.environ, {"ANTHROPIC_API_KEY": canary}, clear=True),
             patch(
                 "conductor.providers.claude_agent_sdk._find_claude_cli",
                 return_value=FAKE_CLI,
@@ -623,17 +644,30 @@ class TestSecretHygiene:
 
     @pytest.mark.asyncio
     async def test_credential_env_vars_not_in_auth_status_on_subscription_conflict(self) -> None:
+        """Subscription blanks an inherited key rather than failing closed, so the
+        canary must reach neither the probe's environment nor the status."""
         canary_key = "sk-ant-CANARY-98765"
         provider = ClaudeAgentSdkProvider(auth_mode="subscription")
+        probe_env: dict[str, str] = {}
+
+        async def fake_create(*args: object, **kwargs: object) -> MagicMock:
+            probe_env.update(kwargs["env"])  # type: ignore[arg-type]
+            proc = MagicMock()
+            proc.returncode = 1
+            proc.communicate = AsyncMock(return_value=(b'{"loggedIn": false}', b""))
+            return proc
+
         with (
-            patch.dict(os.environ, {"ANTHROPIC_API_KEY": canary_key}, clear=False),
+            patch.dict(os.environ, {"ANTHROPIC_API_KEY": canary_key}, clear=True),
             patch(
                 "conductor.providers.claude_agent_sdk._find_claude_cli",
                 return_value=FAKE_CLI,
             ),
+            patch("asyncio.create_subprocess_exec", fake_create),
         ):
             status = await provider._check_auth_readiness()
-        assert canary_key not in (status.error or "")
+        assert probe_env["ANTHROPIC_API_KEY"] == ""
+        assert canary_key not in str(dataclasses.asdict(status))
 
 
 # ---------------------------------------------------------------------------
@@ -776,90 +810,21 @@ class TestCancelWithInterruptSignal:
 
 
 @pytest.mark.claude_auth_readiness_mocked
-class TestAuthEnvOverride:
-    """Unit-level coverage of ``_auth_env_override``'s exact returned mapping.
+class TestAuthEnvWiredIntoOptions:
+    """``ClaudeAgentOptions(env=...)`` receives the complete finalized child
+    environment, not a sparse override: the SDK spreads ``env`` over a live
+    copy of ``os.environ``, so only a complete mapping pins what the child sees.
 
-    ``_auth_env_override`` keys off ``self._auth_mode`` (the *requested* mode)
-    alone, never ``ClaudeAuthStatus.inferred_mode`` — so it is testable in
-    isolation with no subprocess/CLI mocking at all.
+    The per-mode neutralization matrix itself is unit-tested against
+    ``EffectiveAuthContext`` in ``test_claude_agent_sdk_effective_auth_context.py``;
+    these tests prove that result is what reaches the real construction seam.
     """
 
-    def test_subscription_mode_blanks_both_vars(self) -> None:
-        provider = ClaudeAgentSdkProvider(auth_mode="subscription")
-        with patch.dict(
-            os.environ,
-            {"ANTHROPIC_API_KEY": "sk-ant-fake", "ANTHROPIC_AUTH_TOKEN": "tok-fake"},
-            clear=False,
-        ):
-            override = provider._auth_env_override()
-        assert override == {"ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": ""}
-
-    def test_subscription_mode_with_nothing_set_still_blanks_both(self) -> None:
-        """A blank string, not an absent key, is required (the SDK merges
-        ``env`` on top of a copy of ``os.environ`` and cannot delete an
-        inherited entry by omission)."""
-        provider = ClaudeAgentSdkProvider(auth_mode="subscription")
-        with patch.dict(os.environ, _clean_env(), clear=True):
-            override = provider._auth_env_override()
-        assert override == {"ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": ""}
-
-    def test_api_key_mode_blanks_only_auth_token(self) -> None:
-        provider = ClaudeAgentSdkProvider(auth_mode="api_key")
-        with patch.dict(
-            os.environ,
-            {"ANTHROPIC_API_KEY": "sk-ant-fake", "ANTHROPIC_AUTH_TOKEN": "tok-fake"},
-            clear=False,
-        ):
-            override = provider._auth_env_override()
-        assert override == {"ANTHROPIC_AUTH_TOKEN": ""}
-        assert "ANTHROPIC_API_KEY" not in override
-
-    def test_auto_mode_never_overrides(self) -> None:
-        provider = ClaudeAgentSdkProvider(auth_mode="auto")
-        with patch.dict(
-            os.environ,
-            {"ANTHROPIC_API_KEY": "sk-ant-fake", "ANTHROPIC_AUTH_TOKEN": "tok-fake"},
-            clear=False,
-        ):
-            override = provider._auth_env_override()
-        assert override == {}
-
-    def test_subscription_mode_warning_names_var_never_value(self, caplog) -> None:
-        provider = ClaudeAgentSdkProvider(auth_mode="subscription")
-        with (
-            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-super-secret"}, clear=False),
-            caplog.at_level("WARNING"),
-        ):
-            provider._auth_env_override()
-        joined = " ".join(r.message for r in caplog.records)
-        assert "ANTHROPIC_API_KEY" in joined
-        assert "sk-ant-super-secret" not in joined
-
-    def test_subscription_mode_no_warning_when_nothing_conflicts(self, caplog) -> None:
-        provider = ClaudeAgentSdkProvider(auth_mode="subscription")
-        with (
-            patch.dict(os.environ, _clean_env(), clear=True),
-            caplog.at_level("WARNING"),
-        ):
-            provider._auth_env_override()
-        assert not caplog.records
-
-
-@pytest.mark.claude_auth_readiness_mocked
-class TestAuthEnvWiredIntoOptions:
-    """Confirms ``_auth_env_override()``'s result actually reaches the real
-    ``ClaudeAgentOptions(env=...)`` construction seam in ``_execute_session``,
-    not just that the helper method returns the right value in isolation."""
-
-    async def _run_execute_and_capture_env(
+    async def _run_execute_and_capture_options(
         self, auth_mode: str, environ: dict[str, str]
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         provider = ClaudeAgentSdkProvider(auth_mode=auth_mode)
-        agent = AgentDef(
-            name="test",
-            type="agent",
-            prompt="hello",
-        )
+        agent = AgentDef(name="test", type="agent", prompt="hello")
         ready_status = ClaudeAuthStatus(
             requested_mode=auth_mode,  # type: ignore[arg-type]
             inferred_mode="subscription" if auth_mode != "api_key" else "api_key",
@@ -873,32 +838,107 @@ class TestAuthEnvWiredIntoOptions:
 
         with (
             patch.dict(os.environ, environ, clear=True),
+            patch("conductor.providers.claude_agent_sdk._find_claude_cli", return_value=FAKE_CLI),
             patch.object(provider, "_check_auth_readiness", AsyncMock(return_value=ready_status)),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_ctor),
             patch("conductor.providers.claude_agent_sdk.query", fake_query),
         ):
             await provider.execute(agent=agent, context={}, rendered_prompt="hello")
 
-        return options_ctor.call_args.kwargs["env"]
+        return options_ctor.call_args.kwargs
 
     @pytest.mark.asyncio
     async def test_subscription_mode_env_kwarg(self) -> None:
-        env = await self._run_execute_and_capture_env(
-            "subscription", {"ANTHROPIC_API_KEY": "sk-ant-fake"}
+        kwargs = await self._run_execute_and_capture_options(
+            "subscription", {"ANTHROPIC_API_KEY": "sk-ant-fake", "PATH": "/bin"}
         )
-        assert env == {"ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": ""}
+        assert kwargs["env"] == {
+            "PATH": "/bin",
+            "ANTHROPIC_API_KEY": "",
+            "ANTHROPIC_AUTH_TOKEN": "",
+            "CLAUDE_CODE_OAUTH_TOKEN": "",
+            "CLAUDE_CODE_USE_BEDROCK": "",
+            "CLAUDE_CODE_USE_VERTEX": "",
+            "CLAUDE_CODE_USE_FOUNDRY": "",
+        }
 
     @pytest.mark.asyncio
     async def test_api_key_mode_env_kwarg(self) -> None:
-        env = await self._run_execute_and_capture_env(
-            "api_key", {"ANTHROPIC_API_KEY": "sk-ant-fake", "ANTHROPIC_AUTH_TOKEN": "tok-fake"}
+        kwargs = await self._run_execute_and_capture_options(
+            "api_key",
+            {"ANTHROPIC_API_KEY": "sk-ant-fake", "ANTHROPIC_AUTH_TOKEN": "tok", "PATH": "/bin"},
         )
-        assert env == {"ANTHROPIC_AUTH_TOKEN": ""}
+        assert kwargs["env"] == {
+            "PATH": "/bin",
+            "ANTHROPIC_API_KEY": "sk-ant-fake",
+            "ANTHROPIC_AUTH_TOKEN": "",
+            "CLAUDE_CODE_OAUTH_TOKEN": "",
+            "CLAUDE_CODE_USE_BEDROCK": "",
+            "CLAUDE_CODE_USE_VERTEX": "",
+            "CLAUDE_CODE_USE_FOUNDRY": "",
+        }
 
     @pytest.mark.asyncio
-    async def test_auto_mode_env_kwarg(self) -> None:
-        env = await self._run_execute_and_capture_env("auto", _clean_env())
-        assert env == {}
+    async def test_auto_mode_env_kwarg_is_the_unmodified_snapshot(self) -> None:
+        environ = {"ANTHROPIC_API_KEY": "sk-ant-fake", "CLAUDE_CODE_USE_BEDROCK": "1"}
+        kwargs = await self._run_execute_and_capture_options("auto", environ)
+        assert kwargs["env"] == environ
+
+    @pytest.mark.asyncio
+    async def test_cli_path_kwarg_is_the_resolved_cli(self) -> None:
+        kwargs = await self._run_execute_and_capture_options("subscription", {})
+        assert kwargs["cli_path"] == FAKE_CLI
+
+
+@pytest.mark.claude_auth_readiness_mocked
+class TestNeutralizedCredentialWarning:
+    """``execute`` names, and never reveals, the inherited credentials it blanks."""
+
+    async def _execute(self, auth_mode: str, environ: dict[str, str]) -> None:
+        provider = ClaudeAgentSdkProvider(auth_mode=auth_mode)
+        agent = AgentDef(name="test", type="agent", prompt="hello")
+        ready = ClaudeAuthStatus(
+            requested_mode=auth_mode,  # type: ignore[arg-type]
+            inferred_mode="api_key" if auth_mode == "api_key" else "subscription",
+            ready=True,
+        )
+
+        async def fake_query(**kwargs):
+            return
+            yield  # pragma: no cover
+
+        with (
+            patch.dict(os.environ, environ, clear=True),
+            patch.object(provider, "_check_auth_readiness", AsyncMock(return_value=ready)),
+            patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", MagicMock()),
+            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+        ):
+            await provider.execute(agent=agent, context={}, rendered_prompt="hello")
+
+    @pytest.mark.asyncio
+    async def test_warning_names_var_never_value(self, caplog) -> None:
+        with caplog.at_level("WARNING"):
+            await self._execute(
+                "subscription",
+                {"ANTHROPIC_API_KEY": "sk-ant-super-secret", "CLAUDE_CODE_OAUTH_TOKEN": "oat"},
+            )
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "ANTHROPIC_API_KEY" in joined
+        assert "CLAUDE_CODE_OAUTH_TOKEN" in joined
+        assert "sk-ant-super-secret" not in joined
+        assert "oat" not in joined.split()
+
+    @pytest.mark.asyncio
+    async def test_api_key_mode_does_not_report_its_own_key(self, caplog) -> None:
+        with caplog.at_level("WARNING"):
+            await self._execute("api_key", {"ANTHROPIC_API_KEY": "sk-ant-fake"})
+        assert not caplog.records
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_nothing_conflicts(self, caplog) -> None:
+        with caplog.at_level("WARNING"):
+            await self._execute("subscription", {"CLAUDE_CODE_USE_VERTEX": "   "})
+        assert not caplog.records
 
 
 @pytest.mark.claude_auth_readiness_mocked

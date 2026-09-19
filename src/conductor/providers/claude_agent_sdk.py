@@ -14,7 +14,7 @@ import tempfile
 import time
 import types
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
@@ -76,71 +76,75 @@ ClaudeAuthMode = Literal["auto", "subscription", "api_key"]
 InferredClaudeAuthMode = Literal["subscription", "api_key"]
 
 
+# Credential and backend selectors an explicit ``auth_mode`` pins blank in the
+# child environment. Blank rather than absent: the SDK spreads
+# ``ClaudeAgentOptions.env`` over a *live* copy of ``os.environ`` (0.2.87,
+# ``_internal/transport/subprocess_cli.py``) and cannot delete an inherited
+# key, so omitting a key would let the parent's value through; the bundled CLI
+# treats an empty value as unset. Pinned unconditionally, not only when the
+# snapshot carried them, so a variable set in the parent *after* the snapshot
+# cannot reach the child either.
+_EXPLICIT_MODE_NEUTRALIZED: Final[tuple[str, ...]] = (
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+_NEUTRALIZED_BY_MODE: Final[dict[str, tuple[str, ...]]] = {
+    "auto": (),
+    "subscription": ("ANTHROPIC_API_KEY", *_EXPLICIT_MODE_NEUTRALIZED),
+    "api_key": _EXPLICIT_MODE_NEUTRALIZED,
+}
+
+
 @dataclasses.dataclass(frozen=True)
 class EffectiveAuthContext:
-    """Immutable auth context constructed once at operation start.
+    """Immutable authentication context captured once per provider operation.
 
-    Captures a complete one-time snapshot of:
-    - Environment (copy of os.environ at snapshot time)
-    - Working directory (resolved from agent or process)
-    - Configured settings sources (user/project/local tiers)
-    - CLI availability (path if found, or None)
-    - Authentication mode (auto/subscription/api_key)
-    - Finalized child environment (env_snapshot with mode-specific neutralizations applied)
+    ``__post_init__`` copies ``env_snapshot`` and ``setting_sources`` into
+    read-only containers, so the context is isolated from its caller and from
+    later ``os.environ`` changes whatever mapping or sequence it was given.
+    ``finalized_child_env`` is derived from the snapshot once, by applying the
+    requested mode's neutralizations, and is the single environment both the
+    ``claude auth status --json`` probe and ``ClaudeAgentOptions.env`` receive.
 
-    This context is threaded into both readiness probing and ClaudeAgentOptions
-    execution. Post-snapshot mutations to os.environ or cwd do not affect the
-    stored context.
+    Both environment fields are excluded from ``repr`` because they hold
+    credentials; nothing may log, serialize, or render them.
 
-    Args:
-        env_snapshot: Full copy of os.environ at context construction time (immutable).
-        resolved_cwd: Working directory resolved from agent or process cwd.
-        setting_sources: Configured settings tiers (user/project/local, immutable tuple).
-        cli_path: Resolved Claude CLI path, or None if not found.
-        auth_mode: Authentication mode (auto/subscription/api_key) for this execution.
-        finalized_child_env: Complete child-process environment dict with mode-specific
-            neutralizations applied (immutable). Constructed in __post_init__.
+    Attributes:
+        env_snapshot: Copy of the inherited environment at capture time.
+        resolved_cwd: Working directory for the probe and the SDK session.
+        setting_sources: Claude Code settings tiers the session enables.
+        cli_path: CLI resolved without spawning it, or ``None`` if absent.
+        auth_mode: Requested authentication mode.
+        finalized_child_env: ``env_snapshot`` with the mode's neutralizations.
     """
 
-    env_snapshot: types.MappingProxyType[str, str]
+    env_snapshot: Mapping[str, str] = dataclasses.field(repr=False)
     resolved_cwd: str
     setting_sources: tuple[SettingSource, ...]
     cli_path: Path | None
     auth_mode: ClaudeAuthMode
-    finalized_child_env: types.MappingProxyType[str, str] = dataclasses.field(init=False)
+    finalized_child_env: Mapping[str, str] = dataclasses.field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        """Construct finalized_child_env atomically with mode-specific neutralizations."""
-        finalized = dict(self.env_snapshot)
-
-        # Apply mode-specific environment neutralizations to the copied environment.
-        # These neutralizations ensure only one credential path is active.
-        if self.auth_mode == "subscription":
-            # Subscription mode: clear API key + all competing credential variables.
-            finalized["ANTHROPIC_API_KEY"] = ""
-            finalized["ANTHROPIC_AUTH_TOKEN"] = ""
-            for var in [
-                "CLAUDE_CODE_OAUTH_TOKEN",
-                "CLAUDE_CODE_USE_BEDROCK",
-                "CLAUDE_CODE_USE_VERTEX",
-                "CLAUDE_CODE_USE_FOUNDRY",
-            ]:
-                finalized[var] = ""
-
-        elif self.auth_mode == "api_key":
-            # API key mode: clear auth token + competing variables (NOT API key).
-            finalized["ANTHROPIC_AUTH_TOKEN"] = ""
-            for var in [
-                "CLAUDE_CODE_OAUTH_TOKEN",
-                "CLAUDE_CODE_USE_BEDROCK",
-                "CLAUDE_CODE_USE_VERTEX",
-                "CLAUDE_CODE_USE_FOUNDRY",
-            ]:
-                finalized[var] = ""
-
-        # 'auto' mode: no neutralizations; inherits os.environ precedence.
-
+        snapshot = dict(self.env_snapshot)
+        finalized = dict(snapshot)
+        for name in _NEUTRALIZED_BY_MODE[self.auth_mode]:
+            finalized[name] = ""
+        # Frozen dataclass: normalising a field in place needs object.__setattr__.
+        object.__setattr__(self, "env_snapshot", types.MappingProxyType(snapshot))
+        object.__setattr__(self, "setting_sources", tuple(self.setting_sources))
         object.__setattr__(self, "finalized_child_env", types.MappingProxyType(finalized))
+
+    def overridden_credentials(self) -> list[str]:
+        """Names (never values) of inherited, nonblank variables the mode blanks."""
+        return [
+            name
+            for name in _NEUTRALIZED_BY_MODE[self.auth_mode]
+            if self.env_snapshot.get(name, "").strip()
+        ]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -475,14 +479,16 @@ def _find_claude_cli() -> Path | None:
 
 async def _run_auth_status_subprocess(
     cli_path: Path,
-    finalized_child_env: types.MappingProxyType[str, str],
-    resolved_cwd: str,
+    child_env: Mapping[str, str],
+    cwd: str,
 ) -> tuple[bytes, bytes, int]:
     """Run ``claude auth status --json`` with a hard timeout.
 
-    Uses the provided finalized_child_env (with mode-specific neutralizations
-    already applied) and resolved_cwd for the subprocess environment and
-    working directory.
+    ``child_env`` and ``cwd`` are required rather than defaulting to the live
+    process state: callers pass :attr:`EffectiveAuthContext.finalized_child_env`
+    and :attr:`EffectiveAuthContext.resolved_cwd`, the same values the SDK
+    session later receives, so the probe cannot observe a different
+    environment from the one it vouches for.
 
     ``create_subprocess_exec`` is spawned via a separate task and awaited
     through ``asyncio.shield`` rather than directly: a bare
@@ -510,8 +516,8 @@ async def _run_auth_status_subprocess(
             "--json",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=dict(finalized_child_env),
-            cwd=resolved_cwd,
+            env=dict(child_env),
+            cwd=cwd,
         )
     )
     process: asyncio.subprocess.Process | None = None
@@ -1070,7 +1076,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         Shaped as two **separate groups**, per this ticket's diagnostics AC:
         Conductor's own inference (``conductor_inferred``: ``requested_mode``,
         ``inferred_mode``) is never merged with the SDK/CLI's own sanitized,
-        as-observed fields (``sdk_observed``: ``authMethod``, ``apiKeySource``,
+        as-observed fields (``sdk_observed``: ``authMethod``, ``apiProvider``, ``apiKeySource``,
         ``subscriptionType``) — a field absent from the CLI's status payload
         is omitted from ``sdk_observed`` entirely rather than back-filled
         from ``inferred_mode``. This distinction is load-bearing: measured
@@ -1115,47 +1121,55 @@ class ClaudeAgentSdkProvider(AgentProvider):
             )
         return diagnostic
 
+    def _capture_auth_context(self, resolved_cwd: str) -> EffectiveAuthContext:
+        """Snapshot everything one operation's authentication depends on.
+
+        Called once at the start of :meth:`execute` and of
+        :meth:`validate_connection`; the result is then the only source of
+        environment, cwd, settings tiers, and CLI path for that operation.
+        """
+        return EffectiveAuthContext(
+            env_snapshot=os.environ.copy(),
+            resolved_cwd=resolved_cwd,
+            setting_sources=tuple(self._setting_sources),
+            cli_path=_find_claude_cli(),
+            auth_mode=self._auth_mode,
+        )
+
     async def _check_auth_readiness(
         self, context: EffectiveAuthContext | None = None
     ) -> ClaudeAuthStatus:
-        """Return whether the configured Claude authentication path is ready.
+        """Return whether ``context``'s authentication path is ready.
 
-        When context is provided, uses its immutable snapshots; otherwise falls
-        back to live os.environ/CLI lookup (preserves backward compatibility).
+        Every input — mode, environment, cwd, settings tiers, CLI path — is read
+        from ``context``, never from live process state, so the verdict holds
+        for the SDK session that is later started from the same context. With
+        no ``context``, one is captured for the process cwd.
         """
-        # Construct context if not provided (backward compat for testing).
         if context is None:
-            context = EffectiveAuthContext(
-                env_snapshot=types.MappingProxyType(os.environ.copy()),
-                resolved_cwd=os.getcwd(),
-                setting_sources=tuple(self._setting_sources) if self._setting_sources else (),
-                cli_path=_find_claude_cli(),
-                auth_mode=self._auth_mode,
-            )
+            context = self._capture_auth_context(os.getcwd())
+        mode = context.auth_mode
 
-        api_key = context.env_snapshot.get("ANTHROPIC_API_KEY")
-        api_key_present = bool(api_key and api_key.strip())
+        api_key = context.finalized_child_env.get("ANTHROPIC_API_KEY", "")
+        api_key_present = bool(api_key.strip())
 
-        # Explicit-mode setting-source rejection (AC3): must happen BEFORE api_key success.
-        if context.setting_sources and self._auth_mode in ("subscription", "api_key"):
-            sources_str = ", ".join(context.setting_sources)
+        # Checked before any success path: a settings tier can inject a
+        # credential after the child environment is configured, so an explicit
+        # mode cannot be honoured alongside one.
+        if mode != "auto" and context.setting_sources:
+            from conductor.config.schema import explicit_auth_mode_setting_sources_error
+
             return ClaudeAuthStatus(
-                requested_mode=self._auth_mode,
-                inferred_mode="subscription" if self._auth_mode == "subscription" else "api_key",
+                requested_mode=mode,
+                inferred_mode="subscription" if mode == "subscription" else "api_key",
                 ready=False,
-                error=(
-                    f"Authentication mode '{self._auth_mode}' does not support "
-                    f"runtime.provider.setting_sources (configured: [{sources_str}]). "
-                    f"Use 'auto' mode to enable settings tier discovery, or remove "
-                    f"setting_sources from the workflow configuration."
-                ),
+                error=explicit_auth_mode_setting_sources_error(mode, context.setting_sources),
             )
 
-        # api_key mode checks: CLI availability and key presence (fail-closed).
-        if self._auth_mode == "api_key":
-            # Non-spawning CLI check: verify path exists without running subprocess.
-            cli_path = context.cli_path
-            if cli_path is None:
+        if mode == "api_key":
+            # Non-spawning availability check only: api_key never runs
+            # ``claude auth status``.
+            if context.cli_path is None:
                 return ClaudeAuthStatus(
                     requested_mode="api_key",
                     inferred_mode="api_key",
@@ -1165,8 +1179,6 @@ class ClaudeAgentSdkProvider(AgentProvider):
                         "Install with: npm install -g @anthropic-ai/claude-code"
                     ),
                 )
-
-            # Only then check for non-blank API key.
             if api_key_present:
                 return ClaudeAuthStatus(
                     requested_mode="api_key",
@@ -1181,19 +1193,19 @@ class ClaudeAgentSdkProvider(AgentProvider):
             )
 
         # auto mode with api key: early-return before CLI check (no subprocess).
-        if self._auth_mode == "auto" and api_key_present:
+        if mode == "auto" and api_key_present:
             return ClaudeAuthStatus(
                 requested_mode="auto",
                 inferred_mode="api_key",
                 ready=True,
             )
 
-        # Past here: inferred mode is subscription (explicit or auto→subscription).
-        # Requires CLI check via subprocess (AC6: parse JSON regardless of returncode).
+        # Past here the inferred mode is subscription (explicit, or auto with no
+        # API key), which is confirmed by running ``claude auth status``.
         cli_path = context.cli_path
         if cli_path is None:
             return ClaudeAuthStatus(
-                requested_mode=self._auth_mode,
+                requested_mode=mode,
                 inferred_mode="subscription",
                 ready=False,
                 error=(
@@ -1207,7 +1219,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             )
         except TimeoutError:
             return ClaudeAuthStatus(
-                requested_mode=self._auth_mode,
+                requested_mode=mode,
                 inferred_mode="subscription",
                 ready=False,
                 error=(
@@ -1220,7 +1232,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # unreachable at the OS level.  Return a sanitised, non-retryable status
             # rather than letting a FileNotFoundError/PermissionError escape.
             return ClaudeAuthStatus(
-                requested_mode=self._auth_mode,
+                requested_mode=mode,
                 inferred_mode="subscription",
                 ready=False,
                 error=(
@@ -1231,9 +1243,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
         stderr_text = stderr_bytes.decode("utf-8", errors="replace").lower()
 
-        # AC6: Parse JSON first, regardless of returncode.
-        # An explicit loggedIn: false in JSON takes precedence even on nonzero exit.
-        # Only treat nonzero exit as fatal if JSON parsing fails.
+        # Parse stdout before looking at the exit code: a logged-out CLI can
+        # print ``{"loggedIn": false}`` *and* exit nonzero, and that payload is
+        # the specific, actionable answer. The exit code only explains a
+        # response that is not JSON at all.
         try:
             payload = json.loads(stdout_bytes.decode("utf-8", errors="replace"))
         except Exception:
@@ -1256,7 +1269,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             else:
                 error = "Authentication check returned an unreadable status response."
             return ClaudeAuthStatus(
-                requested_mode=self._auth_mode,
+                requested_mode=mode,
                 inferred_mode="subscription",
                 ready=False,
                 error=error,
@@ -1264,7 +1277,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
         if not isinstance(payload, dict):
             return ClaudeAuthStatus(
-                requested_mode=self._auth_mode,
+                requested_mode=mode,
                 inferred_mode="subscription",
                 ready=False,
                 error="Authentication check returned an unreadable status response.",
@@ -1278,7 +1291,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         api_key_source = filtered.get("apiKeySource")
         if logged_in is True:
             return ClaudeAuthStatus(
-                requested_mode=self._auth_mode,
+                requested_mode=mode,
                 inferred_mode="subscription",
                 ready=True,
                 auth_method=auth_method if isinstance(auth_method, str) else None,
@@ -1288,7 +1301,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             )
         if logged_in is False:
             return ClaudeAuthStatus(
-                requested_mode=self._auth_mode,
+                requested_mode=mode,
                 inferred_mode="subscription",
                 ready=False,
                 auth_method=auth_method if isinstance(auth_method, str) else None,
@@ -1298,111 +1311,11 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 error="Not logged in to Claude Code. Run: claude auth login",
             )
         return ClaudeAuthStatus(
-            requested_mode=self._auth_mode,
+            requested_mode=mode,
             inferred_mode="subscription",
             ready=False,
             error="Authentication check returned an unreadable status response.",
         )
-
-    def _auth_env_override(self, context: EffectiveAuthContext | None = None) -> dict[str, str]:
-        """Build the per-call ``ClaudeAgentOptions.env`` authentication override.
-
-        Selects the child process's Claude authentication path deterministically
-        by blanking whichever inherited credential the requested mode does not
-        use, rather than failing the run closed when both are present. The
-        override is applied only to the spawned ``claude`` subprocess's
-        environment (the SDK copies ``os.environ`` and merges this mapping on
-        top when launching it) — the parent process's own ``os.environ`` is
-        never read for this purpose and is never mutated.
-
-        When context is provided, uses its immutable env snapshot; otherwise
-        falls back to live os.environ (preserves backward compatibility).
-
-        * ``subscription`` — blanks both ``ANTHROPIC_API_KEY`` and
-          ``ANTHROPIC_AUTH_TOKEN`` so the CLI falls through to the logged-in
-          subscription session regardless of what the parent process inherited.
-          Also clears competing OAuth/Bedrock/Vertex/Foundry variables.
-        * ``api_key`` — blanks only ``ANTHROPIC_AUTH_TOKEN``. ``ANTHROPIC_API_KEY``
-          is left untouched: it is the credential this mode selects, not one to
-          clear. Also clears competing OAuth/Bedrock/Vertex/Foundry variables.
-        * ``auto`` — contributes no override at all (empty mapping). The child
-          process follows the SDK/CLI's own inherited-environment precedence
-          exactly as if Conductor had not intervened.
-
-        A blank string, not an absent key, is required: the SDK's per-call
-        ``env`` mapping is merged on top of a copy of ``os.environ`` and cannot
-        delete an inherited entry, but the bundled CLI treats an empty value as
-        equivalent to unset.
-        """
-        # Construct context if not provided (backward compat for testing).
-        if context is None:
-            context = EffectiveAuthContext(
-                env_snapshot=os.environ.copy(),
-                resolved_cwd=os.getcwd(),
-                setting_sources=self._setting_sources,
-                cli_path=_find_claude_cli(),
-            )
-
-        # Neutralization matrix: variables to clear for each mode.
-        always_clear = [
-            "ANTHROPIC_AUTH_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "CLAUDE_CODE_USE_BEDROCK",
-            "CLAUDE_CODE_USE_VERTEX",
-            "CLAUDE_CODE_USE_FOUNDRY",
-        ]
-
-        if self._auth_mode == "subscription":
-            # Subscription mode: clear API key + all competing variables.
-            overridden = [
-                name
-                for name in ["ANTHROPIC_API_KEY"] + always_clear
-                if context.env_snapshot.get(name) and context.env_snapshot.get(name).strip()
-            ]
-            if overridden:
-                logger.warning(
-                    "auth_mode=subscription: overriding inherited %s for the Claude "
-                    "child process so the logged-in subscription session is used.",
-                    " and ".join(overridden),
-                )
-            override = {"ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": ""}
-            # Also clear other competing variables.
-            for var in [
-                "CLAUDE_CODE_OAUTH_TOKEN",
-                "CLAUDE_CODE_USE_BEDROCK",
-                "CLAUDE_CODE_USE_VERTEX",
-                "CLAUDE_CODE_USE_FOUNDRY",
-            ]:
-                if context.env_snapshot.get(var):
-                    override[var] = ""
-            return override
-
-        if self._auth_mode == "api_key":
-            # API key mode: clear auth token + competing variables (NOT API key).
-            overridden = [
-                name
-                for name in always_clear
-                if context.env_snapshot.get(name) and context.env_snapshot.get(name).strip()
-            ]
-            if overridden:
-                logger.warning(
-                    "auth_mode=api_key: overriding inherited %s for the Claude "
-                    "child process so ANTHROPIC_API_KEY is used.",
-                    " and ".join(overridden),
-                )
-            override = {"ANTHROPIC_AUTH_TOKEN": ""}
-            # Also clear other competing variables.
-            for var in [
-                "CLAUDE_CODE_OAUTH_TOKEN",
-                "CLAUDE_CODE_USE_BEDROCK",
-                "CLAUDE_CODE_USE_VERTEX",
-                "CLAUDE_CODE_USE_FOUNDRY",
-            ]:
-                if context.env_snapshot.get(var):
-                    override[var] = ""
-            return override
-
-        return {}
 
     async def execute(
         self,
@@ -1437,18 +1350,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
         resolved_cwd = self._resolve_session_cwd(agent)
         session_key = agent.session_key
 
-        # Construct one immutable effective auth context at operation start.
-        # This captures the complete environment, cwd, settings, and CLI
-        # availability as a snapshot that will be used consistently throughout
-        # this execution, guaranteeing no drift between readiness probing and
-        # SDK execution.
-        auth_context = EffectiveAuthContext(
-            env_snapshot=types.MappingProxyType(os.environ.copy()),
-            resolved_cwd=resolved_cwd,
-            setting_sources=tuple(self._setting_sources) if self._setting_sources else (),
-            cli_path=_find_claude_cli(),
-            auth_mode=self._auth_mode,
-        )
+        # Captured once, before readiness: the preflight and the SDK session
+        # below both read this context and nothing else, so they cannot see
+        # different environments, cwds, settings tiers, or CLI binaries.
+        auth_context = self._capture_auth_context(resolved_cwd)
 
         if session_key is None:
             return await self._execute_session(
@@ -1551,13 +1456,13 @@ class ClaudeAgentSdkProvider(AgentProvider):
         agent: AgentDef,
         resolved_cwd: str,
         rendered_prompt: str,
+        auth_context: EffectiveAuthContext,
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
-        auth_context: EffectiveAuthContext | None = None,
     ) -> AgentOutput:
         if query is None or ClaudeAgentOptions is None:
             raise ProviderError("Claude Agent SDK not available")
@@ -1699,17 +1604,13 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 is_retryable=False,
             )
 
-        # The finalized_child_env from the context contains the complete
-        # effective environment for the child process, already applying all
-        # mode-specific neutralizations (subscription/api_key/auto) that were
-        # determined at context construction time. This same environment was
-        # passed to readiness probing, so the execution sees a consistent view.
-        if auth_context is None:
-            raise ProviderError(
-                f"Agent '{agent.name}' execution: auth_context must be set",
-                is_retryable=False,
+        overridden = auth_context.overridden_credentials()
+        if overridden:
+            logger.warning(
+                "auth_mode=%s: blanking inherited %s for the Claude child process.",
+                auth_context.auth_mode,
+                ", ".join(overridden),
             )
-        auth_env = dict(auth_context.finalized_child_env)
 
         options = ClaudeAgentOptions(
             model=model,
@@ -1817,17 +1718,17 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # ``<plugin>:<agent>`` name so two plugins shipping a same-named
             # agent do not collide.
             agents=_build_sdk_agents(custom_agents),
-            # Per-call child-process env override selecting the Claude
-            # authentication path (TICKET-20260816-0002). Built by
-            # ``_auth_env_override`` from ``self._auth_mode`` alone — never
-            # from ``auth_status`` — so ``auto`` is guaranteed to contribute
-            # no override at all. The SDK copies ``os.environ`` and spreads
-            # this mapping last when launching the ``claude`` subprocess
-            # (``claude_agent_sdk`` 0.2.87,
-            # ``_internal/transport/subprocess_cli.py``), so parent
-            # ``os.environ`` is never mutated and every other agent/process
-            # keeps its own inherited credentials untouched.
-            env=auth_env,
+            # The complete finalized environment the preflight above ran with,
+            # not a sparse override. The SDK spreads this over a live copy of
+            # ``os.environ`` (0.2.87, ``_internal/transport/subprocess_cli.py``),
+            # so every key captured here wins over any later parent change;
+            # only a key first set in the parent after capture can still pass
+            # through, which is why explicit modes pin their neutralized keys
+            # even when absent. ``os.environ`` itself is never written.
+            env=dict(auth_context.finalized_child_env),
+            # The binary the preflight vouched for. ``None`` (no CLI found)
+            # leaves the SDK's own lookup in place, as before.
+            cli_path=auth_context.cli_path,
         )
         # Anthropic reports cached prompt tokens OUTSIDE its own
         # ``input_tokens`` counter, unlike Copilot and pydantic-ai. Track them
@@ -2064,14 +1965,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             self._last_validation_error = "Claude Agent SDK not installed"
             return False
 
-        # Construct effective auth context for this independent validation operation.
-        context = EffectiveAuthContext(
-            env_snapshot=os.environ.copy(),
-            resolved_cwd=os.getcwd(),
-            setting_sources=self._setting_sources,
-            cli_path=_find_claude_cli(),
-        )
-        status = await self._check_auth_readiness(context=context)
+        status = await self._check_auth_readiness(context=self._capture_auth_context(os.getcwd()))
         self._last_auth_status = status
         if not status.ready:
             self._last_validation_error = status.error

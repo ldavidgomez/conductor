@@ -205,35 +205,33 @@ def _isolated_runs_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 def _stub_claude_auth_readiness(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Stub ``ClaudeAgentSdkProvider._check_auth_readiness`` to a deterministic,
-    already-ready result for every test, repository-wide (TICKET-20260816-0002).
+    """Keep every test away from a real ``claude auth status --json``.
 
-    ``execute()`` now runs a real, hard-timeout-bounded ``claude auth status
-    --json`` preflight before every agent turn (see ``_check_auth_readiness``
-    in ``providers/claude_agent_sdk.py``). Without this fixture, *any* test
-    that drives ``ClaudeAgentSdkProvider.execute()`` -- directly or via
-    ``WorkflowEngine`` -- spawns that real subprocess: on a developer machine
-    with the ``claude`` CLI installed this silently depends on local login
-    state; on upstream CI (no CLI, no ``ANTHROPIC_API_KEY``) every such test
-    fails or hangs on the readiness check instead of exercising its own
-    behavior. Per-file ad hoc patches (as several test modules already carry)
-    do not scale to the next test someone writes.
+    ``ClaudeAgentSdkProvider.execute()`` and ``validate_connection()`` run an
+    authentication preflight that can spawn the ``claude`` CLI. Left real, any
+    test driving the provider — directly or through ``WorkflowEngine`` — would
+    depend on whether this machine has the CLI installed and logged in.
 
-    **Narrow opt-in for readiness tests (AC7):**
-    Only tests marked with ``@pytest.mark.claude_auth_readiness_mocked`` receive
-    the real, unstubbed method. These are tests that exercise ``_check_auth_readiness``
-    itself against mocked subprocesses. All other tests get this hermetic stub,
-    ensuring ordinary provider/execution tests fail fast if they accidentally
-    attempt a real subprocess call.
-
-    This is a pure hermeticity guard, not a behavior assertion: it always
-    reports an *inferred* subscription readiness, regardless of the
-    provider's configured ``auth_mode``, matching this fixture's only job
-    (let unrelated tests run without touching a real CLI or real
-    credentials) rather than modeling any particular auth outcome.
+    * **Default:** ``_check_auth_readiness`` is stubbed to a ready status, so
+      ordinary tests never reach the preflight at all.
+    * **Opt-in** (``@pytest.mark.claude_auth_readiness_mocked``): the real
+      method runs, for tests of the preflight itself. Process creation is
+      replaced with a guard that fails the test, so an opted-in test must mock
+      ``asyncio.create_subprocess_exec`` (or ``_run_auth_status_subprocess``)
+      itself; one that forgets fails here instead of silently probing the real
+      CLI with the developer's credentials. Those tests control the
+      environment themselves (``patch.dict(os.environ, ..., clear=True)`` or an
+      explicitly built ``EffectiveAuthContext``).
     """
-    # Skip stubbing only if test is marked with claude_auth_readiness_mocked
     if request.node.get_closest_marker("claude_auth_readiness_mocked") is not None:
+
+        async def _refuse_real_spawn(*args: object, **kwargs: object) -> None:
+            raise AssertionError(
+                "claude_auth_readiness_mocked test reached real process creation; "
+                "mock asyncio.create_subprocess_exec or _run_auth_status_subprocess."
+            )
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", _refuse_real_spawn)
         return
 
     from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider, ClaudeAuthStatus
