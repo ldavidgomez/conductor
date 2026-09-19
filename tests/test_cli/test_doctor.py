@@ -318,9 +318,7 @@ class TestDoctorAuthDiagnosticRendering:
     ) -> None:
         """A provider with no ``auth_diagnostic`` (e.g. every provider other
         than ``claude-agent-sdk``) must not gain the extra lines."""
-        report = DoctorReport(
-            providers=[_prov("copilot", checked=True, connection_ok=True)]
-        )
+        report = DoctorReport(providers=[_prov("copilot", checked=True, connection_ok=True)])
         _patch_gather(monkeypatch, report)
         result = runner.invoke(app, ["doctor", "providers", "--check"])
         assert result.exit_code == 0

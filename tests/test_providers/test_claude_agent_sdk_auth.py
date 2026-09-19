@@ -53,6 +53,7 @@ class TestFindClaudeCli:
             assert result is not None
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestClaudeAuthStatusAutoMode:
     @pytest.mark.asyncio
     async def test_auto_with_api_key_resolves_to_api_key_without_subprocess(self) -> None:
@@ -122,6 +123,7 @@ class TestClaudeAuthStatusAutoMode:
             assert status.subscription_type == "pro"
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestClaudeAuthStatusSubscriptionMode:
     @pytest.mark.asyncio
     async def test_subscription_with_conflicting_api_key_overrides_and_proceeds(self) -> None:
@@ -276,6 +278,7 @@ class TestClaudeAuthStatusSubscriptionMode:
             assert "tok-secret" not in str(status_dict)
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestClaudeAuthStatusApiKeyMode:
     @pytest.mark.asyncio
     async def test_api_key_present_passes_without_key_value(self) -> None:
@@ -319,6 +322,7 @@ class TestClaudeAuthStatusApiKeyMode:
             assert status.ready is False
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestAuthPreflightSubprocessTimeout:
     @pytest.mark.asyncio
     async def test_validate_connection_does_not_hang_on_timeout(self) -> None:
@@ -385,7 +389,7 @@ class TestAuthPreflightSubprocessTimeout:
             output={"result": OutputField(type="string")},
         )
 
-        async def slow_check() -> ClaudeAuthStatus:
+        async def slow_check(**kwargs: object) -> ClaudeAuthStatus:
             await asyncio.sleep(100)
             return ClaudeAuthStatus(
                 requested_mode="subscription",
@@ -414,6 +418,7 @@ class TestAuthPreflightSubprocessTimeout:
                 await task
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestAuthCliPathNotShell:
     @pytest.mark.asyncio
     async def test_auth_status_uses_exec_not_shell(self) -> None:
@@ -446,6 +451,7 @@ class TestAuthCliPathNotShell:
             assert call["kwargs"].get("shell") is not True  # type: ignore[union-attr]
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestAuthSubprocessSpawnRobustness:
     """Exercises the real ``_run_auth_status_subprocess`` body (not stubbed).
 
@@ -523,6 +529,7 @@ class TestAuthSubprocessSpawnRobustness:
         proc.wait.assert_awaited_once()
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestFactoryAuthModeWiring:
     @pytest.mark.asyncio
     async def test_factory_passes_auth_mode_subscription(self) -> None:
@@ -598,6 +605,7 @@ class TestFactoryAuthModeWiring:
             await create_provider("claude-agent-sdk", validate=True)
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestSecretHygiene:
     @pytest.mark.asyncio
     async def test_api_key_value_not_in_auth_status(self) -> None:
@@ -633,6 +641,7 @@ class TestSecretHygiene:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestAutoModeAuthToken:
     @pytest.mark.asyncio
     async def test_auto_with_auth_token_only_resolves_to_subscription(self) -> None:
@@ -668,6 +677,7 @@ class TestAutoModeAuthToken:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestSubprocessOsError:
     @pytest.mark.asyncio
     async def test_oserror_during_spawn_returns_sanitized_failure(self) -> None:
@@ -701,6 +711,7 @@ class TestSubprocessOsError:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestCancelWithInterruptSignal:
     @pytest.mark.asyncio
     async def test_execute_cancellation_during_auth_preflight_leaves_no_pending_task(
@@ -727,7 +738,7 @@ class TestCancelWithInterruptSignal:
 
         pending_before: set[asyncio.Task] = set()
 
-        async def slow_check() -> ClaudeAuthStatus:
+        async def slow_check(**kwargs: object) -> ClaudeAuthStatus:
             nonlocal pending_before
             pending_before = {t for t in asyncio.all_tasks() if not t.done()}
             await asyncio.sleep(100)
@@ -764,6 +775,7 @@ class TestCancelWithInterruptSignal:
         assert not leaked, f"Tasks leaked after cancellation: {leaked}"
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestAuthEnvOverride:
     """Unit-level coverage of ``_auth_env_override``'s exact returned mapping.
 
@@ -833,6 +845,7 @@ class TestAuthEnvOverride:
         assert not caplog.records
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestAuthEnvWiredIntoOptions:
     """Confirms ``_auth_env_override()``'s result actually reaches the real
     ``ClaudeAgentOptions(env=...)`` construction seam in ``_execute_session``,
@@ -888,6 +901,7 @@ class TestAuthEnvWiredIntoOptions:
         assert env == {}
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestParentEnvironNeverMutated:
     @pytest.mark.asyncio
     async def test_execute_leaves_os_environ_byte_identical(self) -> None:
@@ -924,6 +938,7 @@ class TestParentEnvironNeverMutated:
         assert before == after
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestApiKeySourcePropagation:
     """``api_key_source`` is populated from the whitelisted ``apiKeySource``
     JSON field, on both the logged-in and logged-out branches, and is absent
@@ -1008,6 +1023,7 @@ class TestApiKeySourcePropagation:
         assert status.api_key_source is None
 
 
+@pytest.mark.claude_auth_readiness_mocked
 class TestAuthStatusDiagnostic:
     """``auth_status_diagnostic`` surfaces two separate groups for
     ``conductor doctor --check`` (TICKET-20260816-0002, Finding 3): the

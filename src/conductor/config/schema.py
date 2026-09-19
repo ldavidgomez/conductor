@@ -3180,6 +3180,23 @@ class ProviderSettings(BaseModel):
                 "which no other provider reads."
             )
 
+        # AC3: subscription and api_key modes reject non-empty setting_sources.
+        # auto mode allows them for discovery. This is a static validation
+        # gate; a matching runtime check also exists in _check_auth_readiness.
+        if (
+            self.name == "claude-agent-sdk"
+            and self.setting_sources is not None
+            and len(self.setting_sources) > 0
+            and self.auth_mode in ("subscription", "api_key")
+        ):
+            sources_str = ", ".join(self.setting_sources)
+            raise ValueError(
+                f"Authentication mode '{self.auth_mode}' does not support "
+                f"runtime.provider.setting_sources (configured: [{sources_str}]). "
+                f"Use 'auto' mode to enable settings tier discovery, or remove "
+                f"setting_sources from the provider configuration."
+            )
+
         if self.hermes_home is not None and self.name != "hermes":
             raise ValueError("'hermes_home' is only supported when name='hermes'.")
 
