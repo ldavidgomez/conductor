@@ -102,10 +102,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"subscription"`, `"api_key"`) selects which credential the `claude` child
   process uses. `auto` leaves the inherited environment unchanged, so existing
   workflows are unaffected. `subscription` blanks `ANTHROPIC_API_KEY`,
-  `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` and the
-  `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY` selectors in the child
+  `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` in the child
   environment; `api_key` requires a non-blank `ANTHROPIC_API_KEY` and blanks
-  the others. Both explicit modes refuse a non-empty `setting_sources`, at
+  the other two. Both explicit modes refuse an inherited non-blank
+  `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY` cloud-backend selector,
+  naming the variable but never its value; `auto` keeps it. Both explicit modes refuse a non-empty `setting_sources`, at
   `conductor validate` and at run time, because a Claude Code settings file's
   `env` block is applied after Conductor configures the child environment.
   Each agent execution captures its environment, working directory, settings
