@@ -832,6 +832,192 @@ def _remove_mcp_config(path: str) -> None:
         )
 
 
+class _ReadOutcome:
+    """Sentinel marking why a read ended without producing a message.
+
+    A distinct object rather than ``None``: the SDK is free to yield anything,
+    so only identity can tell an outcome apart from a message.
+    """
+
+    __slots__ = ("_label",)
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"<{self._label}>"
+
+
+#: The interrupt signal was set, so the caller wants partial output.
+_READ_INTERRUPTED: Final[_ReadOutcome] = _ReadOutcome("read interrupted")
+#: The absolute session deadline passed.
+_READ_TIMED_OUT: Final[_ReadOutcome] = _ReadOutcome("read timed out")
+#: The SDK iterator is exhausted (``StopAsyncIteration``).
+_READ_EXHAUSTED: Final[_ReadOutcome] = _ReadOutcome("read exhausted")
+
+
+async def _reap_shielded(
+    task: asyncio.Future[Any],
+    current: asyncio.Task[Any] | None,
+    observed: int,
+) -> tuple[asyncio.CancelledError | None, int]:
+    """Await one cancelled task to completion without forwarding cancellation.
+
+    Args:
+        task: The owned task to reap. It has already been cancelled.
+        current: The task running this cleanup, or ``None`` outside a task.
+        observed: The caller's cancellation count as of the last check.
+
+    Returns:
+        The first ``CancelledError`` that was aimed at *the caller* (``None``
+        when there was none), and the updated cancellation count.
+    """
+    caller_cancelled: asyncio.CancelledError | None = None
+
+    while True:
+        try:
+            # A fresh shield on every iteration: once a shield wrapper has
+            # been cancelled it stays cancelled, so reusing it would spin.
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            current_count = current.cancelling() if current is not None else observed
+
+            # Two independent questions. Asking only the second one -- "is the
+            # child done?" -- cannot classify a turn in which the caller was
+            # cancelled *and* the child finished, and would silently swallow
+            # the caller's cancellation.
+            #
+            # Question 1: was the caller itself cancelled? ``cancelling()`` is
+            # incremented synchronously by ``cancel()``, so it is true even
+            # when the CancelledError we just caught came from the child.
+            if current_count > observed:
+                if caller_cancelled is None:
+                    caller_cancelled = exc
+                observed = current_count
+
+            # Question 2: has the child finished?
+            if task.done():
+                break
+
+            # The caller was cancelled but the shield kept the child running.
+            # Keep waiting through a new wrapper.
+            continue
+        except Exception:
+            # Teardown failures are suppressed, matching the ``agen.aclose()``
+            # cleanup in ``execute``: cleanup must not replace the outcome.
+            break
+        else:
+            break
+
+    return caller_cancelled, observed
+
+
+async def _cancel_and_reap(tasks: Iterable[asyncio.Future[Any] | None]) -> None:
+    """Cancel every owned task and await its teardown.
+
+    Cancellation aimed at *this* task while the reap is in flight is absorbed
+    and re-raised only once every child has finished, so a caller that gives
+    up cannot cut short an SDK read that is still releasing its resources.
+
+    Args:
+        tasks: Owned tasks; ``None`` entries are ignored.
+
+    Raises:
+        asyncio.CancelledError: The first cancellation aimed at the caller
+            *after* this call began, re-raised once every child is reaped.
+    """
+    owned = [task for task in tasks if task is not None]
+
+    current = asyncio.current_task()
+    # The cancellation that brought us here (if any) is part of the baseline:
+    # cleanup only reacts to cancellations newer than this.
+    observed = current.cancelling() if current is not None else 0
+
+    # Cancel everything first, with no await in between, so no child is left
+    # running while another is being reaped.
+    for task in owned:
+        if not task.done():
+            task.cancel()
+
+    caller_cancelled: asyncio.CancelledError | None = None
+
+    for task in owned:
+        exc, observed = await _reap_shielded(task, current, observed)
+        if exc is not None and caller_cancelled is None:
+            caller_cancelled = exc
+
+    if caller_cancelled is not None:
+        raise caller_cancelled
+
+
+async def _next_message_or_sentinel(
+    agen: Any,
+    interrupt_signal: asyncio.Event | None,
+    deadline: float | None,
+) -> object:
+    """Read the next SDK message, racing it against interrupt and deadline.
+
+    The SDK iterator can block for as long as the model takes, so neither
+    signal may be checked only between messages: both have to be able to
+    pre-empt a read that is already in flight.
+
+    Args:
+        agen: The SDK message iterator.
+        interrupt_signal: Set by the caller to ask for partial output.
+        deadline: Absolute ``time.monotonic()`` instant the session must not
+            run past, or ``None`` for no limit.
+
+    Returns:
+        The next message, or one of the ``_READ_*`` sentinels. Typed ``object``
+        because only identity separates the two; the loop body narrows the
+        message itself, as it already did for the SDK iterator's own values.
+    """
+    # Neither signal starts a read it would immediately abandon. Interrupt is
+    # checked first: when both are already true the caller's explicit request
+    # for partial output wins, as it did between messages.
+    if interrupt_signal is not None and interrupt_signal.is_set():
+        return _READ_INTERRUPTED
+    if deadline is not None and time.monotonic() > deadline:
+        return _READ_TIMED_OUT
+
+    # ``ensure_future`` rather than ``create_task``: ``anext`` returns a
+    # general awaitable, which ``create_task`` does not accept.
+    message_task = asyncio.ensure_future(anext(agen))
+    interrupt_task = (
+        asyncio.ensure_future(interrupt_signal.wait()) if interrupt_signal is not None else None
+    )
+    waiters = [task for task in (message_task, interrupt_task) if task is not None]
+
+    try:
+        done, _pending = await asyncio.wait(
+            waiters,
+            timeout=None if deadline is None else max(0.0, deadline - time.monotonic()),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    except asyncio.CancelledError:
+        # The caller gave up. Reap what we own, then let the cancellation
+        # through untranslated -- upstream unwinds on it.
+        await _cancel_and_reap((message_task, interrupt_task))
+        raise
+
+    if message_task in done:
+        await _cancel_and_reap((interrupt_task,))
+        try:
+            # A real SDK failure outranks every signal: it reaches ``execute``'s
+            # own handling rather than being reported as an interrupt or a
+            # timeout. The loop body re-checks both signals for the message it
+            # gets back, which is what keeps the existing tie behavior.
+            return message_task.result()
+        except StopAsyncIteration:
+            return _READ_EXHAUSTED
+
+    # Snapshot before cleanup: cancelling the waiters changes what ``done``
+    # would say afterwards.
+    interrupt_won = interrupt_task is not None and interrupt_task in done
+    await _cancel_and_reap((message_task, interrupt_task))
+    return _READ_INTERRUPTED if interrupt_won else _READ_TIMED_OUT
+
+
 def _resolve_skill_plugins(
     skill_directories: list[str] | None,
 ) -> tuple[list[str], list[SdkPluginConfig]]:
@@ -966,11 +1152,12 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # but the model still occasionally returns prose. Mark as
         # prompt-injection to keep the validator honest.
         structured_output="prompt_injection",
-        # ``interrupt_signal`` is checked between SDK messages and triggers
-        # a partial-output return.
+        # ``interrupt_signal`` pre-empts a blocked SDK read and triggers a
+        # partial-output return.
         interrupt=True,
-        # ``max_session_seconds`` is enforced between messages via
-        # ``time.monotonic()``.
+        # ``max_session_seconds`` is one absolute ``time.monotonic()``
+        # deadline, raced against the in-flight read rather than only
+        # checked between messages.
         max_session_seconds=True,
         # False even though a ``session_key`` agent's session *is* restored on
         # resume: this flag is a blanket promise the startup banner reads out,
@@ -1885,6 +2072,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # Track pending tool_use IDs so we can pair them with ToolResultBlocks
         pending_tools: dict[str, str] = {}
         session_start = time.monotonic()
+        # One absolute deadline for the whole execution, computed once and
+        # never recomputed: a long stream of messages must not be able to
+        # push it back, and a blocked read is raced against it directly.
+        deadline = None if max_session_seconds is None else session_start + max_session_seconds
 
         # Written inside the try below, never before it: the file holds
         # resolved MCP credentials, so every path out of this method must
@@ -1957,7 +2148,37 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 )
 
             agen = query(prompt=rendered_prompt, options=options)
-            async for message in agen:
+
+            def _partial_output() -> AgentOutput:
+                """The interrupt return, shared by both places that take it."""
+                return self._build_output(
+                    content_parts,
+                    structured_output,
+                    agent,
+                    result_model,
+                    total_input_tokens,
+                    total_output_tokens,
+                    cache_read_tokens=total_cache_read_tokens,
+                    cache_write_tokens=total_cache_write_tokens,
+                    last_call_input_tokens=last_call_input_tokens,
+                    partial=True,
+                )
+
+            while True:
+                # Reads the next message, pre-empting a blocked read when the
+                # interrupt fires or the absolute deadline passes.
+                message = await _next_message_or_sentinel(agen, interrupt_signal, deadline)
+                if message is _READ_EXHAUSTED:
+                    break
+                if message is _READ_INTERRUPTED:
+                    return _partial_output()
+                if message is _READ_TIMED_OUT:
+                    raise ProviderError(
+                        f"Agent '{agent.name}' exceeded maximum session "
+                        f"duration of {max_session_seconds:.0f}s "
+                        f"after {turn_count} turn(s)",
+                        is_retryable=False,
+                    )
                 # Record before the interrupt and timeout checks below, which
                 # return: an agent cut short is worth resuming. Only
                 # conversation messages are trusted — hook and other auxiliary
@@ -1968,34 +2189,22 @@ class ClaudeAgentSdkProvider(AgentProvider):
                     if message_session_id:
                         self._session_ids[(session_key, resolved_cwd)] = message_session_id
 
+                # Re-checked for the message just obtained: an interrupt that
+                # arrived together with it still beats it.
                 if interrupt_signal is not None and interrupt_signal.is_set():
-                    return self._build_output(
-                        content_parts,
-                        structured_output,
-                        agent,
-                        result_model,
-                        total_input_tokens,
-                        total_output_tokens,
-                        cache_read_tokens=total_cache_read_tokens,
-                        cache_write_tokens=total_cache_write_tokens,
-                        last_call_input_tokens=last_call_input_tokens,
-                        partial=True,
-                    )
+                    return _partial_output()
 
-                # Wall-clock session timeout. The SDK does not expose a per-call
-                # timeout, so enforce at each message boundary — the cheapest
-                # cancellation point we have. The check is between messages
-                # rather than around the full ``async for`` so we can return
-                # a clean ProviderError rather than letting asyncio raise.
-                if max_session_seconds is not None:
-                    elapsed = time.monotonic() - session_start
-                    if elapsed > max_session_seconds:
-                        raise ProviderError(
-                            f"Agent '{agent.name}' exceeded maximum session "
-                            f"duration of {max_session_seconds:.0f}s "
-                            f"after {turn_count} turn(s)",
-                            is_retryable=False,
-                        )
+                # Wall-clock session timeout, re-checked for the message just
+                # obtained: a message that arrived at or after the deadline is
+                # rejected rather than processed. The deadline itself is the
+                # same absolute instant the read above raced against.
+                if deadline is not None and time.monotonic() > deadline:
+                    raise ProviderError(
+                        f"Agent '{agent.name}' exceeded maximum session "
+                        f"duration of {max_session_seconds:.0f}s "
+                        f"after {turn_count} turn(s)",
+                        is_retryable=False,
+                    )
 
                 msg_type = type(message).__name__
 

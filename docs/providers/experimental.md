@@ -180,6 +180,20 @@ that bear on this provider's experimental status:
   dispatch tool to reach them, so they are refused rather than registered
   unreachable, at `conductor validate` and again at run time.
 
+## Interrupt and session timeout (`claude-agent-sdk`)
+
+Interrupt and `max_session_seconds` no longer wait for another message from
+the SDK before taking effect. Conductor waits for the SDK to finish cleaning
+up its resources before returning and before removing the temporary MCP
+configuration for that execution. As a result, returning after an interrupt
+or a timeout may take some additional time while that cleanup completes.
+There is no fixed guarantee on how long cleanup will take.
+
+`max_session_seconds` is one absolute deadline measured from the start of the
+execution; messages arriving in between do not extend it. When an interrupt
+and an expired deadline are both pending, the interrupt wins and the agent
+returns its partial output.
+
 ## See also
 
 - `AGENTS.md` — "Provider Parity" section (the rules experimental providers carve out from) and "Experimental Providers" section (rules they must still uphold)

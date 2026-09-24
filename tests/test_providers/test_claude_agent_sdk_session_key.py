@@ -361,11 +361,29 @@ class TestSessionIdProvenance:
         assert provider.get_session_ids() == {}
 
     async def test_session_recorded_when_interrupted(self) -> None:
-        """An interrupted agent is one whose context is worth resuming."""
+        """An interrupted agent is one whose context is worth resuming.
+
+        The interrupt arrives mid-stream, which is the case that has a session
+        to record: one already set when ``execute`` begins now returns before
+        the first read, so the SDK never reports a session id at all.
+        """
         rec = _Recorder(["sess-1"])
         interrupt = asyncio.Event()
-        interrupt.set()
-        with _sdk(rec):
+
+        def _interrupting_query(**kwargs: Any) -> Any:
+            stream = rec(**kwargs)
+
+            async def _gen() -> Any:
+                async for message in stream:
+                    interrupt.set()
+                    yield message
+
+            return _gen()
+
+        with (
+            _sdk(rec),
+            patch("conductor.providers.claude_agent_sdk.query", _interrupting_query),
+        ):
             provider = ClaudeAgentSdkProvider()
             agent = AgentDef(name="analyze", prompt="go", session_key="investigation")
             out = await provider.execute(

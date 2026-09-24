@@ -11,6 +11,7 @@ import os
 import re
 import stat
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,7 @@ from conductor.exceptions import ProviderError  # noqa: E402
 from conductor.providers.claude_agent_sdk import (  # noqa: E402
     ClaudeAgentSdkProvider,
     ClaudeAuthStatus,
+    _cancel_and_reap,
     _remove_mcp_config,
     _resolve_skill_plugins,
     _translate_mcp_servers,
@@ -2325,14 +2327,19 @@ class TestMcpOptionsWiring:
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_config_file_removed_on_interrupt_return(self) -> None:
-        """The interrupt path returns early from inside the loop — still cleans up."""
+        """The interrupt path returns before the first read — still cleans up."""
         captured: dict = {}
         interrupt = asyncio.Event()
         interrupt.set()
 
-        async def fake_query(**kwargs):
-            captured["path"] = kwargs["options"].mcp_servers
+        async def _messages():
             yield _assistant(content=[TextBlock(text="partial")])
+
+        def fake_query(**kwargs):
+            # Recorded when ``query`` is called, not from inside the iterator:
+            # an already-set interrupt returns without ever reading from it.
+            captured["path"] = kwargs["options"].mcp_servers
+            return _messages()
 
         _ready = ClaudeAuthStatus(requested_mode="auto", inferred_mode="api_key", ready=True)
         with (
@@ -4344,3 +4351,692 @@ class TestNativeToolsPolicy:
 
         assert list(options.agents) == ["p:rev"]
         assert options.tools == {"type": "preset", "preset": "claude_code"}
+
+
+# ---------------------------------------------------------------------------
+# Hard interruption and absolute session timeouts
+# ---------------------------------------------------------------------------
+
+#: Generous upper bound used only to fail a hung test instead of blocking the
+#: suite. Nothing below depends on its value for correctness.
+_HANG_GUARD_SECONDS = 5.0
+
+
+def _leaked_tasks(before: set[asyncio.Task[Any]]) -> list[asyncio.Task[Any]]:
+    """Tasks that appeared since ``before`` and are still pending.
+
+    Scoped to the delta so an unrelated task already running in the loop
+    cannot make this report a leak that is not ours.
+    """
+    current = asyncio.current_task()
+    return [t for t in asyncio.all_tasks() - before if t is not current and not t.done()]
+
+
+class _ControlledStream:
+    """Controllable stand-in for the SDK's message iterator.
+
+    ``__anext__`` hands back each queued message in turn -- after
+    ``gap_seconds`` when one is configured -- and then blocks on ``release``
+    until a test lets it finish. A test that never releases is exercising an
+    indefinitely blocked read, which is the whole point of this class.
+    """
+
+    def __init__(
+        self,
+        messages: list[Any] | None = None,
+        *,
+        gap_seconds: float = 0.0,
+        on_read: Callable[[], None] | None = None,
+        raises: BaseException | None = None,
+        controlled_teardown: bool = False,
+        trace: list[str] | None = None,
+    ) -> None:
+        self._messages = list(messages or [])
+        self._gap_seconds = gap_seconds
+        self._on_read = on_read
+        self._raises = raises
+        self.controlled_teardown = controlled_teardown
+        self.trace: list[str] = trace if trace is not None else []
+        self.anext_calls = 0
+        self.aclose_calls = 0
+        self.read_cancellations = 0
+        self.read_blocked = asyncio.Event()
+        self.release = asyncio.Event()
+        self.teardown_started = asyncio.Event()
+        self.allow_teardown_to_finish = asyncio.Event()
+        self.teardown_completed = asyncio.Event()
+
+    def __aiter__(self) -> _ControlledStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        self.anext_calls += 1
+        if self._on_read is not None:
+            self._on_read()
+        if self._raises is not None:
+            raise self._raises
+        try:
+            if self._gap_seconds:
+                await asyncio.sleep(self._gap_seconds)
+            if self._messages:
+                return self._messages.pop(0)
+            self.read_blocked.set()
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.read_cancellations += 1
+            if self.controlled_teardown:
+                self.teardown_started.set()
+                # A plain await: a second cancellation delivered here would
+                # raise straight out of it, leaving ``teardown_completed``
+                # clear -- which is how a leaked cancellation is detected.
+                await self.allow_teardown_to_finish.wait()
+            self.trace.append("read_teardown")
+            self.teardown_completed.set()
+            raise
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        self.trace.append("aclose")
+
+
+def _query_returning(*streams: _ControlledStream) -> Callable[..., _ControlledStream]:
+    """Patch target for ``query`` handing out each stream in call order."""
+    queued = list(streams)
+
+    def _query(**kwargs: Any) -> _ControlledStream:
+        return queued.pop(0) if len(queued) > 1 else queued[0]
+
+    return _query
+
+
+class _TeardownChild:
+    """A child task that blocks, then runs a controllable teardown.
+
+    It absorbs nothing. The single cancellation ``_cancel_and_reap`` delivers
+    is counted and re-raised; a *second* cancellation arriving while teardown
+    is blocked would raise straight out of the plain ``wait()`` below, leaving
+    ``teardown_completed`` clear.
+    """
+
+    def __init__(self) -> None:
+        self.block = asyncio.Event()
+        self.allow_teardown_to_finish = asyncio.Event()
+        self.teardown_started = asyncio.Event()
+        self.teardown_completed = asyncio.Event()
+        self.cancellations = 0
+
+    async def run(self) -> None:
+        try:
+            await self.block.wait()
+        except asyncio.CancelledError:
+            self.cancellations += 1
+            self.teardown_started.set()
+            await self.allow_teardown_to_finish.wait()
+            self.teardown_completed.set()
+            raise
+
+
+class TestCancelAndReap:
+    """``_cancel_and_reap`` is load-bearing: it must not forward the caller's
+    cancellation into a child that is already tearing down, and must not
+    mistake the child's own cancellation for the caller's."""
+
+    async def test_caller_cancellation_does_not_reach_a_blocked_teardown(self) -> None:
+        child = _TeardownChild()
+        child_task = asyncio.create_task(child.run())
+        await asyncio.sleep(0)  # let the child reach its block
+
+        runner = asyncio.create_task(_cancel_and_reap([child_task]))
+        await asyncio.wait_for(child.teardown_started.wait(), _HANG_GUARD_SECONDS)
+
+        runner.cancel()
+        await asyncio.sleep(0)
+
+        # The shield absorbed it: the child is still tearing down, and it has
+        # seen exactly the one cancellation cleanup delivered on purpose.
+        assert child.cancellations == 1
+        assert not child_task.done()
+        assert not runner.done()
+
+        child.allow_teardown_to_finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(runner, _HANG_GUARD_SECONDS)
+
+        assert child.teardown_completed.is_set()
+        assert child_task.done()
+
+    async def test_repeated_caller_cancellation_is_absorbed_each_time(self) -> None:
+        child = _TeardownChild()
+        child_task = asyncio.create_task(child.run())
+        await asyncio.sleep(0)
+
+        runner = asyncio.create_task(_cancel_and_reap([child_task]))
+        await asyncio.wait_for(child.teardown_started.wait(), _HANG_GUARD_SECONDS)
+
+        runner.cancel()
+        await asyncio.sleep(0)
+        runner.cancel()
+        await asyncio.sleep(0)
+
+        assert child.cancellations == 1
+        assert not child_task.done()
+        assert not runner.done()
+
+        child.allow_teardown_to_finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(runner, _HANG_GUARD_SECONDS)
+
+        assert child.teardown_completed.is_set()
+
+    @pytest.mark.parametrize("cancel_before_release", [True, False])
+    async def test_caller_cancellation_and_child_completion_in_one_turn(
+        self, cancel_before_release: bool
+    ) -> None:
+        """The case ``task.done()`` alone cannot classify.
+
+        With no ``await`` between the two actions, the caller's cancellation
+        and the child's completion land in the same event-loop turn. An
+        implementation that decides "was I cancelled?" from ``task.done()``
+        returns normally here instead of propagating.
+        """
+        before = asyncio.all_tasks()
+        child = _TeardownChild()
+        child_task = asyncio.create_task(child.run())
+        await asyncio.sleep(0)
+
+        runner = asyncio.create_task(_cancel_and_reap([child_task, None]))
+        await asyncio.wait_for(child.teardown_started.wait(), _HANG_GUARD_SECONDS)
+
+        if cancel_before_release:
+            runner.cancel()
+            child.allow_teardown_to_finish.set()
+        else:
+            child.allow_teardown_to_finish.set()
+            runner.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(runner, _HANG_GUARD_SECONDS)
+
+        assert child.cancellations == 1
+        assert child.teardown_completed.is_set()
+        assert child_task.done()
+        assert _leaked_tasks(before) == []
+
+    async def test_expected_child_cancellation_is_not_read_as_the_callers(self) -> None:
+        """Negative control: no caller cancellation, so none is reported."""
+        before = asyncio.all_tasks()
+        child = _TeardownChild()
+        child.allow_teardown_to_finish.set()  # teardown is not gated here
+        child_task = asyncio.create_task(child.run())
+        await asyncio.sleep(0)
+
+        # Returns normally: the only CancelledError seen is the child's own.
+        await asyncio.wait_for(_cancel_and_reap([None, child_task]), _HANG_GUARD_SECONDS)
+
+        assert child.cancellations == 1
+        assert child.teardown_completed.is_set()
+        assert child_task.done()
+        assert _leaked_tasks(before) == []
+
+
+@patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+@patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+class TestBlockedReadPreemption:
+    """Interrupt and the session deadline must pre-empt a blocked SDK read."""
+
+    async def test_interrupt_preempts_an_indefinitely_blocked_read(self) -> None:
+        before = asyncio.all_tasks()
+        interrupt = asyncio.Event()
+        stream = _ControlledStream()
+
+        with patch("conductor.providers.claude_agent_sdk.query", _query_returning(stream)):
+            provider = ClaudeAgentSdkProvider()
+            execution = asyncio.create_task(
+                provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                    interrupt_signal=interrupt,
+                )
+            )
+            await asyncio.wait_for(stream.read_blocked.wait(), _HANG_GUARD_SECONDS)
+            interrupt.set()
+            output = await asyncio.wait_for(execution, _HANG_GUARD_SECONDS)
+
+        assert output.partial is True
+        assert stream.read_cancellations == 1
+        assert stream.aclose_calls == 1
+        assert _leaked_tasks(before) == []
+
+    async def test_preset_interrupt_starts_no_read_at_all(self) -> None:
+        before = asyncio.all_tasks()
+        interrupt = asyncio.Event()
+        interrupt.set()
+        stream = _ControlledStream([_assistant(content=[TextBlock(text="never")])])
+
+        with patch("conductor.providers.claude_agent_sdk.query", _query_returning(stream)):
+            provider = ClaudeAgentSdkProvider()
+            output = await asyncio.wait_for(
+                provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                    interrupt_signal=interrupt,
+                ),
+                _HANG_GUARD_SECONDS,
+            )
+
+        assert output.partial is True
+        assert stream.anext_calls == 0
+        assert _leaked_tasks(before) == []
+
+    async def test_interrupt_preserves_text_already_received(self) -> None:
+        """Text from a delivered message survives an interrupt taken later.
+
+        The interrupt is set only once the *next* read is blocked, so the
+        pre-empted read is provably the second one and the first message has
+        already been processed.
+        """
+        interrupt = asyncio.Event()
+        stream = _ControlledStream([_assistant(content=[TextBlock(text="part one")])])
+
+        with patch("conductor.providers.claude_agent_sdk.query", _query_returning(stream)):
+            provider = ClaudeAgentSdkProvider()
+            execution = asyncio.create_task(
+                provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                    interrupt_signal=interrupt,
+                )
+            )
+            # Fires on the read *after* the message, so the first one is done.
+            await asyncio.wait_for(stream.read_blocked.wait(), _HANG_GUARD_SECONDS)
+            interrupt.set()
+            output = await asyncio.wait_for(execution, _HANG_GUARD_SECONDS)
+
+        assert output.partial is True
+        assert "part one" in str(output.content)
+        assert stream.anext_calls == 2
+
+    async def test_timeout_preempts_an_indefinitely_blocked_read(self) -> None:
+        before = asyncio.all_tasks()
+        stream = _ControlledStream()
+
+        with patch("conductor.providers.claude_agent_sdk.query", _query_returning(stream)):
+            provider = ClaudeAgentSdkProvider(max_session_seconds=0.05)
+            with pytest.raises(ProviderError, match="exceeded maximum session duration") as err:
+                await asyncio.wait_for(
+                    provider.execute(
+                        agent=AgentDef(name="t", prompt="hi"),
+                        context={},
+                        rendered_prompt="hi",
+                    ),
+                    _HANG_GUARD_SECONDS,
+                )
+
+        assert err.value.is_retryable is False
+        assert stream.read_cancellations == 1
+        assert stream.aclose_calls == 1
+        assert _leaked_tasks(before) == []
+
+    async def test_expired_deadline_starts_no_read_at_all(self) -> None:
+        # Negative so the absolute deadline is already in the past when the
+        # first read is about to start -- no sleeping and no clock patching,
+        # so the short-circuit is proven rather than raced for.
+        stream = _ControlledStream([_assistant(content=[TextBlock(text="never")])])
+
+        with patch("conductor.providers.claude_agent_sdk.query", _query_returning(stream)):
+            provider = ClaudeAgentSdkProvider(max_session_seconds=-1.0)
+            with pytest.raises(ProviderError, match="exceeded maximum session duration"):
+                await asyncio.wait_for(
+                    provider.execute(
+                        agent=AgentDef(name="t", prompt="hi"),
+                        context={},
+                        rendered_prompt="hi",
+                    ),
+                    _HANG_GUARD_SECONDS,
+                )
+
+        assert stream.anext_calls == 0
+
+    async def test_interrupt_wins_when_both_are_already_true(self) -> None:
+        interrupt = asyncio.Event()
+        interrupt.set()
+        stream = _ControlledStream([_assistant(content=[TextBlock(text="never")])])
+
+        with patch("conductor.providers.claude_agent_sdk.query", _query_returning(stream)):
+            provider = ClaudeAgentSdkProvider(max_session_seconds=-1.0)
+            output = await asyncio.wait_for(
+                provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                    interrupt_signal=interrupt,
+                ),
+                _HANG_GUARD_SECONDS,
+            )
+
+        assert output.partial is True
+        assert stream.anext_calls == 0
+
+    async def test_intermediate_messages_do_not_reset_the_deadline(self) -> None:
+        """The deadline is absolute: two gaps, each under it, still exceed it.
+
+        ``release`` is set up front so the read after the last message ends
+        the stream instead of blocking. That is what makes this discriminate:
+        a deadline restarted per message would let the stream drain and the
+        execution succeed, rather than timing out on a read that never ends.
+        """
+        stream = _ControlledStream(
+            [
+                _assistant(content=[TextBlock(text="one")]),
+                _assistant(content=[TextBlock(text="two")]),
+            ],
+            gap_seconds=0.2,
+        )
+        stream.release.set()
+
+        with patch("conductor.providers.claude_agent_sdk.query", _query_returning(stream)):
+            provider = ClaudeAgentSdkProvider(max_session_seconds=0.3)
+            with pytest.raises(ProviderError, match="exceeded maximum session duration") as err:
+                await asyncio.wait_for(
+                    provider.execute(
+                        agent=AgentDef(name="t", prompt="hi"),
+                        context={},
+                        rendered_prompt="hi",
+                    ),
+                    _HANG_GUARD_SECONDS,
+                )
+
+        # Tripped on the second read, after one turn. A per-message deadline
+        # would not have tripped at all.
+        assert "after 1 turn(s)" in str(err.value)
+
+    async def test_interrupt_still_beats_a_simultaneously_available_message(self) -> None:
+        """Tie behavior is unchanged: the in-body check owns this case."""
+        interrupt = asyncio.Event()
+        stream = _ControlledStream(
+            [_assistant(content=[TextBlock(text="arrived with the interrupt")])],
+            on_read=interrupt.set,
+        )
+
+        with patch("conductor.providers.claude_agent_sdk.query", _query_returning(stream)):
+            provider = ClaudeAgentSdkProvider()
+            output = await asyncio.wait_for(
+                provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                    interrupt_signal=interrupt,
+                ),
+                _HANG_GUARD_SECONDS,
+            )
+
+        assert output.partial is True
+        assert stream.anext_calls == 1
+        assert "arrived with the interrupt" not in str(output.content)
+
+    async def test_sdk_error_is_not_swallowed_into_interrupt_or_timeout(self) -> None:
+        """A genuine SDK failure outranks a signal that is true at the same time."""
+        interrupt = asyncio.Event()
+        stream = _ControlledStream(
+            raises=RuntimeError("connection refused"),
+            on_read=interrupt.set,
+        )
+
+        with patch("conductor.providers.claude_agent_sdk.query", _query_returning(stream)):
+            provider = ClaudeAgentSdkProvider(max_session_seconds=0.05)
+            with pytest.raises(ProviderError, match="connection refused"):
+                await asyncio.wait_for(
+                    provider.execute(
+                        agent=AgentDef(name="t", prompt="hi"),
+                        context={},
+                        rendered_prompt="hi",
+                        interrupt_signal=interrupt,
+                    ),
+                    _HANG_GUARD_SECONDS,
+                )
+
+    async def test_exhausted_iterator_completes_normally(self) -> None:
+        before = asyncio.all_tasks()
+        stream = _ControlledStream([_result(result="done")])
+        stream.release.set()  # the read after the last message ends the stream
+
+        with patch("conductor.providers.claude_agent_sdk.query", _query_returning(stream)):
+            provider = ClaudeAgentSdkProvider()
+            output = await asyncio.wait_for(
+                provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                ),
+                _HANG_GUARD_SECONDS,
+            )
+
+        assert output.partial is False
+        assert output.content == {"response": "done"}
+        assert _leaked_tasks(before) == []
+
+    async def test_outer_cancellation_propagates(self) -> None:
+        before = asyncio.all_tasks()
+        stream = _ControlledStream()
+
+        with patch("conductor.providers.claude_agent_sdk.query", _query_returning(stream)):
+            provider = ClaudeAgentSdkProvider()
+            execution = asyncio.create_task(
+                provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                )
+            )
+            await asyncio.wait_for(stream.read_blocked.wait(), _HANG_GUARD_SECONDS)
+            execution.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(execution, _HANG_GUARD_SECONDS)
+
+        assert stream.read_cancellations == 1
+        assert stream.aclose_calls == 1
+        assert _leaked_tasks(before) == []
+
+
+@patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+@patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", Mock)
+class TestGeneratorFinalization:
+    """Every exit path closes the SDK generator and leaves no owned task."""
+
+    async def _run(self, stream: _ControlledStream, **kwargs: Any) -> Any:
+        with patch("conductor.providers.claude_agent_sdk.query", _query_returning(stream)):
+            provider = ClaudeAgentSdkProvider(
+                max_session_seconds=kwargs.pop("max_session_seconds", None)
+            )
+            return await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"),
+                context={},
+                rendered_prompt="hi",
+                **kwargs,
+            )
+
+    async def test_finalized_on_success(self) -> None:
+        before = asyncio.all_tasks()
+        stream = _ControlledStream([_result(result="done")])
+        stream.release.set()
+        await asyncio.wait_for(self._run(stream), _HANG_GUARD_SECONDS)
+        assert stream.aclose_calls == 1
+        assert _leaked_tasks(before) == []
+
+    async def test_finalized_on_interrupt(self) -> None:
+        before = asyncio.all_tasks()
+        interrupt = asyncio.Event()
+        interrupt.set()
+        stream = _ControlledStream()
+        await asyncio.wait_for(self._run(stream, interrupt_signal=interrupt), _HANG_GUARD_SECONDS)
+        assert stream.aclose_calls == 1
+        assert _leaked_tasks(before) == []
+
+    async def test_finalized_on_timeout(self) -> None:
+        before = asyncio.all_tasks()
+        stream = _ControlledStream()
+        with pytest.raises(ProviderError, match="exceeded maximum session duration"):
+            await asyncio.wait_for(self._run(stream, max_session_seconds=0.05), _HANG_GUARD_SECONDS)
+        assert stream.aclose_calls == 1
+        assert _leaked_tasks(before) == []
+
+    async def test_finalized_on_sdk_error(self) -> None:
+        before = asyncio.all_tasks()
+        stream = _ControlledStream(raises=RuntimeError("boom"))
+        with pytest.raises(ProviderError, match="boom"):
+            await asyncio.wait_for(self._run(stream), _HANG_GUARD_SECONDS)
+        assert stream.aclose_calls == 1
+        assert _leaked_tasks(before) == []
+
+    async def test_finalized_on_outer_cancellation(self) -> None:
+        before = asyncio.all_tasks()
+        stream = _ControlledStream()
+        execution = asyncio.create_task(self._run(stream))
+        await asyncio.wait_for(stream.read_blocked.wait(), _HANG_GUARD_SECONDS)
+        execution.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(execution, _HANG_GUARD_SECONDS)
+        assert stream.aclose_calls == 1
+        assert _leaked_tasks(before) == []
+
+
+@patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+class TestTeardownOrderingAndIsolation:
+    """The MCP secrets file outlives the read task and the generator."""
+
+    _SERVERS = {"docs": {"type": "stdio", "command": "docs-server"}}
+
+    async def test_mcp_config_removed_only_after_teardown(self) -> None:
+        before = asyncio.all_tasks()
+        trace: list[str] = []
+        captured: dict[str, Any] = {}
+        interrupt = asyncio.Event()
+        stream = _ControlledStream(trace=trace)
+
+        def _query(**kwargs: Any) -> _ControlledStream:
+            captured["path"] = kwargs["options"].mcp_servers
+            return stream
+
+        with (
+            patch("conductor.providers.claude_agent_sdk.query", _query),
+            patch(
+                "conductor.providers.claude_agent_sdk._remove_mcp_config",
+                side_effect=lambda path: trace.append("remove_mcp_config"),
+            ),
+        ):
+            provider = ClaudeAgentSdkProvider(mcp_servers=self._SERVERS)
+            execution = asyncio.create_task(
+                provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                    interrupt_signal=interrupt,
+                )
+            )
+            await asyncio.wait_for(stream.read_blocked.wait(), _HANG_GUARD_SECONDS)
+            interrupt.set()
+            await asyncio.wait_for(execution, _HANG_GUARD_SECONDS)
+
+        assert trace == ["read_teardown", "aclose", "remove_mcp_config"]
+        assert _leaked_tasks(before) == []
+        # The real file is gone too (the recorder above replaced the unlink).
+        Path(captured["path"]).unlink(missing_ok=True)
+
+    async def test_outer_cancellation_waits_for_a_blocked_read_teardown(self) -> None:
+        """Shield keeps the read task alive until it has finished tearing down."""
+        before = asyncio.all_tasks()
+        trace: list[str] = []
+        stream = _ControlledStream(controlled_teardown=True, trace=trace)
+
+        with (
+            patch("conductor.providers.claude_agent_sdk.query", _query_returning(stream)),
+            patch(
+                "conductor.providers.claude_agent_sdk._remove_mcp_config",
+                side_effect=lambda path: trace.append("remove_mcp_config"),
+            ),
+        ):
+            provider = ClaudeAgentSdkProvider(mcp_servers=self._SERVERS)
+            execution = asyncio.create_task(
+                provider.execute(
+                    agent=AgentDef(name="t", prompt="hi"),
+                    context={},
+                    rendered_prompt="hi",
+                )
+            )
+            await asyncio.wait_for(stream.read_blocked.wait(), _HANG_GUARD_SECONDS)
+
+            execution.cancel()
+            await asyncio.wait_for(stream.teardown_started.wait(), _HANG_GUARD_SECONDS)
+
+            # Cancel the caller *again*, while the read is mid-teardown. The
+            # shield must absorb it: forwarding it would raise inside the
+            # read's own cleanup and lose the teardown entirely.
+            execution.cancel()
+            await asyncio.sleep(0)
+
+            # Still tearing down, and neither caller cancellation reached it:
+            # one cancellation, and nothing cleaned up yet.
+            assert stream.read_cancellations == 1
+            assert not execution.done()
+            assert trace == []
+
+            stream.allow_teardown_to_finish.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(execution, _HANG_GUARD_SECONDS)
+
+        assert trace == ["read_teardown", "aclose", "remove_mcp_config"]
+        assert _leaked_tasks(before) == []
+
+    async def test_concurrent_executions_stay_independent(self) -> None:
+        before = asyncio.all_tasks()
+        paths: list[str] = []
+        interrupt_a = asyncio.Event()
+        interrupt_b = asyncio.Event()
+        stream_a = _ControlledStream()
+        stream_b = _ControlledStream([_result(result="b done")])
+        stream_b.release.set()
+        streams = {"a": stream_a, "b": stream_b}
+
+        def _query(**kwargs: Any) -> _ControlledStream:
+            paths.append(kwargs["options"].mcp_servers)
+            return streams[kwargs["prompt"]]
+
+        with patch("conductor.providers.claude_agent_sdk.query", _query):
+            provider = ClaudeAgentSdkProvider(mcp_servers=self._SERVERS)
+            agent = AgentDef(name="t", prompt="hi")
+            run_a = asyncio.create_task(
+                provider.execute(
+                    agent=agent,
+                    context={},
+                    rendered_prompt="a",
+                    interrupt_signal=interrupt_a,
+                )
+            )
+            await asyncio.wait_for(stream_a.read_blocked.wait(), _HANG_GUARD_SECONDS)
+            output_b = await asyncio.wait_for(
+                provider.execute(
+                    agent=agent,
+                    context={},
+                    rendered_prompt="b",
+                    interrupt_signal=interrupt_b,
+                ),
+                _HANG_GUARD_SECONDS,
+            )
+            # B finished untouched while A is still blocked on its own read.
+            assert output_b.partial is False
+            assert output_b.content == {"response": "b done"}
+            assert not run_a.done()
+            assert not interrupt_a.is_set()
+
+            interrupt_a.set()
+            output_a = await asyncio.wait_for(run_a, _HANG_GUARD_SECONDS)
+
+        assert output_a.partial is True
+        assert len(paths) == 2
+        assert paths[0] != paths[1]
+        assert not any(Path(p).exists() for p in paths)
+        assert _leaked_tasks(before) == []
