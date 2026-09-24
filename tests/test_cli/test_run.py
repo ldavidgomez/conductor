@@ -11,6 +11,8 @@ This module tests:
 from __future__ import annotations
 
 import os
+import re
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,6 +31,65 @@ from conductor.console import make_console
 from conductor.mcp_auth import resolve_mcp_env_vars
 
 runner = CliRunner()
+
+
+def _unwrapped(panel_text: str) -> str:
+    """Strip whitespace and panel borders so text Rich wrapped mid-token still matches."""
+    return re.sub(r"[\s│]+", "", panel_text)
+
+
+class TestScriptRouteFailureCli:
+    @pytest.mark.parametrize("silent", [False, True])
+    def test_missing_script_file_reports_context(self, tmp_path: Path, silent: bool) -> None:
+        workflow_file = tmp_path / "script.yaml"
+        missing = tmp_path / "missing.py"
+        workflow_file.write_text(
+            f"""\
+workflow:
+  name: script-route-error
+  entry_point: detector
+agents:
+  - name: detector
+    type: script
+    command: {sys.executable!r}
+    args: [{str(missing)!r}]
+    routes:
+      - to: handler
+        when: "{{{{ output.ok }}}}"
+      - to: $end
+  - name: handler
+    type: script
+    command: {sys.executable!r}
+    args: ["-c", "print('handled')"]
+    routes:
+      - to: $end
+"""
+        )
+        args = (["--silent"] if silent else []) + [
+            "run",
+            str(workflow_file),
+            "--no-interactive",
+        ]
+        result = runner.invoke(app, args)
+        assert result.exit_code != 0, (result.stdout, result.stderr)
+        if silent:
+            assert "exit 2" not in result.stdout
+        else:
+            assert "exit 2" in result.output
+        # The error panel wraps at the console width, and the missing file's
+        # path has no spaces to break at, so on a long temp dir (Windows CI)
+        # Rich splits it mid-name. Compare with wrapping undone.
+        stderr = _unwrapped(result.stderr)
+        for expected in (
+            "detector",
+            "{{ output.ok }}",
+            "script exit 2",
+            "stdout: empty or whitespace-only",
+            missing.name,
+        ):
+            assert _unwrapped(expected) in stderr, result.stderr
+        assert "Ensure variable 'dict object'" not in result.output
+        assert "handled" not in result.output
 
 
 class TestCoerceValue:
