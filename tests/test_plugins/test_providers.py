@@ -19,7 +19,6 @@ from conductor.config.schema import AgentDef, OutputField
 from conductor.exceptions import ProviderError
 from conductor.providers.base import AgentProvider
 from conductor.providers.copilot import CopilotProvider
-from tests.test_providers.claude_sdk_harness import patch_sdk
 
 from .conftest import PLUGIN_CAPABLE_CAPS
 
@@ -213,6 +212,7 @@ class TestClaudeAgentSdkDelivery:
     async def test_plugin_agents_reach_the_options_object(self) -> None:
         pytest.importorskip("claude_agent_sdk")
         from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+        from tests.test_providers.claude_sdk_harness import patch_sdk
 
         options_mock = MagicMock()
 
@@ -253,6 +253,7 @@ class TestClaudeAgentSdkDelivery:
         """
         pytest.importorskip("claude_agent_sdk")
         from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+        from tests.test_providers.claude_sdk_harness import patch_sdk
 
         queried = False
 
@@ -298,6 +299,7 @@ class TestClaudeAgentSdkDelivery:
         # meaning here, so the option stays out of the request entirely.
         pytest.importorskip("claude_agent_sdk")
         from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+        from tests.test_providers.claude_sdk_harness import patch_sdk
 
         options_mock = MagicMock()
 
@@ -322,6 +324,7 @@ class TestClaudeAgentSdkDelivery:
         # The only layer that runs during `conductor run` on this provider.
         pytest.importorskip("claude_agent_sdk")
         from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+        from tests.test_providers.claude_sdk_harness import patch_sdk
 
         async def fake_query(**kwargs: Any) -> Any:
             if False:
