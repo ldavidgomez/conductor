@@ -19,6 +19,7 @@ from conductor.config.schema import AgentDef, OutputField
 from conductor.exceptions import ProviderError
 from conductor.providers.base import AgentProvider
 from conductor.providers.copilot import CopilotProvider
+from tests.test_providers.claude_sdk_harness import patch_sdk
 
 from .conftest import PLUGIN_CAPABLE_CAPS
 
@@ -221,7 +222,7 @@ class TestClaudeAgentSdkDelivery:
 
         with (
             patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
             _auth_ready(),
         ):
@@ -263,7 +264,7 @@ class TestClaudeAgentSdkDelivery:
 
         with (
             patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             _auth_ready(),
         ):
             provider = ClaudeAgentSdkProvider()
@@ -306,7 +307,7 @@ class TestClaudeAgentSdkDelivery:
 
         with (
             patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             patch("conductor.providers.claude_agent_sdk.ClaudeAgentOptions", options_mock),
             _auth_ready(),
         ):
@@ -328,7 +329,7 @@ class TestClaudeAgentSdkDelivery:
 
         with (
             patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
-            patch("conductor.providers.claude_agent_sdk.query", fake_query),
+            patch_sdk(fake_query),
             _auth_ready(),
         ):
             provider = ClaudeAgentSdkProvider(
