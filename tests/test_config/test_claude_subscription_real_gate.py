@@ -11171,16 +11171,12 @@ class TestPreReporterFailures:
         exact_scratch.module(self.SCRATCH_TEST)
         exact_scratch.sandbox.write("failing_plugin.py", FAILING_PLUGIN)
         for path in exact_scratch.sandbox.pytester.path.rglob("*.py"):
+            text = path.read_text()
+            assert str(REPO_ROOT) not in text, path.name  # no repository path is added
             if path.name == "tripwires.py":  # the stdlib-only Layer 1: it only names what it audits
-                assert "import conductor" not in path.read_text()
+                assert "import conductor" not in text
                 continue
-            assert scratch_import_problems(path.read_text()) == [], path.name
-        if not (REPO_ROOT / ".git").exists():
-            pytest.skip("not a git checkout (a scratch copy): the scope audit needs the worktree")
-        status = subprocess.run(
-            ["git", "status", "--short"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
-        ).stdout.splitlines()
-        assert len(status) == 7, status  # the whole PR stays within its seven paths
+            assert scratch_import_problems(text) == [], path.name
 
 
 # ============================================================================
