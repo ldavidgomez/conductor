@@ -4,9 +4,12 @@
 [Experimental Providers](experimental.md)). This page is the operator runbook for using it with a
 Claude subscription login, and for the maintainer-only live validation harness.
 
-**No live validation has been run yet.** Every *live-proven* cell in the
-[status table](#status-table) reads *not yet*. Nothing on this page claims that a real Claude CLI,
-login or inference has been exercised by the automated harness.
+**No passing official evidence exists yet. The readiness-only check passed once during development.
+The first official validation attempt was retained as a non-official failure record, which authorizes
+nothing. Any future readiness or official operation requires fresh explicit human approval, and no
+retry is ever automatic.** Every *live-proven* cell in the [status table](#status-table) reads
+*not yet*. Nothing on this page claims that a real Claude CLI, login or inference has been exercised
+by the automated harness.
 
 ## What this is, and what it is not
 
@@ -129,8 +132,11 @@ can settle.
 | `conductor run` on a real login | yes | yes (mocked) | *manual step only* | none |
 | Live harness (L0, L1, L3, L2) | yes | yes (all boundaries replaced) | *not yet* | every real-CLI behavior above |
 
-The *live-proven* column changes only from official evidence, never from expectation. No live run
-has been performed, so there is no live result to report.
+The *live-proven* column changes only from official evidence, never from expectation. No passing
+official evidence exists yet. The readiness-only check passed once during development. The first
+official validation attempt was retained as a non-official failure record, which authorizes nothing.
+Any future readiness or official operation requires fresh explicit human approval, and no retry is
+ever automatic.
 
 ## Live validation (maintainers)
 
@@ -138,7 +144,10 @@ The harness is `tests/test_integration/test_claude_agent_sdk_subscription_real.p
 safety tests in `tests/test_config/test_claude_subscription_real_gate.py`. It is experimental,
 POSIX-only and never runs in CI, on untrusted pull requests or on shared accounts.
 
-There are two live operations. Each needs its own explicit approval, and **neither has been run**:
+There are two live operations. No passing official evidence exists yet. The readiness-only check
+passed once during development. The first official validation attempt was retained as a non-official
+failure record, which authorizes nothing. Any future readiness or official operation requires fresh
+explicit human approval, and no retry is ever automatic. The two operations are:
 
 - the **readiness-only check** (`-k readiness_probe_only`) runs case L0 alone. It makes **one**
   authentication probe and no inference. It is **not official end-to-end evidence**.
@@ -184,7 +193,12 @@ Each authentication probe may read or refresh authentication state, contact Anth
 raise a Keychain prompt, which may surface as `Authentication check timed out`. A person must be at
 the machine throughout **both** the readiness-only check and the official live validation.
 
-### Commands (each needs explicit approval; none has been run)
+### Commands
+
+No passing official evidence exists yet. The readiness-only check passed once during development. The
+first official validation attempt was retained as a non-official failure record, which authorizes
+nothing. Any future readiness or official operation requires fresh explicit human approval, and no
+retry is ever automatic.
 
 Run both operations in **Bash or Zsh** (zsh on macOS, bash on Linux), from a **plain terminal
 session**, never from inside a Claude Code session shell or another agent shell. Write the steps
@@ -470,6 +484,76 @@ Only allowlisted fields are ever retained: versions, model names, environment va
 booleans, fixed outcome codes, token counts and estimated cost. Never retained: account identity,
 raw `auth status` output, credential or canary values, the raw subscription type, home paths,
 Keychain data, raw stdout/stderr, raw log text, exception arguments or matched text.
+
+### Reading the L3 diagnostic fields
+
+The L3 case record (the invalid-key case) may carry three closed-enum **diagnostic fields**:
+`diag_provider_retryability`, `diag_assistant_error` and `diag_api_status`. They **only describe**
+what the harness observed. They never classify, never change an outcome and never authorize a
+step: `invalid_key` still requires typed, non-retryable authentication evidence from the
+provider error and the observed signals, and message text is never used.
+
+The three states are exact:
+
+- `absent` (one field) means the harness collected the signal and saw nothing of that kind.
+- `unavailable` (always all three fields) means the outcome was already fixed and the diagnostic
+  collection or validation then failed.
+- **Omission of all three fields** means L3 classification was never reached, or the capture
+  predates the diagnostic fields. An omitted triple on a `failure_record` is **not itself proof**
+  that classification was never reached: it may be a pre-amendment capture; it remains
+  non-authorizing, and an `official` capture rejects omission (§5.8 item 9).
+
+An `official` capture is accepted only if its L3 record carries a qualifying triple (a
+non-retryable or `mixed` retryability **and** a typed 401) or the complete all-`unavailable`
+triple; the check can only reject, never create an `official` verdict.
+
+The table below is read on the record's **`adapter_outcome`** (what the unchanged classification
+produced), **not** on `outcome`, which a canary or descendant finding can replace. `AO` is the
+`adapter_outcome`, `R` is `diag_provider_retryability`, `A` is `diag_assistant_error` and `S` is
+`diag_api_status`. `T` (typed 401) means `A = authentication_failed` or `S = "401"`. `Q` (the
+gate's non-retryable condition) means `R ∈ {non_retryable, mixed}`. `X` (transient-looking signal)
+means `A ∈ {rate_limit, server_error}` or `S ∈ {"429", 5xx}`. The state of the triple is **C**
+(complete, valid, none `unavailable`), **U** (all three `unavailable`), **O** (omitted) or **M**
+(present but neither C nor U). `K` is {`invalid_key`, `inconclusive`}. Rows 1 to 6 apply only to
+`AO ∈ K` and state C; rows 7a to 7d are the complement. Every row ends with the same rule: **no
+further run and no automatic retry**.
+
+| Row | Predicate | Conclusion | Cannot be concluded | Next action |
+|---|---|---|---|---|
+| **1. Retryable error** | `AO = inconclusive ∧ C ∧ R = retryable ∧ ¬T` | the provider classified the failure as retry-eligible; `rate_limit` or `"429"` points to rate limiting, `server_error` or `5xx` to the provider side | whether an invalid key is rejected with a typed 401 | `environment_investigation` |
+| **2. Non-retryable typed 401** | `AO = invalid_key ∧ C ∧ Q ∧ T` | the fake key was rejected with typed, non-retryable authentication evidence; for `mixed`, a qualifying non-retryable error existed **and** a retryable `ProviderError` was also observed in the same chain, and the conclusion holds for the non-retryable error only | a failure elsewhere in the capture; for `mixed`, which error ended the run | `read_failing_case` |
+| **3. Non-retryable other 4xx** | `AO = inconclusive ∧ C ∧ R = non_retryable ∧ ¬T ∧ S ≠ "404" ∧ ¬X ∧ (S ∈ {"403", other_4xx} ∨ A ∈ {billing_error, invalid_request})` | the provider rejected the request non-retryably with a status or error the harness does not treat as authentication | whether the key was or was not the cause | `environment_investigation` |
+| **4a. No typed signal (non-retryable)** | `AO = inconclusive ∧ C ∧ R = non_retryable ∧ ¬T ∧ S ≠ "404" ∧ ¬X ∧ S ∈ {absent, other} ∧ A ∈ {unknown, other, absent}` | the provider declared the failure non-retryable but no typed signal reached the observer | whether the key was rejected | `harness_investigation` |
+| **4b. No `ProviderError`** | `AO = inconclusive ∧ C ∧ R = absent ∧ ¬T` | the failure was not a `ProviderError` (read `exception_class`) | whether the key was rejected | `environment_investigation` |
+| **5a. Contradictory: retryable with a typed 401** | `AO = inconclusive ∧ C ∧ R = retryable ∧ T` | the observed signals do not describe one failure | which signal is the truth | `product_investigation_offline` |
+| **5b. Contradictory: typed 401 without a `ProviderError`** | `AO = inconclusive ∧ C ∧ R = absent ∧ T` | the observation and the exception do not describe one failure | which signal is the truth | `harness_investigation` |
+| **5c. Contradictory: mixed chain, no typed 401** | `AO = inconclusive ∧ C ∧ R = mixed ∧ ¬T ∧ S ≠ "404"` | the chain held both a retryable and a non-retryable `ProviderError` and no typed signal explains either | which error ended the run | `harness_investigation` |
+| **5d. Contradictory: transient signal on a non-retryable error** | `AO = inconclusive ∧ C ∧ R = non_retryable ∧ ¬T ∧ S ≠ "404" ∧ X` | a non-retryable error carries a transient-looking signal | which signal is the truth | `harness_investigation` |
+| **6a. Impossible: `invalid_key` without qualifying evidence** | `AO = invalid_key ∧ C ∧ ¬(Q ∧ T)` | the diagnostics and the unchanged classification disagree: a harness defect | the diagnostics never re-derive the outcome | `harness_defect_review` |
+| **6b. Impossible: `inconclusive` with qualifying evidence** | `AO = inconclusive ∧ C ∧ Q ∧ T` | the classification would have returned `invalid_key`: a harness defect | as row 6a | `harness_defect_review` |
+| **6c. Impossible: `inconclusive` with a 404 and no typed 401** | `AO = inconclusive ∧ C ∧ Q ∧ ¬T ∧ S = "404"` | the classification would have returned `model_unavailable`: a harness defect | as row 6a | `harness_defect_review` |
+| **7a. Uninterpretable: another outcome** | `AO ∉ K` | nothing from this table | anything about the invalid-key result from the diagnostics | `no_diagnostic_reading` |
+| **7b. Uninterpretable: diagnostics unavailable** | `AO ∈ K ∧ U` | the classification completed and the outcome stands; the collection or validation failed afterwards | anything the diagnostics would have said | `harness_investigation` |
+| **7c. Uninterpretable: diagnostics omitted** | `AO ∈ K ∧ O` | classification was not reached on the diagnostic path, or the capture predates the diagnostic fields | anything from the diagnostics | `no_diagnostic_reading` |
+| **7d. Uninterpretable: malformed triple** | `AO ∈ K ∧ M` | the triple is not valid; the offline classifier discards such a capture | anything | `harness_defect_review` |
+
+Read `AO` first, then the state of the triple, then `R`, `T`, `S` and `A`, and always together
+with `exception_class`, `elapsed_s`, `quota_attempts_total` and `interrupted`. A diagnostic reading
+is a reason to investigate offline, never a reason to run again and never a reason to change the
+classification. `uninterpretable` describes the evidence, not a verdict.
+
+**The first official live validation.** Its capture is a **retained local failure record**: it is
+never shared, committed, quoted as successful or official evidence or used to authorize another
+step, it has no diagnostic fields and it receives no retroactive interpretation. The official live
+validation has **not** passed, and nothing on this page calls that run a pass, a partial pass or
+evidence of subscription inference.
+
+**No step is ever retried automatically.** A new official live validation is considered only after
+the offline correction is implemented, the full offline safety tests and the focused
+falsification checks pass, an independent reviewer accepts it and it is committed on the same feature branch. It
+then needs a **fresh, separate human approval** with the human present: the review, the commit and
+this page do not imply it. Repeating the readiness-only check first is the human's separate
+decision; nothing here requires or authorizes it.
 
 ### Descendant processes
 

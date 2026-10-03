@@ -71,6 +71,15 @@ every other combination.  An interruption before a run-level record exists is di
 the count lines are pytest constants: a change to any fixed line makes the classifier discard the
 capture, and the offline gate tests are rerun after any pytest upgrade and before live validation.
 
+L3 diagnostics.  The L3 case record may carry three closed-enum diagnostic fields
+(``diag_provider_retryability``, ``diag_assistant_error``, ``diag_api_status``) that only describe
+what the harness observed: they are computed after the unchanged ``classify_l3`` has returned,
+never classify, never change an outcome and never authorize a step.  ``absent`` means collected and
+nothing seen, ``unavailable`` (always all three) means the reduction or validation failed after
+classification, and omission of all three means classification was never reached.  Only the L3
+runner assigns them; ``_safe_fields`` and the case wrapper's ``HarnessFailure`` branch each strip
+them from adapter-supplied fields.
+
 Cancellation.  ``KeyboardInterrupt``, ``asyncio.CancelledError`` and any other non-``Exception``
 ``BaseException`` are never converted: scan, descendant observation and cleanup run, findings are
 recorded as secondary evidence, and the original exception object is re-raised unchanged.  Only
@@ -387,6 +396,63 @@ def _member_of(values: frozenset[str]) -> Callable[[object], bool]:
     return lambda v: isinstance(v, str) and v in values
 
 
+# ``claude_agent_sdk.types.AssistantMessageError`` (pinned against the SDK by H12).  It lives in the
+# head so that the pure layer, the diagnostic sets below and the classifier share one object.
+ASSISTANT_ERRORS: Final = frozenset(
+    {
+        "authentication_failed",
+        "billing_error",
+        "rate_limit",
+        "invalid_request",
+        "server_error",
+        "unknown",
+    }
+)
+
+# The three L3 diagnostic keys (design section 9.4): closed literal sets, defined once.  Each set
+# holds ``absent`` (collected, nothing observed) and ``unavailable`` (classification completed, the
+# diagnostic reduction or validation then failed; always all three keys).  Omission of all three
+# keys means L3 classification was never reached.
+DIAG_PROVIDER_RETRYABILITY: Final = frozenset(
+    {"absent", "retryable", "non_retryable", "mixed", "unavailable"}
+)
+DIAG_ASSISTANT_ERROR: Final = ASSISTANT_ERRORS | frozenset({"other", "absent", "unavailable"})
+DIAG_API_STATUS: Final = frozenset(
+    {"401", "403", "404", "429", "other_4xx", "5xx", "other", "absent", "unavailable"}
+)
+DIAG_KEYS: Final = ("diag_provider_retryability", "diag_assistant_error", "diag_api_status")
+DIAG_VALIDATORS: Final[dict[str, Callable[[object], bool]]] = {
+    "diag_provider_retryability": _member_of(DIAG_PROVIDER_RETRYABILITY),
+    "diag_assistant_error": _member_of(DIAG_ASSISTANT_ERROR),
+    "diag_api_status": _member_of(DIAG_API_STATUS),
+}
+DIAG_UNAVAILABLE: Final[Mapping[str, str]] = dict.fromkeys(DIAG_KEYS, "unavailable")
+# First member present wins; each tuple is its closed set without ``absent`` and ``unavailable``.
+DIAG_ASSISTANT_ERROR_PRECEDENCE: Final = (
+    "authentication_failed",
+    "billing_error",
+    "invalid_request",
+    "rate_limit",
+    "server_error",
+    "unknown",
+    "other",
+)
+DIAG_API_STATUS_PRECEDENCE: Final = ("401", "404", "403", "429", "other_4xx", "5xx", "other")
+
+
+def diag_triple_valid(triple: object) -> bool:
+    """Exactly the three keys, each a member of its closed set, all ``unavailable`` or none."""
+    if not isinstance(triple, Mapping) or len(triple) != len(DIAG_KEYS):
+        return False
+    mapping = cast("Mapping[str, object]", triple)
+    values: list[object] = []
+    for key in DIAG_KEYS:
+        if key not in mapping or not DIAG_VALIDATORS[key](mapping[key]):
+            return False
+        values.append(mapping[key])
+    return sum(value == "unavailable" for value in values) in (0, len(DIAG_KEYS))
+
+
 # ``official``, ``skipped_reports`` and ``zero_skip_verdict`` are deliberately *not* keys: they are
 # the three G4 section lines written by the evidence plugin, the only place they appear.
 _EVIDENCE_SPECS: Final[dict[str, Callable[[object], bool]]] = {
@@ -438,6 +504,7 @@ _EVIDENCE_SPECS: Final[dict[str, Callable[[object], bool]]] = {
     "pytest_version": _is_pytest_version,
     "plugins": _is_plugins,
     "exception_class": _matcher(_IDENT_RE),
+    **DIAG_VALIDATORS,
 }
 EVIDENCE_KEYS: Final = frozenset(_EVIDENCE_SPECS)
 
@@ -771,6 +838,39 @@ def _success_count(counts: Mapping[str, int] | None) -> bool:
     )
 
 
+def _diag_problem(record: Mapping[str, object]) -> str | None:
+    """Record check 7 beyond grammar: placement, all-or-none and all-or-no ``unavailable``.
+
+    ``None`` when fine, else ``evidence_inconsistent``.  Reads no value except to tell
+    ``unavailable`` from the rest; never compares the triple with an outcome.
+    """
+    present = [key for key in DIAG_KEYS if key in record]
+    if not present:
+        return None
+    if record.get("case") != "L3" or len(present) != len(DIAG_KEYS):
+        return "evidence_inconsistent"
+    if not diag_triple_valid({key: record[key] for key in DIAG_KEYS}):  # only a mix remains
+        return "evidence_inconsistent"
+    return None
+
+
+def _qualifying_triple(record: Mapping[str, object]) -> bool:
+    """Official item 9: the triple ``classify_l3`` needs for ``invalid_key``, or all unavailable.
+
+    Restrict-only: it runs only inside the official step, which can end only in ``official`` or
+    ``discard``.  An omitted triple is not qualifying.
+    """
+    if not all(key in record for key in DIAG_KEYS):
+        return False
+    retryability = record["diag_provider_retryability"]
+    if retryability == "unavailable":
+        return True  # the guard's constant: diag_triple_valid already made it all-or-nothing
+    return retryability in ("non_retryable", "mixed") and (
+        record["diag_assistant_error"] == "authentication_failed"
+        or record["diag_api_status"] == "401"
+    )
+
+
 def _check_record_kinds(
     records: list[dict[str, object]],
 ) -> tuple[dict[str, object] | None, list[dict[str, object]], dict[str, object] | None, str | None]:
@@ -944,6 +1044,9 @@ def _classify(text: str, status: int) -> tuple[str, str]:
             validate_record(parsed)
         except EvidenceError:
             return _discard("evidence_record_invalid")
+        diag_problem = _diag_problem(parsed)
+        if diag_problem is not None:
+            return _discard(diag_problem)
         kind = parsed.get("case")
         keys = set(parsed)
         if kind == "session":
@@ -1007,6 +1110,9 @@ def _classify(text: str, status: int) -> tuple[str, str]:
         if status != 0:
             return _discard("pipeline_status_nonzero")
         if official_records and g4["skipped"] == 0 and clean_extras and _success_count(counts):
+            # Item 9 (restrict-only): it can only turn ``official`` into a discard.
+            if not _qualifying_triple(next(r for r in cases if r["case"] == "L3")):
+                return _discard("evidence_inconsistent")
             return VERDICT_OFFICIAL, "ok"
         return _discard("evidence_inconsistent")
     if official_records and g4["skipped"] == 0:
@@ -1985,18 +2091,6 @@ async def observe_descendants(
 # Pure layer: typed observations and the L3 classifier
 # ============================================================================
 
-# ``claude_agent_sdk.types.AssistantMessageError`` (pinned against the SDK by H12).
-ASSISTANT_ERRORS: Final = frozenset(
-    {
-        "authentication_failed",
-        "billing_error",
-        "rate_limit",
-        "invalid_request",
-        "server_error",
-        "unknown",
-    }
-)
-
 
 @dataclasses.dataclass(frozen=True)
 class Observation:
@@ -2059,6 +2153,107 @@ def classify_l3(
         if any(o.api_error_status == 404 for o in observations):
             return Outcome.MODEL_UNAVAILABLE
     return Outcome.INCONCLUSIVE
+
+
+# ============================================================================
+# Pure layer: L3 diagnostic reducers (strictly diagnostic; never an input to classification)
+# ============================================================================
+
+
+def assistant_error_of(value: object) -> str | None:
+    """Total single-value reducer: ``None`` adds nothing, an SDK literal is itself, else ``other``.
+
+    Exact type test then literal comparison only: a foreign object is never hashed, compared or
+    called.
+    """
+    if value is None:
+        return None
+    if type(value) is str and value in ASSISTANT_ERRORS:
+        return value
+    return "other"
+
+
+def api_status_of(value: object) -> str | None:
+    """Total single-value reducer: ``None`` contributes nothing, an exact ``int`` in 100-599 is its
+    bucket, any other value (a bool, a float, a string, an out-of-range number) is ``other``."""
+    if value is None:
+        return None
+    if type(value) is int and 100 <= value <= 599:
+        if value == 401:
+            return "401"
+        if value == 403:
+            return "403"
+        if value == 404:
+            return "404"
+        if value == 429:
+            return "429"
+        if value < 400:
+            return "other"
+        if value < 500:
+            return "other_4xx"
+        return "5xx"
+    return "other"
+
+
+def provider_retryability_of(chain: Iterable[BaseException]) -> str:
+    """The retryability of the ``ProviderError`` instances of ``chain`` (the gate's own predicate).
+
+    ``N`` (non-retryable) is exactly ``exc.is_retryable is False``, verbatim from
+    :func:`classify_l3`; any other value counts on the retryable side.  Raises if ``chain`` cannot
+    be iterated or an attribute access raises (the guard turns that into ``unavailable``).
+    """
+    providers = [exc for exc in chain if isinstance(exc, ProviderError)]
+    if not providers:
+        return "absent"
+    non_retryable = [exc for exc in providers if exc.is_retryable is False]
+    if not non_retryable:
+        return "retryable"
+    return "non_retryable" if len(non_retryable) == len(providers) else "mixed"
+
+
+def _first_present(precedence: Sequence[str], present: set[str]) -> str:
+    return next((member for member in precedence if member in present), "absent")
+
+
+def l3_diagnostics(
+    observations: Sequence[Observation], exc_chain: Iterable[BaseException]
+) -> dict[str, str]:
+    """The three closed-set diagnostic values, an exact function of the signals that occurred.
+
+    Reads only ``Observation.assistant_error`` and ``Observation.api_error_status`` and
+    ``ProviderError.is_retryable``; never a message.  Never returns ``unavailable``.
+    """
+    assistant: set[str] = set()
+    status: set[str] = set()
+    for observation in observations:
+        reduced_error = assistant_error_of(getattr(observation, "assistant_error", None))
+        if reduced_error is not None:
+            assistant.add(reduced_error)
+        reduced_status = api_status_of(getattr(observation, "api_error_status", None))
+        if reduced_status is not None:
+            status.add(reduced_status)
+    return {
+        "diag_provider_retryability": provider_retryability_of(exc_chain),
+        "diag_assistant_error": _first_present(DIAG_ASSISTANT_ERROR_PRECEDENCE, assistant),
+        "diag_api_status": _first_present(DIAG_API_STATUS_PRECEDENCE, status),
+    }
+
+
+def guarded_diagnostics(
+    observations: Sequence[Observation], exc_chain: Iterable[BaseException]
+) -> dict[str, str]:
+    """Reduce and validate the complete triple inside the guard (``Exception`` only).
+
+    Any reducer or validation failure yields the constant all-``unavailable`` triple, so no
+    diagnostic fault can change the already-fixed L3 outcome; a ``BaseException`` propagates.
+    """
+    try:
+        triple = l3_diagnostics(observations, exc_chain)
+        if not diag_triple_valid(triple):
+            return dict(DIAG_UNAVAILABLE)
+        return dict(triple)
+    except Exception:
+        return dict(DIAG_UNAVAILABLE)
 
 
 # ============================================================================
@@ -2575,7 +2770,9 @@ async def run_ordered_cases(
             fields = dict(case_outcome.fields)
         except HarnessFailure as exc:
             adapter_outcome, exc_class = exc.outcome, exception_class_of(exc)
-            fields = dict(exc.extra)
+            # An escaping ``HarnessFailure.extra`` is the second adapter-controlled source of case
+            # fields (the first is ``_safe_fields``): it never carries the L3 diagnostic keys.
+            fields = {k: v for k, v in exc.extra.items() if k not in DIAG_KEYS}
         except Exception as exc:
             adapter_outcome = Outcome.INCONCLUSIVE if case is Case.L3 else Outcome.CASE_FAILED
             exc_class = exception_class_of(exc)
@@ -3555,8 +3752,12 @@ _L0_BOOLEANS: Final = (
 
 
 def _safe_fields(fields: Mapping[str, object]) -> dict[str, object]:
-    """Only allowlisted evidence keys, for attaching to a record."""
-    return {k: v for k, v in fields.items() if k in EVIDENCE_KEYS}
+    """Only allowlisted evidence keys, for attaching to a record.
+
+    The three L3 diagnostic keys are always removed, whatever the case, value or adapter: only the
+    L3 runner assigns them (after ``classify_l3``), so an adapter can never supply them.
+    """
+    return {k: v for k, v in fields.items() if k in EVIDENCE_KEYS and k not in DIAG_KEYS}
 
 
 def assert_l0_success(ready: bool, fields: Mapping[str, object]) -> dict[str, object]:
@@ -3667,7 +3868,13 @@ def _inference_runner(
             fields["exception_class"] = exception_class_of(observed.exception)
         if case is Case.L3:
             fields["requested_model"] = requested_model
-            return CaseOutcome(classify_l3(sink, chain, observed.events), fields)
+            # Execution order (design 8.3.1): classification completes and its outcome is fixed
+            # first; only then are the diagnostics reduced and validated, inside the guard, from
+            # the very same ``sink`` and ``chain`` list objects; the complete triple is merged in
+            # one step, after ``_safe_fields``.  The diagnostics never touch the outcome.
+            outcome = classify_l3(sink, chain, observed.events)
+            fields.update(guarded_diagnostics(sink, chain))
+            return CaseOutcome(outcome, fields)
         if case is Case.L2 and any(o.assistant_error == "authentication_failed" for o in sink):
             raise HarnessFailure(Outcome.CANARY_USED_IN_L2, extra=fields)
         return CaseOutcome(
