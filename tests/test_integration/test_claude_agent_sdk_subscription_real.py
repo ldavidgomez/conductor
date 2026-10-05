@@ -31,15 +31,18 @@ Everything except the two gated live tests at the bottom is exercised offline by
 process and network boundary replaced.
 
 The official sequence is L0 -> L1 and nothing else.  L0 shows that readiness reports a usable
-first-party subscription login.  L1 runs one real inference through the subscription path and
-checks its billing provenance.  That an explicit ``subscription`` mode neutralizes competing API-key
-variables is an offline property of the production provider, proven by its own tests, not by a live
-run.  Credential precedence under ``auth_mode: auto`` is unproven and out of scope: no case here
+first-party subscription login.  L1 runs one inference-capable workflow attempt through the
+subscription path and checks its billing provenance (the agent session may make several SDK turns
+and internal model requests; they are not counted).  That an explicit ``subscription`` mode
+neutralizes competing API-key variables is an offline property of the production provider,
+proven by its own tests, not by a live run.  Credential precedence under ``auth_mode: auto`` is
+unproven and out of scope: no case here
 sets a credential variable or builds an ``auto`` configuration, and no live attempt to prove
 precedence is permitted unless a new, separately reviewed design names a public, stable, typed
 authentication signal in advance.
 
-What a live run may consume: at most **one** potentially quota-consuming attempt (L1), enforced by
+What a live run may consume: at most **one** potentially quota-consuming attempt (L1: one
+inference-capable workflow or agent-session attempt, not one guaranteed model request), enforced by
 ``QuotaCounter``; nothing is ever retried automatically.  In the current production path the
 readiness probe (``claude auth status --json``) runs once for L0 and twice for L1.
 
@@ -78,7 +81,8 @@ environment variable, imports nothing beyond the head, echoes nothing and delete
 ``<N>`` is the pipeline status under ``pipefail``, which is not necessarily pytest's own status.
 The operator's shell gate around it (:data:`PRE_GATE`, :data:`CLASSIFY_BLOCK`,
 :data:`MATRIX_BLOCK`) tests both the exit status and the exact token and deletes the capture on
-every other combination.  An interruption before a run-level record exists is discarded as
+every other combination, then verifies the deletion and says so when it failed.  An interruption
+before a run-level record exists is discarded as
 ``run_record_missing``.  A terminal width beyond the grammar's bounds (a ``COLUMNS`` far above
 500) fails closed.  ``pytest`` is lower-bounded and not upper-pinned and the interrupt hint and
 the count lines are pytest constants: a change to any fixed line makes the classifier discard the
@@ -247,7 +251,7 @@ def _is_env_list(v: object) -> bool:
 
 
 def _is_quota_attempts(v: object) -> bool:
-    """Exactly 0 or 1: the one designed inference attempt is the only one there can be."""
+    """Exactly 0 or 1: the one designed inference-capable attempt is the only one there can be."""
     return _is_int(v) and v in (0, 1)
 
 
@@ -1368,6 +1372,10 @@ def parse_git_state(rev_parse_output: str, porcelain_output: str) -> tuple[str, 
     return sha, bool(porcelain_output.strip())
 
 
+# Upper bound for reaping an owned child after its group was killed; cleanup never waits longer.
+_REAP_TIMEOUT: Final = 2.0
+
+
 def _run_owned_subprocess(
     argv: Sequence[str],
     *,
@@ -1377,8 +1385,11 @@ def _run_owned_subprocess(
 ) -> tuple[int, str, int]:
     """Run a subprocess this module owns: new session, bounded, killpg of its *own* group.
 
-    Returns ``(returncode, stdout, pid)``.  ``os.killpg`` is only ever sent to the group of
-    the process created here, never to a discovered PID.
+    Returns ``(0, stdout, pid)``: every nonzero exit status raises ``CalledProcessError`` (no
+    output attached) before a caller can interpret stdout.  Any exceptional exit, including a
+    timeout or ``KeyboardInterrupt``, kills the child's own group and reaps it within a bounded
+    time; the original exception is the one that propagates.  ``os.killpg`` is only ever sent to
+    the group of the process created here, never to a discovered PID.
     """
     proc = popen(
         list(argv),
@@ -1390,10 +1401,22 @@ def _run_owned_subprocess(
     )
     try:
         out, _ = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.communicate()
+    except BaseException:
+        try:  # noqa: SIM105 -- ``contextlib.suppress`` would widen the pinned module chains
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:  # already gone, or no process groups on this platform
+            pass
+        try:
+            proc.communicate(timeout=_REAP_TIMEOUT)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=_REAP_TIMEOUT)
+            except Exception:  # cleanup is bounded and never replaces the original exception
+                pass
         raise
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, argv[0])
     return proc.returncode, out or "", proc.pid
 
 
@@ -1442,11 +1465,14 @@ class PrivateLogSink:
     """Keep SDK and provider log records away from every handler of the run.
 
     While active, each logger of :data:`PRIVATE_LOGGERS` stops propagating and has one private
-    discarding handler, so no record reaches the root logger, pytest's report handlers or Python's
-    last-resort handler.  No level is changed and no text is retained.  Level, handlers,
-    ``propagate`` and ``disabled`` are restored exactly on exit (success, failure, timeout and
-    cancellation).  Only the real adapters enter it, and only through the exact ``with`` of their
-    pinned execution chain.
+    discarding handler in place of its own, so no record reaches the root logger, a pre-existing
+    handler of the logger or its parents, pytest's report handlers or Python's last-resort
+    handler.  Every already-created descendant of those loggers loses its own handlers too and
+    propagates to the private one, so a child logger's pre-existing handler sees no record
+    either.  No level is changed and no text is retained.  Level, handlers, ``propagate`` and
+    ``disabled`` of every touched logger are restored exactly on exit (success, failure, timeout,
+    interruption and cancellation).  Only the real adapters enter it, and only through the exact
+    ``with`` of their pinned execution chain.
     """
 
     def __init__(self) -> None:
@@ -1461,11 +1487,23 @@ class PrivateLogSink:
         try:
             for name in PRIVATE_LOGGERS:
                 logger = logging.getLogger(name)
-                self._saved.append(
-                    (logger, logger.level, list(logger.handlers), logger.propagate, logger.disabled)
-                )
-                logger.propagate = False
-                logger.addHandler(self._handler)
+                members = [(logger, True)]
+                for key, child in list(logger.manager.loggerDict.items()):
+                    # a ``PlaceHolder`` has no ``propagate``; only real loggers are isolated
+                    if key.startswith(name + ".") and hasattr(child, "propagate"):
+                        members.append((child, False))
+                for member, named in members:
+                    self._saved.append(
+                        (
+                            member,
+                            member.level,
+                            list(member.handlers),
+                            member.propagate,
+                            member.disabled,
+                        )
+                    )
+                    member.propagate = not named
+                    member.handlers[:] = [self._handler] if named else []
         except BaseException:
             self.__exit__(None, None, None)
             raise
@@ -1474,12 +1512,10 @@ class PrivateLogSink:
     def __exit__(self, *exc_info: object) -> None:
         while self._saved:
             logger, level, handlers, propagate, disabled = self._saved.pop()
-            logger.removeHandler(self._handler)
             logger.setLevel(level)
             logger.propagate = propagate
             logger.disabled = disabled
-            if logger.handlers != handlers:  # a handler added meanwhile is not ours to keep
-                logger.handlers[:] = handlers
+            logger.handlers[:] = handlers
 
 
 # ============================================================================
@@ -2631,9 +2667,9 @@ def build_l1_config(yaml_text: str, model: str | None) -> dict[str, Any]:
     Only when a validated model override exists is ``workflow.runtime.default_model`` replaced;
     nothing else is ever changed (``auth_mode`` stays ``subscription``).
     """
-    import yaml
+    from ruamel.yaml import YAML
 
-    doc = dict(yaml.safe_load(yaml_text))
+    doc = dict(YAML(typ="safe").load(yaml_text))
     if model is not None:
         doc["workflow"]["runtime"]["default_model"] = model
     return doc
@@ -2746,8 +2782,8 @@ class RealWorkflowAdapter:
         assert_live_isolation(self._tmp_path)
         import io
 
-        import yaml
         from rich.console import Console
+        from ruamel.yaml import YAML
 
         from conductor.cli.run import display_usage_summary
         from conductor.config.loader import load_config
@@ -2756,7 +2792,11 @@ class RealWorkflowAdapter:
         from conductor.providers.registry import ProviderRegistry
 
         path = self._tmp_path / "workflow-L1.yaml"
-        path.write_text(yaml.safe_dump(dict(config)))
+        dumper = YAML(typ="safe")
+        dumper.default_flow_style = False
+        dumped = io.StringIO()
+        dumper.dump(dict(config), dumped)
+        path.write_text(dumped.getvalue())
         events: list[dict[str, Any]] = []
         console_buffer = io.StringIO()
         result: Mapping[str, object] | None = None
@@ -3319,7 +3359,11 @@ OFFICIAL_COMMAND: Final = _evidence_command("official_live_evidence")
 PRE_GATE: Final = """\
 set -o pipefail                                                    # Bash or Zsh
 : "${EXPECTED:?}"                                                  # readiness_only or official
-if env | grep -E '^(CLAUDE_|ANTHROPIC_)' >/dev/null 2>&1; then exit 1; fi   # plain terminal
+ENV_DUMP=$(env) || exit 1                                          # enumeration must succeed
+printf '%s\\n' "$ENV_DUMP" | grep -E '^(CLAUDE_|ANTHROPIC_)' >/dev/null 2>&1
+ENV_CHECK=$?                                                       # 1 only for a clean no-match
+unset ENV_DUMP                                                     # never printed or persisted
+[ "$ENV_CHECK" -eq 1 ] || exit 1                                   # plain terminal; any error stops
 [ ! -e "$EVIDENCE_FILE" ] && [ ! -L "$EVIDENCE_FILE" ] || exit 1   # no pre-existing path
 : > "$EVIDENCE_FILE" || exit 1                                     # the path can be created
 """
@@ -3355,8 +3399,11 @@ case "$CLASSIFY_STATUS:$VERDICT" in
     exit 3 ;;                                                    # kept, yet never a success
   *)
     printf '%s\\n' "$VERDICT" | grep -E '^discard [a-z_]{1,40}$'     # a closed-set code
-    rm -f -- "$EVIDENCE_FILE"
-    echo "capture deleted; stop"
+    if rm -f -- "$EVIDENCE_FILE" && [ ! -e "$EVIDENCE_FILE" ] && [ ! -L "$EVIDENCE_FILE" ]; then
+      echo "capture deleted; stop"
+    else
+      echo "capture NOT deleted: remove it manually, never share it; stop"
+    fi
     exit 1 ;;
 esac
 """

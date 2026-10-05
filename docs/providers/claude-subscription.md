@@ -4,13 +4,14 @@
 [Experimental Providers](experimental.md)). This page is the operator runbook for using it with a
 Claude subscription login, and for the maintainer-only live validation harness.
 
-**One official live validation (readiness, then one subscription inference) has passed. Readiness
-confirmed a first-party subscription login, and one Haiku inference completed with subscription
-billing provenance. It does not validate fake-key behavior, auto-mode or API-key credential
-precedence, fallback or any broader compatibility. Earlier readiness-only and official attempts
-remain non-official records: they are never reclassified, authorize nothing and support no claim.
-Any future readiness or official operation requires fresh explicit human approval, and no retry is
-ever automatic.**
+**A prior readiness-plus-inference run observed a first-party subscription login and subscription
+billing provenance. That observation is provisional, not official evidence, and nothing is
+live-proven until it is revalidated with the corrected harness. Revalidation needs the corrected
+harness to be reviewed and CI to be green, then a fresh explicit human approval and a new run. The
+observation does not validate fake-key behavior, auto-mode or API-key credential precedence,
+fallback or any broader compatibility. Earlier readiness-only and official attempts remain
+non-official records: they are never reclassified, authorize nothing and support no claim. No
+retry is ever automatic.**
 Live-proven cells change only from official evidence.
 
 ## What this is, and what it is not
@@ -69,8 +70,10 @@ conductor validate examples/claude-agent-sdk-subscription.yaml
 
 `auth_mode: subscription` refuses to run while a cloud-backend selector is inherited or while
 `setting_sources` is non-empty, because a settings file can inject a credential after Conductor has
-configured the child environment. `ANTHROPIC_BASE_URL`, custom headers and proxies are **not**
-neutralized by an explicit mode; they make the billing source `unknown`.
+configured the child environment. `ANTHROPIC_BASE_URL` is **not** neutralized by an explicit
+mode; an inherited value forces the billing source to `unknown`. Custom headers and proxy variables
+(for example `HTTPS_PROXY`) also pass through to the CLI unchanged, but billing derivation does not
+inspect them, so they do not change the billing source.
 
 Under explicit `subscription` mode, Conductor blanks `ANTHROPIC_API_KEY` and the other competing
 credential variables in the environment it gives the Claude child process. That is an offline
@@ -80,8 +83,10 @@ scope.
 
 ## Run the minimal example
 
-This is ordinary product use: it makes **one real inference** on your subscription and writes run
-records to the normal `~/.conductor/runs`.
+This is ordinary product use: it makes **one inference-capable workflow run** (one agent-session
+attempt) on your subscription and writes run records to the normal `~/.conductor/runs`. The agent
+session may make several SDK turns and internal model requests; they are not counted, and this is
+not a promise of exactly one model request.
 
 ```bash
 conductor run examples/claude-agent-sdk-subscription.yaml --input question="What is Conductor?"
@@ -123,31 +128,36 @@ Each entry is keyed on a message the code can produce.
 ## Status table
 
 *Implemented* means the code exists. *Hermetically tested* means the offline test suite covers it
-with test doubles and no real CLI, login or network. *Live-proven* means it was observed against a
-real Claude CLI and login. *Unverified* lists what only a real run can settle.
+with test doubles and no real CLI, login or network. *Live-proven* means an official live
+validation backs it; no cell is live-proven today. *Provisional observation* marks a cell that an
+earlier run observed against a real Claude CLI and login but that is not official evidence until it
+is revalidated. *Unverified* lists what only a real run can settle.
 
 | Capability | Implemented | Hermetically tested | Live-proven | Unverified |
 |---|---|---|---|---|
 | `auth_mode` resolution and env blanking | yes | yes | not applicable (offline property, R2b′) | — |
-| Readiness (`claude auth status --json`) | yes | yes (fixtures) | yes (official live validation) | other authentication states, hosts and CLI versions |
-| `billing_mode == subscription` derivation | yes | yes (fixtures) | yes (official live validation) | other evidence combinations, hosts and CLI versions |
-| `API-equivalent estimate` label | yes | yes | yes (official live validation) | other output environments and display paths |
+| Readiness (`claude auth status --json`) | yes | yes (fixtures) | provisional observation (revalidation pending) | other authentication states, hosts and CLI versions |
+| `billing_mode == subscription` derivation | yes | yes (fixtures) | provisional observation (revalidation pending) | other evidence combinations, hosts and CLI versions |
+| `API-equivalent estimate` label | yes | yes | provisional observation (revalidation pending) | other output environments and display paths |
 | `auto` + API key ⇒ `metered_api` | yes (by construction) | yes | out of scope | auto-mode credential precedence (unproven, R2′) |
 | Cloud-selector / `setting_sources` refusal | yes | yes | not applicable | managed/enterprise settings |
 | Hard session timeout / interrupt | yes (#570) | yes | not in this PR | real-CLI timing |
-| Bundled CLI reads the user's login | — | no | yes (official live validation) | cross-version compatibility |
-| Live harness (L0, L1) | yes | yes (all boundaries replaced) | yes (official live validation) | other hosts, CLI versions and broader real-CLI behavior |
+| Bundled CLI reads the user's login | — | no | provisional observation (revalidation pending) | cross-version compatibility |
+| Live harness (L0, L1) | yes | yes (all boundaries replaced) | provisional observation (revalidation pending) | other hosts, CLI versions and broader real-CLI behavior |
 | `conductor run` entry point on a real login | yes | yes (mocked) | *manual step only* | — |
 
-Live-proven cells change only from official evidence, never from expectation.
+Live-proven cells change only from official evidence, never from expectation. The provisional
+cells keep that wording until a new official run, made after the corrected harness is reviewed and
+CI is green and under a fresh explicit approval, replaces them.
 
-One official live validation (readiness, then one subscription inference) has passed. Readiness
-confirmed a first-party subscription login, and one Haiku inference completed with subscription
-billing provenance. It does not validate fake-key behavior, auto-mode or API-key credential
-precedence, fallback or any broader compatibility. Earlier readiness-only and official attempts
-remain non-official records: they are never reclassified, authorize nothing and support no claim.
-Any future readiness or official operation requires fresh explicit human approval, and no retry is
-ever automatic.
+A prior readiness-plus-inference run observed a first-party subscription login and subscription
+billing provenance. That observation is provisional, not official evidence, and nothing is
+live-proven until it is revalidated with the corrected harness. Revalidation needs the corrected
+harness to be reviewed and CI to be green, then a fresh explicit human approval and a new run. The
+observation does not validate fake-key behavior, auto-mode or API-key credential precedence,
+fallback or any broader compatibility. Earlier readiness-only and official attempts remain
+non-official records: they are never reclassified, authorize nothing and support no claim. No
+retry is ever automatic.
 
 ## Live validation (maintainers)
 
@@ -156,18 +166,19 @@ safety tests in `tests/test_config/test_claude_subscription_real_gate.py`. It is
 POSIX-only and never runs in CI, on untrusted pull requests or on shared accounts.
 
 The harness claims exactly four things: (1) readiness reports a usable first-party subscription
-login; (2) one real inference completes through the subscription path and carries the expected
-billing provenance; (3) explicit `subscription` mode neutralizes competing API-key variables in
+login; (2) one inference-capable workflow attempt completes through the subscription path and carries
+the expected billing provenance; (3) explicit `subscription` mode neutralizes competing API-key variables in
 Conductor's finalized child environment, an offline property proven by the production provider's
 tests; and (4) auto-mode credential precedence is unproven and out of scope.
 
-One official live validation (readiness, then one subscription inference) has passed. Readiness
-confirmed a first-party subscription login, and one Haiku inference completed with subscription
-billing provenance. It does not validate fake-key behavior, auto-mode or API-key credential
-precedence, fallback or any broader compatibility. Earlier readiness-only and official attempts
-remain non-official records: they are never reclassified, authorize nothing and support no claim.
-Any future readiness or official operation requires fresh explicit human approval, and no retry is
-ever automatic.
+A prior readiness-plus-inference run observed a first-party subscription login and subscription
+billing provenance. That observation is provisional, not official evidence, and nothing is
+live-proven until it is revalidated with the corrected harness. Revalidation needs the corrected
+harness to be reviewed and CI to be green, then a fresh explicit human approval and a new run. The
+observation does not validate fake-key behavior, auto-mode or API-key credential precedence,
+fallback or any broader compatibility. Earlier readiness-only and official attempts remain
+non-official records: they are never reclassified, authorize nothing and support no claim. No
+retry is ever automatic.
 
 There are two live operations:
 
@@ -175,11 +186,11 @@ There are two live operations:
   authentication probe and no inference. It is **not official end-to-end evidence**. It is
   historical: repeating it is neither required nor authorized, and no official run depends on it.
 - the **official live validation** (`-k official_live_evidence`) runs L0 and then L1 in one ordered
-  test. It makes **three** authentication probes and at most **one** inference attempt.
+  test. It makes **three** authentication probes and at most **one** inference-capable workflow attempt.
 
 The **optional manual example** is a separate, separately approved step: one ordinary
 `conductor run` of the shipped example (see [Run the minimal example](#run-the-minimal-example)),
-which adds one inference attempt (two in all).
+which adds one inference-capable workflow attempt (two in all).
 
 Each official live validation needs a fresh, explicit human approval that names the exact tested commit, with the human present.
 The approval covers one readiness-plus-inference session only; the inference step is the only one
@@ -221,13 +232,14 @@ the machine throughout **both** the readiness-only check and the official live v
 
 ### Commands
 
-One official live validation (readiness, then one subscription inference) has passed. Readiness
-confirmed a first-party subscription login, and one Haiku inference completed with subscription
-billing provenance. It does not validate fake-key behavior, auto-mode or API-key credential
-precedence, fallback or any broader compatibility. Earlier readiness-only and official attempts
-remain non-official records: they are never reclassified, authorize nothing and support no claim.
-Any future readiness or official operation requires fresh explicit human approval, and no retry is
-ever automatic.
+A prior readiness-plus-inference run observed a first-party subscription login and subscription
+billing provenance. That observation is provisional, not official evidence, and nothing is
+live-proven until it is revalidated with the corrected harness. Revalidation needs the corrected
+harness to be reviewed and CI to be green, then a fresh explicit human approval and a new run. The
+observation does not validate fake-key behavior, auto-mode or API-key credential precedence,
+fallback or any broader compatibility. Earlier readiness-only and official attempts remain
+non-official records: they are never reclassified, authorize nothing and support no claim. No
+retry is ever automatic.
 
 Run both operations in **Bash or Zsh** (zsh on macOS, bash on Linux), from a **plain terminal
 session**, never from inside a Claude Code session shell or another agent shell. Write the steps
@@ -251,7 +263,11 @@ EXPECTED=readiness_only
 # pre-gate: it stops before any live action if any check fails
 set -o pipefail                                                    # Bash or Zsh
 : "${EXPECTED:?}"                                                  # readiness_only or official
-if env | grep -E '^(CLAUDE_|ANTHROPIC_)' >/dev/null 2>&1; then exit 1; fi   # plain terminal
+ENV_DUMP=$(env) || exit 1                                          # enumeration must succeed
+printf '%s\n' "$ENV_DUMP" | grep -E '^(CLAUDE_|ANTHROPIC_)' >/dev/null 2>&1
+ENV_CHECK=$?                                                       # 1 only for a clean no-match
+unset ENV_DUMP                                                     # never printed or persisted
+[ "$ENV_CHECK" -eq 1 ] || exit 1                                   # plain terminal; any error stops
 [ ! -e "$EVIDENCE_FILE" ] && [ ! -L "$EVIDENCE_FILE" ] || exit 1   # no pre-existing path
 : > "$EVIDENCE_FILE" || exit 1                                     # the path can be created
 # readiness-only check (case L0; not official evidence)
@@ -280,8 +296,11 @@ case "$CLASSIFY_STATUS:$VERDICT" in
     exit 3 ;;                                                    # kept, yet never a success
   *)
     printf '%s\n' "$VERDICT" | grep -E '^discard [a-z_]{1,40}$'     # a closed-set code
-    rm -f -- "$EVIDENCE_FILE"
-    echo "capture deleted; stop"
+    if rm -f -- "$EVIDENCE_FILE" && [ ! -e "$EVIDENCE_FILE" ] && [ ! -L "$EVIDENCE_FILE" ]; then
+      echo "capture deleted; stop"
+    else
+      echo "capture NOT deleted: remove it manually, never share it; stop"
+    fi
     exit 1 ;;
 esac
 ```
@@ -342,7 +361,9 @@ echoes nothing and deletes nothing.
   documentation claim.
 - **Every other combination** (exit 0 with unexpected stdout, the token of the other run kind, exit
   1 without an exact `discard <code>`, a classifier that failed to start, a `tee` failure, a stale
-  path, a malformed status) **deletes the capture and stops**.
+  path, a malformed status) **deletes the capture and stops**. The script then checks that neither
+  a file nor a symlink remains at the path. If it prints `capture NOT deleted`, the capture is still
+  on disk: remove it manually and never share, quote or commit it.
 - A `tee` failure after a live command has run leaves **no valid capture**: usage may have been
   spent and pytest's own status is lost. Do not reuse the path; the pre-gate refuses an existing
   one.
@@ -352,7 +373,10 @@ echoes nothing and deletes nothing.
 **The plain terminal.** A Claude Code session shell carries `CLAUDE_CODE_*`, `CLAUDE_EFFORT`,
 `CLAUDE_PID` and similar variables that every child process inherits. Nothing in the harness reads
 them and they are **not accepted** as part of the evidence environment: the pre-gate refuses to
-start when any `CLAUDE_*` or `ANTHROPIC_*` variable is present, prints no name or value, and the
+start when any `CLAUDE_*` or `ANTHROPIC_*` variable is present, or when the environment cannot be
+listed or checked (a failing `env` or `grep` is never read as a clean result: only a clean no-match
+proceeds). It prints no name or value and writes no environment dump anywhere: the listing lives in
+one shell variable that is unset at once. The
 `env -u` prefix does not scrub them (a silent scrub would make the evidence describe an environment
 that did not exist). Keep your shell free of `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
 `CLAUDE_CODE_OAUTH_TOKEN`, as [Log in safely](#log-in-safely) says.
@@ -427,6 +451,10 @@ There is exactly one procedure, and each step needs the previous one:
 8. If the evidence contradicts how billing is derived, stop and ask for a separate approval; any
    change to the derivation is a new commit and needs a new official live validation.
 
+The provisional observation described at the top of this page stays provisional until step 5 is
+repeated with the corrected harness, after the harness has been reviewed and CI is green. That
+needs a fresh explicit approval and a new run; no earlier approval carries over.
+
 After a failure record or a discarded capture, nothing is pushed and no documentation commit is made.
 
 If you check whether the upstream branch moved with `git ls-remote upstream main`, treat the output
@@ -443,8 +471,8 @@ case only; your real `HOME` is kept). The harness sets no credential variable.
 | L0 | The provider is built as the factory builds it for `auth_mode: subscription`; the real readiness check runs; the real billing derivation runs. | Readiness succeeded; billing is `subscription` with reason `first_party_login`; `subscriptionType` is present and `apiKeySource` is absent; the `apiProvider` constant is `validated` or `unexercised` (a mismatch fails). |
 | L1 | The shipped example, loaded with `load_config` and run through `ProviderRegistry` and `WorkflowEngine`, once. | Structured `answer` output; a real `agent_completed` event with `billing_mode == "subscription"`; aggregate billing state `subscription`; requested and effective model present; a non-zero estimated cost; the label appears in the real usage summary. |
 
-L1 starts only after L0 is `ok`, so a login that readiness cannot report never spends an inference
-attempt. No other case exists, and no step ever sets an API key.
+L1 starts only after L0 is `ok`, so a login that readiness cannot report never starts an
+inference-capable attempt. No other case exists, and no step ever sets an API key.
 
 ### Authentication probes and quota
 
@@ -457,8 +485,11 @@ attempt. No other case exists, and no step ever sets an API key.
   transport can also run `<cli> --version`, and the harness runs it once for evidence. Probes are
   not inference.
 - **Quota.** At most **one** potentially quota-consuming attempt is allowed (L1); a second is
-  refused. There is no `retry:` block, so retries cannot multiply attempts. The optional manual
-  example adds one, for a total ceiling of two.
+  refused. An *attempt* is one inference-capable workflow or agent-session run, not one guaranteed
+  model request: the agent session may make several SDK turns and internal model requests, and
+  those are not counted. `max_agent_iterations` is not set to 1. There is no `retry:` block, so
+  retries cannot multiply attempts. The optional manual example adds one attempt, for a total
+  ceiling of two.
 - **Cost figures** are API-equivalent estimates, never quota, invoices or charges.
 
 ### Reading the evidence
@@ -499,8 +530,8 @@ Each case record carries:
 - `cleanup_failed`: a bounded, fixed list drawn only from `descendants` and `evidence`, in that
   order and never repeated; present only when a real cleanup or evidence step failed. It never
   carries free text and never replaces the cancellation or hides a finding.
-- `attempted_quota_execution`: whether the case started the one inference attempt (an attempt, not
-  consumption). L0 never does.
+- `attempted_quota_execution`: whether the case started the one inference-capable workflow attempt (an
+  attempt, not consumption and not a model-request count). L0 never does.
 
 SDK and provider log records go to a private discarding sink that counts arrivals and keeps no text;
 it never reaches pytest's report handlers, the root logger or Python's last-resort handler.
@@ -528,14 +559,14 @@ record has `interrupted` other than `none`, and `P` is the prefix of the run-lev
 
 | Row | Predicate | Reading | Next action |
 |---|---|---|---|
-| **V1** | `CLASSIFY_STATUS = 0 ∧ VERDICT = official` | a candidate: L0 and L1 both `ok`, one inference attempt, clean committed tree; eligible for the human review of the sequence above; approves nothing by itself | `human_review` |
+| **V1** | `CLASSIFY_STATUS = 0 ∧ VERDICT = official` | a candidate: L0 and L1 both `ok`, one inference-capable workflow attempt, clean committed tree; eligible for the human review of the sequence above; approves nothing by itself | `human_review` |
 | **V2** | `CLASSIFY_STATUS = 0 ∧ VERDICT = readiness_only` | readiness reported a usable login; never official evidence | `human_review` |
 | **V3** | `CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ I` | a cancellation or interrupt; the original exception was primary; read `interrupted`, `descendants` and `secondary_findings` of the interrupted case | `operator_review` |
-| **V4** | `CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ ¬I ∧ P = session` | a prerequisite or session preflight failed; no case ran and no inference was attempted | `prerequisite_investigation` |
-| **V5** | `CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ ¬I ∧ P = L0` | readiness did not report a usable first-party subscription login, or L0 had a safety finding; L1 did not run; no inference attempt | `login_investigation` |
-| **V6** | `CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ ¬I ∧ P = L1` | L1 did not complete a subscription inference with the expected billing provenance (read `outcome`, `exception_class`, `descendants`); one inference attempt may have been spent | `inference_investigation` |
+| **V4** | `CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ ¬I ∧ P = session` | a prerequisite or session preflight failed; no case ran and no inference-capable attempt was started | `prerequisite_investigation` |
+| **V5** | `CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ ¬I ∧ P = L0` | readiness did not report a usable first-party subscription login, or L0 had a safety finding; L1 did not run; no inference-capable attempt | `login_investigation` |
+| **V6** | `CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ ¬I ∧ P = L1` | L1 did not complete an inference-capable workflow attempt with the expected billing provenance (read `outcome`, `exception_class`, `descendants`); one attempt may have been spent | `inference_investigation` |
 | **V7** | `CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ ¬I ∧ P = none` | no interrupt and no case-level or session failure was recorded and the L0/L1 records are otherwise valid, yet the run is not official because of a non-case condition: for example a skip elsewhere in the session (zero-skip), a dirty working tree, or another nonzero pipeline status; read the G4 lines and the session-facts record; no cause is presumed | `not_official_no_case_failure` |
-| **V8** | any other combination of `CLASSIFY_STATUS` and `VERDICT` (every `discard <code>`, an unexpected token, a classifier that failed to start) | not a candidate; the matrix has deleted the capture | `delete_and_stop` |
+| **V8** | any other combination of `CLASSIFY_STATUS` and `VERDICT` (every `discard <code>`, an unexpected token, a classifier that failed to start) | not a candidate; the matrix has deleted the capture, or told you to delete it manually | `delete_and_stop` |
 
 Every row ends with the same rule: **no automatic retry; any new run needs a fresh, explicit human
 approval with the human present.** A `failure_record` (V3 to V7) is kept locally, authorizes nothing

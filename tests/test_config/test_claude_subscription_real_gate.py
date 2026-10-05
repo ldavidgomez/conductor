@@ -110,6 +110,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -124,10 +125,23 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-import yaml
+from ruamel.yaml import YAML
 
 from conductor.exceptions import ProviderError
 from tests.test_integration import test_claude_agent_sdk_subscription_real as lm
+
+
+def yaml_safe_load(text: str) -> Any:
+    return YAML(typ="safe").load(text)
+
+
+def yaml_safe_dump(data: Any) -> str:
+    dumper = YAML(typ="safe")
+    dumper.default_flow_style = False
+    buffer = io.StringIO()
+    dumper.dump(data, buffer)
+    return buffer.getvalue()
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SANDBOX_INI = "[pytest]\nmarkers =\n    real_api: opt-in real API tests\n"
@@ -202,6 +216,32 @@ def as_conftest_fn(fn: Callable[..., Any]) -> Callable[..., Any]:
     return relabel(fn, ROOT_CONFTEST)
 
 
+def symlink_or_skip(link: Path, target: Path) -> None:
+    """Create a symlink; skip only where the platform refuses it (Windows without the privilege)."""
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks are unavailable here: {type(exc).__name__}")
+
+
+# A full session resolves the CLI through the real prerequisite check, which needs ``ps``.
+def ps_unavailable(platform: str, which: Callable[[str], str | None] = shutil.which) -> bool:
+    """``ps`` is a POSIX tool: never run it on Windows, even where a Git install ships one."""
+    return platform == "win32" or which("ps") is None
+
+
+requires_ps = pytest.mark.skipif(
+    ps_unavailable(sys.platform), reason="needs ps (POSIX; not run on Windows)"
+)
+
+
+def windows_base_env(platform: str, environ: Mapping[str, str]) -> dict[str, str]:
+    """The one variable a Windows child cannot start without; empty elsewhere (not copied)."""
+    if platform != "win32":
+        return {}
+    return {name: environ[name] for name in ("SYSTEMROOT",) if name in environ}
+
+
 def raises_outcome(outcome: lm.Outcome) -> Any:
     return pytest.raises(lm.HarnessFailure, check=lambda exc: exc.outcome == outcome)
 
@@ -245,6 +285,38 @@ LAYER1_NAMES = (
     "socket.create_connection",
     "socket.getaddrinfo",
 )
+
+
+# The only ``os`` attributes a platform may genuinely lack (POSIX-only).  Every other tripwire
+# target must exist: a missing one is an error, never a silent skip.
+OPTIONAL_POSIX_OS_ATTRIBUTES = frozenset({"posix_spawn", "posix_spawnp", "fork", "forkpty"})
+
+
+def target_is_absent_and_optional(owner: Any, attribute: str) -> bool:
+    """True to skip arming: only an optional POSIX-only ``os`` attribute the platform lacks.
+
+    Any other missing target raises, so a renamed or removed essential target cannot go unarmed.
+    """
+    if hasattr(owner, attribute):
+        return False
+    if owner is os and attribute in OPTIONAL_POSIX_OS_ATTRIBUTES:
+        return True
+    raise AssertionError(
+        f"tripwire target missing: {getattr(owner, '__name__', repr(owner))}.{attribute}"
+    )
+
+
+def layer1_names_available(os_module: Any = os) -> tuple[str, ...]:
+    """The Layer-1 identifiers this platform can arm: only optional POSIX ``os`` APIs may lack."""
+    return tuple(
+        name
+        for name in LAYER1_NAMES
+        if not name.startswith("os.")
+        or name.removeprefix("os.") not in OPTIONAL_POSIX_OS_ATTRIBUTES
+        or hasattr(os_module, name.removeprefix("os."))
+    )
+
+
 SEAM_NAMES = (
     "anyio.open_process",
     "ClaudeSDKClient.connect",
@@ -276,9 +348,14 @@ def _record(name):
         handle.write(name + "\\n")
 
 
+OPTIONAL = ("posix_spawn", "posix_spawnp")  # POSIX-only: the one thing a platform may lack
+
+
 def _arm(owner, attr, name):
     if not hasattr(owner, attr):
-        return
+        if owner is os and attr in OPTIONAL:
+            return
+        raise AssertionError("tripwire target missing: " + name)
     ORIGINALS[name] = [owner, attr, getattr(owner, attr)]
 
     def tripwire(*args, **kwargs):
@@ -406,11 +483,34 @@ for _name in {exports!r}:
     globals()[_name] = getattr(lm, _name)
 """
 
-EXTRA_CLI_NONE = """
+# The prerequisite check locates the optional SDK first.  A test of what comes *after* that step
+# (a missing CLI, a missing ``ps``) must not depend on the extra being installed, so SDK discovery
+# is faked here when the SDK is absent; the CLI and ``ps`` are then the only things that can fail.
+FAKE_SDK_DISCOVERY = """
+@pytest.fixture(autouse=True)
+def _sdk_discovered(monkeypatch):
+    import importlib.util
+    import types
+
+    real_find_spec = importlib.util.find_spec
+
+    def find_spec(name, package=None):
+        found = real_find_spec(name, package)
+        if found is None and name == "claude_agent_sdk":
+            return types.SimpleNamespace(submodule_search_locations=[], origin="/absent/sdk.py")
+        return found
+
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+"""
+
+EXTRA_CLI_NONE = (
+    FAKE_SDK_DISCOVERY
+    + """
 @pytest.fixture(autouse=True)
 def _cli_none(monkeypatch):
     monkeypatch.setattr("conductor.providers.claude_agent_sdk._find_claude_cli", lambda: None)
 """
+)
 
 EXTRA_SDK_BLOCKED = """
 @pytest.fixture(autouse=True)
@@ -418,7 +518,9 @@ def _sdk_blocked(monkeypatch):
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
 """
 
-EXTRA_PS_MISSING = """
+EXTRA_PS_MISSING = (
+    FAKE_SDK_DISCOVERY
+    + """
 @pytest.fixture(autouse=True)
 def _ps_missing(monkeypatch):
     real_which = shutil.which
@@ -426,6 +528,7 @@ def _ps_missing(monkeypatch):
         shutil, "which", lambda name, *a, **k: None if name == "ps" else real_which(name, *a, **k)
     )
 """
+)
 
 EXTRA_FILE_CONSOLE = """
 @pytest.fixture(autouse=True)
@@ -559,6 +662,7 @@ class Sandbox:
         }
         if self.klass == "R":
             env["PYTHONPATH"] = str(REPO_ROOT / "src")
+        env.update(windows_base_env(sys.platform, os.environ))  # never a broken Windows child
         self.assert_isolated(env)  # the constructed base: no declared extra is in it yet
         for key, value in (extra or {}).items():  # a control's own declared variables only (S8)
             env[key] = value
@@ -661,8 +765,9 @@ def _hit(fn, *args, **kwargs):
 
 def test_every_layer1_family_is_armed():
     _hit(subprocess.Popen, ["x"])
-    _hit(os.posix_spawn, "x", ["x"], {})
-    _hit(os.posix_spawnp, "x", ["x"], {})
+    for name in ("posix_spawn", "posix_spawnp"):
+        if hasattr(os, name):  # POSIX only: a platform without the API cannot call it either
+            _hit(getattr(os, name), "x", ["x"], {})
     for name in ("execv", "execve", "execvp", "execvpe"):
         _hit(getattr(os, name), "x", ["x"], *([{}] if name.endswith("e") else []))
     for name in ("execl", "execle", "execlp", "execlpe"):
@@ -720,8 +825,9 @@ def test_layer1_tripwires_are_armed_positive_control(scratch: Sandbox) -> None:
     scratch.write("test_control.py", LAYER1_CONTROL)
     result = scratch.run("test_control.py", "-m", "real_api", gate=False, expect_hits=True)
     result.assert_outcomes(passed=1)
-    assert set(scratch.hits()) == set(LAYER1_NAMES)
-    assert len(scratch.hits()) == len(LAYER1_NAMES)  # exactly one hit per call, no extras
+    expected = layer1_names_available()  # only the APIs this platform actually has
+    assert set(scratch.hits()) == set(expected)
+    assert len(scratch.hits()) == len(expected)  # exactly one hit per call, no extras
 
 
 def test_layer2_seam_recorders_are_armed_positive_control(sandbox: Sandbox) -> None:
@@ -872,6 +978,8 @@ class TestSandboxPrerequisites:
         ids=["cli", "sdk", "ps"],
     )
     def test_h6_prerequisite_fails_closed(self, sandbox: Sandbox, extra: str, enum: str) -> None:
+        if enum == "prereq_ps_missing":  # ``ps`` is checked after the bundled CLI (SDK needed)
+            pytest.importorskip("claude_agent_sdk")
         sandbox.conftest(extra)
         sandbox.live_tests()
         result = sandbox.run("test_live_sandbox.py", "-m", "real_api", "-rs")
@@ -1736,11 +1844,15 @@ class Exact:
 
 @pytest.fixture
 def exact(sandbox: Sandbox, tmp_path_factory: pytest.TempPathFactory) -> Exact:
+    if shutil.which("bash") is None or sys.platform == "win32":
+        pytest.skip("needs bash (POSIX)")
     return Exact(sandbox, tmp_path_factory.mktemp("evidence"))
 
 
 @pytest.fixture
 def exact_scratch(scratch: Sandbox, tmp_path_factory: pytest.TempPathFactory) -> Exact:
+    if shutil.which("bash") is None or sys.platform == "win32":
+        pytest.skip("needs bash (POSIX)")
     return Exact(scratch, tmp_path_factory.mktemp("evidence"))
 
 
@@ -3127,7 +3239,7 @@ class TestSourceTree:
         test_file, _ = self._layout(tmp_path / "worktree")
         _, other = self._layout(tmp_path / "main-checkout")
         link = tmp_path / "worktree" / "src" / "conductor" / "linked.py"
-        link.symlink_to(other)
+        symlink_or_skip(link, other)
         with raises_outcome(lm.Outcome.SOURCE_TREE_MISMATCH):
             lm.verify_source_tree(link, test_file)
 
@@ -3708,7 +3820,7 @@ class TestStateMachine:
 
     def test_the_l1_configuration_is_the_shipped_example(self) -> None:
         text = lm.EXAMPLE_PATH.read_text()
-        parsed = yaml.safe_load(text)
+        parsed = yaml_safe_load(text)
         assert lm.build_l1_config(text, None) == parsed
         assert parsed["workflow"]["runtime"]["provider"]["auth_mode"] == "subscription"
         changed = lm.build_l1_config(text, "claude-haiku-4-5-20251001")
@@ -4088,9 +4200,7 @@ class TestExamplePin:
     example = REPO_ROOT / "examples" / "claude-agent-sdk-subscription.yaml"
 
     def _raw(self) -> dict[str, Any]:
-        import yaml
-
-        return yaml.safe_load(self.example.read_text())
+        return yaml_safe_load(self.example.read_text())
 
     def test_intended_policy_entry_exists(self) -> None:
         from tests.test_integration.test_examples import TestClaudeAgentSdkExamplesNativeTools
@@ -4173,7 +4283,7 @@ class TestExamplePin:
 
         text = self.example.read_text()
         assert lm.build_l1_config(text, None) == self._raw()  # unchanged, ``subscription``
-        config = load_config_string(yaml.safe_dump(lm.build_l1_config(text, None)))
+        config = load_config_string(yaml_safe_dump(lm.build_l1_config(text, None)))
         assert config.workflow.runtime.provider.auth_mode == "subscription"
 
 
@@ -4220,31 +4330,36 @@ RUNBOOK_PATH = REPO_ROOT / "docs" / "providers" / "claude-subscription.md"
 
 # The state-dependent constants of H65 (the status statement, the five live-proven cells and the
 # four Unverified cells of ``FIXED_STATUS_ROWS`` they qualify) and the state-independent ones.
-# After the official L0 -> L1 validation every live-proven cell is ``VALIDATED_CELL``.
+# The earlier L0 -> L1 observation is provisional: every live-proven cell is ``PROVISIONAL_CELL``
+# until a new official run, after the corrected harness is reviewed and CI is green, replaces it.
 RUNBOOK_STATUS_STATEMENT = (
-    "One official live validation (readiness, then one subscription inference) has passed. "
-    "Readiness confirmed a first-party subscription login, and one Haiku inference completed with "
-    "subscription billing provenance. It does not validate fake-key behavior, auto-mode or API-key "
-    "credential precedence, fallback or any broader compatibility. Earlier readiness-only and "
-    "official attempts remain non-official records: they are never reclassified, authorize "
-    "nothing and support no claim. Any future readiness or official operation requires fresh "
-    "explicit human approval, and no retry is ever automatic."
+    "A prior readiness-plus-inference run observed a first-party subscription login and "
+    "subscription billing provenance. That observation is provisional, not official evidence, "
+    "and nothing is live-proven until it is revalidated with the corrected harness. "
+    "Revalidation needs the corrected harness to be reviewed and CI to be green, then a fresh "
+    "explicit human approval and a new run. The observation does not validate fake-key "
+    "behavior, auto-mode or API-key credential precedence, fallback or any broader "
+    "compatibility. Earlier readiness-only and official attempts remain non-official records: "
+    "they are never reclassified, authorize nothing and support no claim. No retry is ever "
+    "automatic."
 )
 EXPERIMENTAL_VALIDATION_CLAUSE = (
     "This detection currently relies on CLI-reported `apiProvider` / `subscriptionType` evidence "
     "that has not yet been validated against a live Claude CLI session;"
 )
 NOT_YET_CELL = "*not yet*"
-VALIDATED_CELL = "yes (official live validation)"
+PROVISIONAL_CELL = "provisional observation (revalidation pending)"
+# The retired cell wording and status claims: they present the earlier observation as official.
+RETIRED_VALIDATED_CELL = "yes (official live " + "validation)"
 LIVE_PROVEN_CELLS = {
-    "Readiness (`claude auth status --json`)": VALIDATED_CELL,
-    "`billing_mode == subscription` derivation": VALIDATED_CELL,
-    "`API-equivalent estimate` label": VALIDATED_CELL,
-    "Bundled CLI reads the user's login": VALIDATED_CELL,
-    "Live harness (L0, L1)": VALIDATED_CELL,
+    "Readiness (`claude auth status --json`)": PROVISIONAL_CELL,
+    "`billing_mode == subscription` derivation": PROVISIONAL_CELL,
+    "`API-equivalent estimate` label": PROVISIONAL_CELL,
+    "Bundled CLI reads the user's login": PROVISIONAL_CELL,
+    "Live harness (L0, L1)": PROVISIONAL_CELL,
 }
 # row -> (Live-proven cell, or ``None`` when the row's cell is taken from ``LIVE_PROVEN_CELLS``,
-# Unverified cell).  Post-evidence state: the five ``None`` rows are all ``VALIDATED_CELL`` and
+# Unverified cell).  Post-evidence state: the five ``None`` rows are all ``PROVISIONAL_CELL`` and
 # their Unverified cells list only what remains unverified beyond the one official L0 -> L1
 # validation; the Unverified column keeps its meaning (what a real run still has to settle).
 FIXED_STATUS_ROWS = {
@@ -4278,6 +4393,10 @@ STALE_RUNBOOK_STATEMENTS = (
     "neither has been run",
     "none has been run",
     "means no passing official evidence exists",  # the removed reinterpretation wording
+    "One official live validation (readiness, then one subscription inference) has passed",
+    "official live validation (readiness, then one subscription inference) confirmed",
+    "one Haiku inference completed",
+    RETIRED_VALIDATED_CELL,
     "The first official validation attempt was retained",  # the revision-14 statement
 )
 # A claim that the automated harness never exercised a real CLI contradicts the recorded history
@@ -4780,8 +4899,9 @@ def no_signals(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     def boom(*args: object, **kwargs: object) -> None:
         raise AssertionError("a signal was sent")
 
-    monkeypatch.setattr(os, "kill", boom)
-    monkeypatch.setattr(os, "killpg", boom)
+    for name in ("kill", "killpg"):
+        if hasattr(os, name):  # ``killpg`` does not exist on Windows
+            monkeypatch.setattr(os, name, boom)
     return monkeypatch
 
 
@@ -4852,6 +4972,7 @@ class TestDescendants:
         with raises_outcome(lm.Outcome.PREREQ_PS_MISSING):
             lm.read_ps_table(popen=missing)
 
+    @pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are POSIX-only")
     def test_ps_timeout_kills_only_its_own_group(self, monkeypatch: pytest.MonkeyPatch) -> None:
         sent: list[tuple[int, int]] = []
         monkeypatch.setattr(os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
@@ -5031,6 +5152,209 @@ class TestDescendants:
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait(timeout=5)
+
+
+# ============================================================================
+# Remediation: the owned-subprocess helper fails closed and always cleans up
+# ============================================================================
+
+PLANTED_STDOUT = "PLANTED-STDOUT-4417"
+
+
+class ScriptedProc:
+    """A fake child: fixed output and status; records what the helper does to it."""
+
+    def __init__(
+        self,
+        *,
+        output: str = "",
+        returncode: int = 0,
+        pid: int = 4321,
+        first: BaseException | None = None,
+        stuck: bool = False,
+        wait_error: BaseException | None = None,
+    ) -> None:
+        self.output = output
+        self.returncode = returncode
+        self.pid = pid
+        self.first = first
+        self.stuck = stuck
+        self.wait_error = wait_error
+        self.calls: list[tuple[str, float | None]] = []
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, None]:
+        self.calls.append(("communicate", timeout))
+        if len(self.calls) == 1 and self.first is not None:
+            raise self.first
+        if self.stuck:
+            raise subprocess.TimeoutExpired("child", timeout or 0)
+        return self.output, None
+
+    def kill(self) -> None:
+        self.calls.append(("kill", None))
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.calls.append(("wait", timeout))
+        if self.wait_error is not None:
+            raise self.wait_error
+        return self.returncode
+
+
+class ArgvPopen:
+    """A ``Popen`` stand-in answering each owned command by a fragment of its argv."""
+
+    def __init__(self, answers: Mapping[str, tuple[int, str]]) -> None:
+        self.answers = answers
+
+    def __call__(self, argv: Sequence[str], **kwargs: object) -> ScriptedProc:
+        joined = " ".join(argv)
+        for fragment, (status, output) in self.answers.items():
+            if fragment in joined:
+                return ScriptedProc(output=output, returncode=status)
+        raise AssertionError(f"unexpected command {joined}")
+
+
+@pytest.fixture
+def owned_popen(monkeypatch: pytest.MonkeyPatch) -> Callable[[Mapping[str, tuple[int, str]]], None]:
+    """Replace the default ``popen`` of the helper (``read_git_state`` and ``read_cli_version``)."""
+
+    def install(answers: Mapping[str, tuple[int, str]]) -> None:
+        monkeypatch.setitem(lm._run_owned_subprocess.__kwdefaults__, "popen", ArgvPopen(answers))
+
+    return install
+
+
+class TestOwnedSubprocessFailsClosed:
+    @pytest.mark.parametrize("status", [1, 2, 127, 128, 255, -9])
+    def test_every_nonzero_status_raises_without_embedding_any_output(self, status: int) -> None:
+        proc = ScriptedProc(output=PLANTED_STDOUT + "\n", returncode=status)
+        with pytest.raises(subprocess.CalledProcessError) as caught:
+            lm._run_owned_subprocess(["tool", "arg"], popen=lambda *a, **k: proc)
+        error = caught.value
+        assert error.returncode == status
+        assert error.output is None and error.stderr is None and error.stdout is None
+        assert PLANTED_STDOUT not in str(error) + repr(error) + repr(error.args)
+
+    def test_a_zero_status_returns_the_output_and_the_owned_pid(self) -> None:
+        proc = ScriptedProc(output="out\n", pid=77)
+        assert lm._run_owned_subprocess(["tool"], popen=lambda *a, **k: proc) == (0, "out\n", 77)
+
+    def test_a_failed_git_status_is_a_failure_not_a_clean_tree(
+        self, gates_on: None, tmp_path: Path, owned_popen: Callable[..., None]
+    ) -> None:
+        owned_popen({"rev-parse": (0, "d" * 40 + "\n"), "status": (128, "")})  # empty stdout
+        with raises_outcome(lm.Outcome.CASE_FAILED):
+            lm.read_git_state(make_config(), tmp_path)
+
+    def test_a_failed_rev_parse_is_a_failure_even_with_a_valid_looking_sha(
+        self, gates_on: None, tmp_path: Path, owned_popen: Callable[..., None]
+    ) -> None:
+        owned_popen({"rev-parse": (1, "d" * 40 + "\n"), "status": (0, "")})
+        with raises_outcome(lm.Outcome.CASE_FAILED):
+            lm.read_git_state(make_config(), tmp_path)
+
+    def test_a_successful_git_pair_still_reads_the_state(
+        self, gates_on: None, tmp_path: Path, owned_popen: Callable[..., None]
+    ) -> None:
+        owned_popen({"rev-parse": (0, "e" * 40 + "\n"), "status": (0, " M x\n")})
+        assert lm.read_git_state(make_config(), tmp_path) == ("e" * 40, True)
+
+    def test_a_failed_ps_never_yields_a_process_table(self) -> None:
+        popen = ArgvPopen({"ps -A": (1, PS_OUTPUT)})  # a table-shaped stdout with a failing status
+        with raises_outcome(lm.Outcome.PREREQ_PS_MISSING):
+            lm.read_ps_table(popen=popen)
+
+    def test_a_failed_cli_version_is_a_failure_not_a_version(
+        self, gates_on: None, tmp_path: Path, owned_popen: Callable[..., None]
+    ) -> None:
+        owned_popen({"--version": (1, "2.1.0 (Claude Code)\n")})  # a parseable version, bad status
+        with raises_outcome(lm.Outcome.PREREQ_CLI_MISSING):
+            lm.read_cli_version(make_config(), tmp_path, Path("claude"))
+
+    def test_a_successful_cli_version_is_still_parsed(
+        self, gates_on: None, tmp_path: Path, owned_popen: Callable[..., None]
+    ) -> None:
+        owned_popen({"--version": (0, "2.1.0 (Claude Code)\n")})
+        assert lm.read_cli_version(make_config(), tmp_path, Path("claude")) == "2.1.0"
+
+
+@pytest.fixture
+def group_kills(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
+    """Record group kills where the OS has them; elsewhere the helper falls back to ``kill``."""
+    sent: list[tuple[int, int]] = []
+    if hasattr(os, "killpg"):
+        monkeypatch.setattr(os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
+    return sent
+
+
+class TestOwnedSubprocessCleanup:
+    EXCEPTIONS = [
+        subprocess.TimeoutExpired("child", 5),
+        KeyboardInterrupt(),
+        asyncio.CancelledError(),
+        RuntimeError("boom"),
+        SystemExit(3),
+    ]
+    IDS = ["timeout", "keyboard_interrupt", "cancelled", "runtime_error", "system_exit"]
+
+    @pytest.mark.parametrize("raised", EXCEPTIONS, ids=IDS)
+    def test_the_child_group_is_killed_and_reaped_and_the_original_propagates(
+        self, raised: BaseException, group_kills: list[tuple[int, int]]
+    ) -> None:
+        proc = ScriptedProc(first=raised)
+        with pytest.raises(type(raised)) as caught:
+            lm._run_owned_subprocess(["tool"], popen=lambda *a, **k: proc)
+        assert caught.value is raised  # never swallowed, never replaced
+        if hasattr(os, "killpg"):
+            assert group_kills == [(proc.pid, signal.SIGKILL)]  # its own group, once
+        assert proc.calls == [("communicate", 5.0), ("communicate", lm._REAP_TIMEOUT)]
+
+    def test_a_reap_that_does_not_finish_falls_back_to_a_bounded_kill_and_wait(
+        self, group_kills: list[tuple[int, int]]
+    ) -> None:
+        raised = KeyboardInterrupt()
+        proc = ScriptedProc(first=raised, stuck=True)
+        with pytest.raises(KeyboardInterrupt) as caught:
+            lm._run_owned_subprocess(["tool"], popen=lambda *a, **k: proc)
+        assert caught.value is raised
+        assert proc.calls == [
+            ("communicate", 5.0),
+            ("communicate", lm._REAP_TIMEOUT),
+            ("kill", None),
+            ("wait", lm._REAP_TIMEOUT),
+        ]
+        assert 0 < lm._REAP_TIMEOUT <= 5
+
+    def test_a_failing_cleanup_never_replaces_the_original_exception(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def broken(pgid: int, sig: int) -> None:
+            raise ProcessLookupError("already gone")
+
+        if hasattr(os, "killpg"):
+            monkeypatch.setattr(os, "killpg", broken)
+        raised = KeyboardInterrupt()
+        proc = ScriptedProc(first=raised, stuck=True, wait_error=OSError("cannot wait"))
+        with pytest.raises(KeyboardInterrupt) as caught:
+            lm._run_owned_subprocess(["tool"], popen=lambda *a, **k: proc)
+        assert caught.value is raised
+        assert ("wait", lm._REAP_TIMEOUT) in proc.calls  # it was still attempted, bounded
+
+    def test_a_child_that_could_not_be_created_has_nothing_to_clean_up(
+        self, group_kills: list[tuple[int, int]]
+    ) -> None:
+        def missing(*args: object, **kwargs: object) -> None:
+            raise FileNotFoundError("tool")
+
+        with pytest.raises(FileNotFoundError):
+            lm._run_owned_subprocess(["tool"], popen=missing)
+        assert group_kills == []
+
+    def test_a_nonzero_exit_needs_no_kill(self, group_kills: list[tuple[int, int]]) -> None:
+        proc = ScriptedProc(returncode=3)
+        with pytest.raises(subprocess.CalledProcessError):
+            lm._run_owned_subprocess(["tool"], popen=lambda *a, **k: proc)
+        assert group_kills == [] and proc.calls == [("communicate", 5.0)]
 
 
 # ============================================================================
@@ -6123,14 +6447,16 @@ LOGIN_PAYLOAD: dict[str, object] = {
 ANSWER_TEXT = json.dumps({"answer": "A workflow is a sequence of steps."})
 
 
-@pytest.fixture
-def boundary_hits(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+def armed_boundaries(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Fail-closed tripwires on every process / network / SDK-process entry (zero hits expected)."""
     import socket
 
     hits: list[str] = []
 
     def arm(owner: Any, attr: str, name: str) -> None:
+        if target_is_absent_and_optional(owner, attr):
+            return  # never created: ``raising=False`` would invent an API Windows does not have
+
         def tripwire(*args: object, **kwargs: object) -> None:
             hits.append(name)
             raise AssertionError(f"tripwire: {name}")
@@ -6151,6 +6477,11 @@ def boundary_hits(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     arm(anyio, "open_process", "anyio.open_process")
     arm(SubprocessCLITransport, "connect", "SubprocessCLITransport.connect")
     return hits
+
+
+@pytest.fixture
+def boundary_hits(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    return armed_boundaries(monkeypatch)
 
 
 class AuthProbe:
@@ -6388,6 +6719,7 @@ def record_for(records: Sequence[dict[str, object]], case: str) -> dict[str, obj
 
 @pytest.mark.claude_auth_readiness_mocked
 class TestRealAdaptersHappyPath:
+    @requires_ps
     def test_full_official_session_through_real_production_paths(self, stack: Stack) -> None:
         stack.script(sdk_frames())  # L1
         result = stack.session()
@@ -6709,6 +7041,7 @@ class TestRealInferenceAdapters:
     """L1 through ``load_config`` -> ``ProviderRegistry`` -> ``WorkflowEngine``."""
 
     # -- happy path and reachability ------------------------------------------------------
+    @requires_ps
     def test_full_session_reaches_the_real_engine_registry_and_provider(self, stack: Stack) -> None:
         seen: dict[str, str | None] = {}
         transport = stack.script(sdk_frames(), on_connect=env_recorder(seen))
@@ -6728,6 +7061,7 @@ class TestRealInferenceAdapters:
         assert "ANTHROPIC_API_KEY" not in os.environ
         assert stack.hits == []
 
+    @requires_ps
     def test_evidence_of_a_full_session_is_complete_and_sanitized(self, stack: Stack) -> None:
         stack.script(sdk_frames())
         result = stack.session()
@@ -6987,6 +7321,7 @@ class TestRealInferenceAdapters:
         assert len(stack.probe.envs) == 1  # L0, and therefore the readiness-only check
         assert stack.probe.sites == ["direct"]
 
+    @requires_ps
     def test_official_total_is_three_in_a_fixed_order_and_probes_are_not_quota(
         self, stack: Stack
     ) -> None:
@@ -7002,6 +7337,7 @@ class TestRealInferenceAdapters:
 class TestPerCaseIsolation:
     """Nothing from L0 bleeds into L1."""
 
+    @requires_ps
     def test_environment_is_restored_after_a_full_session(
         self, stack: Stack, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -7015,6 +7351,7 @@ class TestPerCaseIsolation:
         assert dict(os.environ) == before
         assert private_logger_state() == loggers_before
 
+    @requires_ps
     def test_each_case_sees_the_route_scrub_and_no_credential(
         self, stack: Stack, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -7493,6 +7830,158 @@ class TestPrivateLogSink:
         assert lm.PRIVATE_LOGGERS == ("claude_agent_sdk", "conductor.providers.claude_agent_sdk")
 
 
+# ============================================================================
+# Remediation: the private sink isolates every pre-existing handler of its hierarchy
+# ============================================================================
+
+HIERARCHY_CHILD = "claude_agent_sdk.remediation_child.leaf"
+HIERARCHY_MIDDLE = "claude_agent_sdk.remediation_child"
+PROVIDER_CHILD = "conductor.providers.claude_agent_sdk.remediation_child"
+HIERARCHY = (
+    "claude_agent_sdk",
+    HIERARCHY_MIDDLE,
+    HIERARCHY_CHILD,
+    "conductor.providers.claude_agent_sdk",
+    PROVIDER_CHILD,
+)
+
+
+@pytest.fixture
+def seeded_hierarchy() -> Iterator[dict[str, RecordingHandler]]:
+    """Pre-existing handlers on named loggers *and* already-created children, parents included."""
+    handlers: dict[str, RecordingHandler] = {}
+    loggers = [logging.getLogger(name) for name in (*HIERARCHY, "conductor.providers", "conductor")]
+    saved = [(lg, lg.level, list(lg.handlers), lg.propagate, lg.disabled) for lg in loggers]
+    try:
+        for logger in loggers:
+            handlers[logger.name] = RecordingHandler()
+            logger.addHandler(handlers[logger.name])
+        yield handlers
+    finally:
+        for logger, level, kept, propagate, disabled in saved:
+            logger.handlers[:] = kept
+            logger.setLevel(level)
+            logger.propagate = propagate
+            logger.disabled = disabled
+
+
+def hierarchy_state() -> dict[str, tuple[int, list[Any], bool, bool]]:
+    return sink_state((*HIERARCHY, "conductor.providers", "conductor", ""))
+
+
+class TestPrivateLogSinkHierarchy:
+    def test_no_pre_existing_handler_of_a_named_logger_or_a_child_sees_a_record(
+        self, seeded_hierarchy: dict[str, RecordingHandler]
+    ) -> None:
+        with lm.PrivateLogSink() as sink:
+            for name in HIERARCHY:
+                logging.getLogger(name).warning("raw %s", SECRET)
+                logging.getLogger(name).error("raw %s", SECRET)
+            assert sink.arrivals == 2 * len(HIERARCHY)  # each record counted once
+        for name, handler in seeded_hierarchy.items():
+            assert [r for r in handler.records if SECRET in r.getMessage()] == [], name
+
+    def test_each_record_is_counted_exactly_once_whatever_the_depth(
+        self, seeded_hierarchy: dict[str, RecordingHandler]
+    ) -> None:
+        with lm.PrivateLogSink() as sink:
+            logging.getLogger(HIERARCHY_CHILD).warning("deep %s", SECRET)
+            assert sink.arrivals == 1
+            logging.getLogger(PROVIDER_CHILD).warning("deep %s", SECRET)
+            assert sink.arrivals == 2
+            logging.getLogger("claude_agent_sdk").warning("top %s", SECRET)
+            assert sink.arrivals == 3
+
+    def test_a_child_that_does_not_propagate_is_still_counted_and_never_reaches_its_handler(
+        self, seeded_hierarchy: dict[str, RecordingHandler]
+    ) -> None:
+        logging.getLogger(HIERARCHY_CHILD).propagate = False  # restored by the fixture's state
+        with lm.PrivateLogSink() as sink:
+            logging.getLogger(HIERARCHY_CHILD).warning("quiet %s", SECRET)
+            assert sink.arrivals == 1
+        assert seeded_hierarchy[HIERARCHY_CHILD].records == []
+        assert logging.getLogger(HIERARCHY_CHILD).propagate is False
+
+    def test_a_logger_outside_the_hierarchy_is_untouched(
+        self, seeded_hierarchy: dict[str, RecordingHandler]
+    ) -> None:
+        look_alike = logging.getLogger("claude_agent_sdk_other")  # a prefix, not a child
+        keep = RecordingHandler()
+        look_alike.addHandler(keep)
+        try:
+            before = sink_state((look_alike.name,))
+            with lm.PrivateLogSink() as sink:
+                assert sink_state((look_alike.name,)) == before
+                look_alike.warning("not-ours %s", SECRET)
+                assert sink.arrivals == 0
+            assert [r.getMessage() for r in keep.records] == [f"not-ours {SECRET}"]
+        finally:
+            look_alike.removeHandler(keep)
+
+    @pytest.mark.parametrize(
+        "exit_with",
+        [None, RuntimeError("boom"), KeyboardInterrupt(), asyncio.CancelledError()],
+        ids=["success", "failure", "interrupt", "cancellation"],
+    )
+    def test_the_whole_hierarchy_is_restored_exactly(
+        self, seeded_hierarchy: dict[str, RecordingHandler], exit_with: BaseException | None
+    ) -> None:
+        for name in (HIERARCHY_CHILD, PROVIDER_CHILD):
+            logging.getLogger(name).setLevel(logging.ERROR)
+        logging.getLogger(HIERARCHY_MIDDLE).propagate = False
+        logging.getLogger(HIERARCHY_MIDDLE).disabled = True
+        before = hierarchy_state()
+        try:
+            with lm.PrivateLogSink():
+                for name in HIERARCHY:
+                    level, _handlers, _propagate, _disabled = sink_state((name,))[name]
+                    assert level == before[name][0]  # no level is ever changed
+                logging.getLogger(HIERARCHY_CHILD).disabled = True  # flipped inside the scope
+                if exit_with is not None:
+                    raise exit_with
+        except BaseException as raised:
+            assert raised is exit_with
+        assert hierarchy_state() == before
+        # the very same handler objects are back, in their original order
+        for name in HIERARCHY:
+            assert seeded_hierarchy[name] in logging.getLogger(name).handlers
+
+    def test_after_the_scope_the_original_handlers_receive_records_again(
+        self, seeded_hierarchy: dict[str, RecordingHandler]
+    ) -> None:
+        with lm.PrivateLogSink():
+            pass
+        logging.getLogger(HIERARCHY_CHILD).warning("later %s", SECRET)
+        assert [r.getMessage() for r in seeded_hierarchy[HIERARCHY_CHILD].records] == [
+            f"later {SECRET}"
+        ]
+
+    def test_parents_above_the_private_loggers_receive_nothing(
+        self, seeded_hierarchy: dict[str, RecordingHandler]
+    ) -> None:
+        with lm.PrivateLogSink():
+            logging.getLogger(PROVIDER_CHILD).error("up %s", SECRET)
+        for name in ("conductor.providers", "conductor"):
+            assert seeded_hierarchy[name].records == []
+
+    def test_a_failure_while_entering_restores_the_children_already_changed(
+        self, seeded_hierarchy: dict[str, RecordingHandler], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        before = hierarchy_state()
+        real = logging.getLogger
+
+        def broken(name: str | None = None) -> logging.Logger:
+            if name == lm.PRIVATE_LOGGERS[1]:  # the second private logger cannot be fetched
+                raise TypeError("cannot get the second logger")
+            return real(name)
+
+        monkeypatch.setattr(lm.logging, "getLogger", broken)
+        with pytest.raises(TypeError):
+            lm.PrivateLogSink().__enter__()
+        monkeypatch.setattr(lm.logging, "getLogger", real)
+        assert hierarchy_state() == before
+
+
 class TestAuthorizedCommands:
     """H21 (vii): the commands the runbook shows and a maintainer may be authorized to run."""
 
@@ -7650,7 +8139,7 @@ class TestStructuralTripwires:
 
     def test_the_tripwire_fixture_arms_every_boundary(self) -> None:
         tree = ast.parse(Path(__file__).read_text())
-        fixture = module_level_functions(tree)["boundary_hits"]
+        fixture = module_level_functions(tree)["armed_boundaries"]
         armed = [
             ast.literal_eval(c.args[2])
             for c in ast.walk(fixture)
@@ -7668,13 +8157,15 @@ class TestStructuralTripwires:
         ]
 
     def test_the_tripwires_are_live_positive_control(self, boundary_hits: list[str]) -> None:
-        for boundary in (
-            lambda: subprocess.Popen(["true"]),
-            lambda: os.posix_spawn("/bin/true", ["true"], {}),
-        ):
+        boundaries: list[tuple[Callable[[], object], str]] = [
+            (lambda: subprocess.Popen(["true"]), "Popen"),
+        ]
+        if hasattr(os, "posix_spawn"):  # POSIX only: nothing to arm, or call, elsewhere
+            boundaries.append((lambda: os.posix_spawn("/bin/true", ["true"], {}), "posix_spawn"))
+        for boundary, _name in boundaries:
             with pytest.raises(AssertionError, match="tripwire"):
                 boundary()
-        assert boundary_hits == ["Popen", "posix_spawn"]
+        assert boundary_hits == [name for _boundary, name in boundaries]
 
 
 # Planning-phase labels and "adapters are not wired" wording, built from parts so that this
@@ -8162,7 +8653,7 @@ class TestClassifierGrammar:
         locked.write_bytes(b"x")
         locked.chmod(0)
         try:
-            if os.geteuid() != 0:
+            if hasattr(os, "geteuid") and os.geteuid() != 0:  # POSIX permission semantics only
                 assert lm._read_capture(str(locked)) == (None, "capture_unreadable")
         finally:
             locked.chmod(0o600)
@@ -9135,6 +9626,7 @@ class ClassC:
             "XDG_CACHE_HOME": str(base / "xdg-cache"),
             "PATH": SYSTEM_PATH,
         }
+        env.update(windows_base_env(sys.platform, os.environ))  # never a broken Windows child
         assert not [k for k in env if k.startswith(("ANTHROPIC_", "CLAUDE_", "CONDUCTOR_"))]
         assert shutil.which("claude", path=SYSTEM_PATH) is None
         env.update(extra or {})  # a vector's own declared variables only
@@ -9559,7 +10051,7 @@ class TestClassifierStartup:
         layout = class_c.root / "layout"
         (layout / "bin").mkdir(parents=True)
         interpreter = layout / "bin" / "python"
-        interpreter.symlink_to(base)
+        symlink_or_skip(interpreter, base)
         (layout / "pyvenv.cfg").write_text(
             f"home = {base.parent}\ninclude-system-site-packages = false\n"
         )
@@ -9829,7 +10321,7 @@ class TestShellGate:
         elif kind == "empty":
             gate.evidence.write_bytes(b"")
         else:
-            gate.evidence.symlink_to(gate.root / "no-such-target")
+            symlink_or_skip(gate.evidence, gate.root / "no-such-target")
         before = gate.evidence.read_bytes() if gate.evidence.is_file() else None
         done = gate.run(shell)
         assert done.returncode != 0 and not done.ran  # the pytest stand-in never ran
@@ -9954,6 +10446,160 @@ class TestShellGate:
             check=False,
         )
         assert done.returncode == 0 and "pipefail" in done.stdout
+
+    # -- remediation: a fail-closed environment pre-gate and a truthful capture disposal --------
+
+    @staticmethod
+    def stub_path(gate: GateRunner, **scripts: str) -> str:
+        """A PATH whose first directory holds the given stand-in commands (POSIX shell scripts)."""
+        stubs = gate.root / "stubs"
+        stubs.mkdir(exist_ok=True)
+        for name, body in scripts.items():
+            stub = stubs / name
+            stub.write_text("#!/bin/sh\n" + body + "\n")
+            stub.chmod(0o755)
+        return f"{stubs}:{SYSTEM_PATH}"
+
+    PLANTED_ENV = "PLANTED-ENV-VALUE-4417"
+    REAL_ENV = shutil.which("env", path=SYSTEM_PATH) or "/usr/bin/env"
+    # (stand-ins, id): each makes the environment check fail without a clean "no match"
+    CHECKER_ERRORS = [
+        ({"grep": "cat >/dev/null; exit 2"}, "grep_error"),
+        ({"grep": "cat >/dev/null; exit 127"}, "grep_not_found"),
+        ({"grep": "cat >/dev/null; exit 137"}, "grep_killed"),
+        ({"grep": "cat >/dev/null; exit 0"}, "grep_reports_a_match"),
+        (
+            {"env": 'if [ "$#" -eq 0 ]; then exit 1; fi; exec ' + REAL_ENV + ' "$@"'},
+            "env_error_without_output",
+        ),
+        (
+            {
+                "env": 'if [ "$#" -eq 0 ]; then printf "%s\\n" "PARTIAL='
+                + PLANTED_ENV
+                + '"; exit 3; fi; exec '
+                + REAL_ENV
+                + ' "$@"'
+            },
+            "env_error_after_a_partial_dump",
+        ),
+        ({"env": 'if [ "$#" -eq 0 ]; then exit 0; fi; exec ' + REAL_ENV + ' "$@"'}, "env_silent"),
+    ]
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize(
+        ("scripts", "label"), CHECKER_ERRORS, ids=[c[1] for c in CHECKER_ERRORS]
+    )
+    def test_an_environment_checker_error_stops_the_gate_and_leaks_nothing(
+        self, gate: GateRunner, shell: str, scripts: dict[str, str], label: str
+    ) -> None:
+        # "env_silent" (an empty listing) is a clean no-match: it must proceed, as a control
+        proceeds = label == "env_silent"
+        done = gate.run(
+            shell,
+            env={"PATH": self.stub_path(gate, **scripts), "PLANTED_NAME": self.PLANTED_ENV},
+        )
+        assert done.ran is proceeds and (done.returncode == 0) is proceeds, label
+        assert self.PLANTED_ENV not in done.stdout + done.stderr  # the dump is never printed
+        persisted = [
+            p
+            for p in gate.root.rglob("*")
+            if p.is_file()
+            and p.parent.name != "stubs"  # the stand-in itself names the value
+            and self.PLANTED_ENV.encode() in p.read_bytes()
+        ]
+        assert persisted == []  # and never written anywhere
+        if not proceeds:
+            assert done.argv == [] and not gate.evidence.exists()  # stopped before any live action
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    def test_the_old_one_line_check_would_have_proceeded_on_a_checker_error(
+        self, gate: GateRunner, shell: str
+    ) -> None:
+        """Negative control: why the new pre-gate distinguishes an error from a clean no-match."""
+        start = lm.PRE_GATE.index("ENV_DUMP=$(env)")
+        end = lm.PRE_GATE.index('[ ! -e "$EVIDENCE_FILE"')
+        old = (
+            lm.PRE_GATE[:start]
+            + "if env | grep -E '^(CLAUDE_|ANTHROPIC_)' >/dev/null 2>&1; then exit 1; fi\n"
+            + lm.PRE_GATE[end:]
+        )
+        path = self.stub_path(gate, grep="cat >/dev/null; exit 2")
+        assert gate.run(shell, env={"PATH": path}, pre_gate=old).ran  # the defect, reproduced
+        assert not gate.run(shell, env={"PATH": path}).ran  # the fix
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize("name", ["CLAUDE_CODE_TEST", "ANTHROPIC_API_KEY"])
+    def test_a_match_still_stops_and_the_dump_variable_does_not_outlive_the_gate(
+        self, gate: GateRunner, shell: str, name: str
+    ) -> None:
+        stopped = gate.run(shell, env={name: self.PLANTED_ENV})
+        assert stopped.returncode != 0 and not stopped.ran
+        assert self.PLANTED_ENV not in stopped.stdout + stopped.stderr
+        probe = subprocess.run(
+            [shell, "-c", lm.PRE_GATE + 'printf "[%s][%s]" "${ENV_DUMP-unset}" "$ENV_CHECK"\n'],
+            cwd=gate.root,
+            env=gate.cls.environment(
+                {"EVIDENCE_FILE": str(gate.root / "outside" / "p.txt"), "EXPECTED": "official"}
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert probe.stdout == "[unset][1]"  # the dump is gone; 1 is the clean no-match code
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    @pytest.mark.parametrize(
+        ("remover", "label"),
+        [
+            ("exit 1", "rm_fails"),
+            ("exit 0", "rm_silently_does_nothing"),
+            (
+                'for p in "$@"; do :; done; /bin/rm -f -- "$p"; '
+                'ln -s /no-such-target-4417 "$p"; exit 0',
+                "rm_leaves_a_symlink",
+            ),
+        ],
+    )
+    def test_a_capture_that_could_not_be_deleted_is_reported_as_still_on_disk(
+        self, gate: GateRunner, shell: str, remover: str, label: str
+    ) -> None:
+        path = self.stub_path(gate, rm=remover)
+        done = gate.run(
+            shell, classifier_stdout="", classifier_status=1, env={"PATH": path}
+        )  # a discard row
+        assert done.returncode == 1, label
+        assert gate.evidence.exists() or gate.evidence.is_symlink()  # it really is still there
+        assert "capture NOT deleted" in done.stdout
+        assert "remove it manually" in done.stdout and "never share it" in done.stdout
+        assert "capture deleted; stop" not in done.stdout
+        assert str(gate.evidence) not in done.stdout + done.stderr  # no path is printed
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    def test_a_verified_deletion_still_says_deleted(self, gate: GateRunner, shell: str) -> None:
+        done = gate.run(shell, classifier_stdout="", classifier_status=1)
+        assert done.returncode == 1 and not gate.evidence.exists()
+        assert "capture deleted; stop" in done.stdout and "NOT deleted" not in done.stdout
+
+    @pytest.mark.parametrize("shell", SHELLS)
+    def test_a_dangling_symlink_left_behind_would_pass_the_old_message(
+        self, gate: GateRunner, shell: str
+    ) -> None:
+        """Negative control: the previous block printed ``capture deleted`` whatever happened."""
+        old = lm.MATRIX_BLOCK.replace(
+            'if rm -f -- "$EVIDENCE_FILE" && [ ! -e "$EVIDENCE_FILE" ] '
+            '&& [ ! -L "$EVIDENCE_FILE" ]; then',
+            'rm -f -- "$EVIDENCE_FILE"; if true; then',
+        )
+        assert old != lm.MATRIX_BLOCK
+        path = self.stub_path(gate, rm="exit 1")
+        done = gate.run(
+            shell,
+            classifier_stdout="",
+            classifier_status=1,
+            env={"PATH": path},
+            matrix_block=old,
+        )
+        assert "capture deleted; stop" in done.stdout and gate.evidence.exists()  # the false claim
 
     def test_generic_posix_sh_is_documented_only(self) -> None:
         text = RUNBOOK_PATH.read_text()
@@ -11494,11 +12140,12 @@ def test_a_replacement_never_calls_through():
         "subprocess.Popen": lambda: subprocess.Popen(["PLANTED-argv-4417"]),
         "os.system": lambda: os.system("PLANTED-command-4417"),
         "os.popen": lambda: os.popen("PLANTED-command-4417"),
-        "os.posix_spawn": lambda: os.posix_spawn("PLANTED-4417", ["x"], {}),
         "asyncio.create_subprocess_exec": lambda: asyncio.create_subprocess_exec("PLANTED-4417"),
         "socket.getaddrinfo": lambda: socket.getaddrinfo("planted-4417.invalid", 80),
         "socket.create_connection": lambda: socket.create_connection(("127.0.0.1", 9)),
     }
+    if hasattr(os, "posix_spawn"):  # POSIX only
+        calls["os.posix_spawn"] = lambda: os.posix_spawn("PLANTED-4417", ["x"], {})
     for name, call in calls.items():
         try:
             result = call()
@@ -11595,7 +12242,8 @@ class TestIsolationControls:
             "XDG_CACHE_HOME",
         ):
             assert Path(env[name]).resolve().is_relative_to(root), name
-        assert env["PATH"] == SYSTEM_PATH and "claude" not in os.listdir("/usr/bin")
+        assert env["PATH"] == SYSTEM_PATH
+        assert not os.path.isdir("/usr/bin") or "claude" not in os.listdir("/usr/bin")
         assert shutil.which("claude", path=env["PATH"]) is None
         assert "PLANTED" not in " ".join(env.values())
         for value in env.values():
@@ -11783,6 +12431,7 @@ SCRATCH_SOURCES = {
 
 # The class every sandbox-using test class belongs to (design section 10).
 SANDBOX_CLASS = {
+    "TestPlatformGuards": "S",
     "TestNoRetroactiveAcceptance": "R",
     "TestFailClosedConditions": "R",
     "TestSandboxGates": "R",
@@ -12686,7 +13335,6 @@ TABLE_E_MODULES = frozenset(
         "tempfile",
         "time",
         "pytest",
-        "yaml",
         "io",
         "datetime",
         "platform",
@@ -13498,8 +14146,8 @@ LIVE_STDLIB_ALLOWLIST = frozenset(
         ("from", "pathlib", ("Path",), ""),
         ("from", "typing", ("NoReturn", "Protocol"), ""),
         ("import", "pytest", (), ""),
-        ("import", "yaml", (), "build_l1_config"),
-        ("import", "yaml", (), "RealWorkflowAdapter.execute"),
+        ("from", "ruamel.yaml", ("YAML",), "build_l1_config"),
+        ("from", "ruamel.yaml", ("YAML",), "RealWorkflowAdapter.execute"),
         ("import", "datetime", (), "environment_facts"),
         ("import", "importlib.metadata", (), "environment_facts"),
         ("import", "platform", (), "environment_facts"),
@@ -13639,7 +14287,7 @@ TABLE_E_CHAINS = {
     "subprocess.PIPE": {"_run_owned_subprocess"},
     "subprocess.Popen": {"_run_owned_subprocess", "descendant_snapshot", "read_ps_table"},
     "subprocess.SubprocessError": {"read_cli_version", "read_git_state", "read_ps_table"},
-    "subprocess.TimeoutExpired": {"_run_owned_subprocess"},
+    "subprocess.CalledProcessError": {"_run_owned_subprocess"},
     "sys.argv": {""},
     "sys.exit": {""},
     "sys.platform": {"check_prerequisites"},
@@ -13652,8 +14300,6 @@ TABLE_E_CHAINS = {
         "run_ordered_cases",
         "with_descendant_check",
     },
-    "yaml.safe_dump": {"RealWorkflowAdapter.execute"},
-    "yaml.safe_load": {"build_l1_config"},
 }
 
 
@@ -14582,6 +15228,8 @@ async def scoped_tripwires(
     patches: list[tuple[Any, str, Any, bool]] = []
 
     def arm(owner: Any, attribute: str, site: FakeSite) -> None:
+        if target_is_absent_and_optional(owner, attribute):
+            return
         own = isinstance(owner, type) and attribute in owner.__dict__
         original = owner.__dict__[attribute] if own else getattr(owner, attribute)
 
@@ -15094,6 +15742,7 @@ class TestCountingFakes:
             (concurrent.futures.ProcessPoolExecutor, "submit"),
             (socket.socket, "connect"),
         ]
+        targets = [target for target in targets if hasattr(*target)]  # POSIX-only OS APIs
         before = [(o, a, getattr(o, a)) for o, a in targets]
         execute_child = subprocess.Popen.__dict__["_execute_child"]
         violations: Violations = []
@@ -15250,6 +15899,345 @@ class TestCountingOfficialSession:
         assert result.succeeded
 
 
+POSIX_ONLY_OS_APIS = tuple(sorted(OPTIONAL_POSIX_OS_ATTRIBUTES))
+
+
+class TestPlatformGuards:
+    """Only POSIX-specific controls are platform-dependent; absent APIs are never touched."""
+
+    @pytest.fixture
+    def without_posix_apis(self, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Remove the POSIX-only spawn APIs (a Windows approximation); returns those removed."""
+        removed = [name for name in POSIX_ONLY_OS_APIS if hasattr(os, name)]
+        for name in removed:
+            monkeypatch.delattr(os, name)  # restored at teardown; nothing is ever created
+        assert not any(hasattr(os, name) for name in POSIX_ONLY_OS_APIS)
+        return removed
+
+    def test_the_boundary_tripwires_never_access_or_create_an_absent_api(
+        self, without_posix_apis: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with monkeypatch.context() as scope:
+            hits = armed_boundaries(scope)
+            assert not any(hasattr(os, name) for name in POSIX_ONLY_OS_APIS)  # none was invented
+            with pytest.raises(AssertionError, match="tripwire: Popen"):
+                subprocess.Popen(["x"])
+        assert hits == ["Popen"]  # the platform-neutral boundaries stay armed
+        assert not any(hasattr(os, name) for name in POSIX_ONLY_OS_APIS)
+
+    def test_the_scoped_tripwires_never_access_or_create_an_absent_api(
+        self, without_posix_apis: list[str]
+    ) -> None:
+        violations: Violations = []
+        seen: list[bool] = []
+
+        async def inside() -> None:
+            seen.append(any(hasattr(os, name) for name in POSIX_ONLY_OS_APIS))
+
+        async def go() -> None:
+            async with scoped_tripwires(violations):
+                await inside()
+
+        asyncio.run(go())
+        assert seen == [False]  # nothing was invented inside the scope
+        assert violations == []
+        assert not any(hasattr(os, name) for name in POSIX_ONLY_OS_APIS)
+
+    def test_the_tripwire_sources_never_invent_an_api(self) -> None:
+        """No ``raising=False`` patch of an ``os`` attribute, anywhere in the gate module."""
+        tree = ast.parse(Path(__file__).read_text())
+        offenders = [
+            ast.unparse(call)
+            for call in ast.walk(tree)
+            if isinstance(call, ast.Call)
+            and ast.unparse(call.func) in ("monkeypatch.setattr", "scope.setattr")
+            and any(
+                kw.arg == "raising" and ast.unparse(kw.value) == "False" for kw in call.keywords
+            )
+        ]
+        assert offenders == []
+
+    def test_layer1_expectations_follow_the_platform(self) -> None:
+        everything = SimpleNamespace(**{n.removeprefix("os."): 0 for n in LAYER1_NAMES if "." in n})
+        assert layer1_names_available(everything) == LAYER1_NAMES
+        windows = SimpleNamespace(
+            **{
+                name.removeprefix("os."): 0
+                for name in LAYER1_NAMES
+                if name.startswith("os.") and "spawn" not in name
+            }
+        )
+        expected = tuple(n for n in LAYER1_NAMES if n not in ("os.posix_spawn", "os.posix_spawnp"))
+        assert layer1_names_available(windows) == expected
+        assert "os.posix_spawn" not in expected and "subprocess.Popen" in expected
+        neutral = tuple(n for n in LAYER1_NAMES if not n.startswith("os."))
+        assert set(neutral) <= set(layer1_names_available(SimpleNamespace()))
+        assert layer1_names_available(os) == tuple(
+            n for n in LAYER1_NAMES if not n.startswith("os.") or hasattr(os, n[3:])
+        )
+
+    def test_the_child_control_only_calls_apis_the_platform_has(self) -> None:
+        assert "if hasattr(os, name):" in LAYER1_CONTROL
+        assert "_hit(os.posix_spawn" not in LAYER1_CONTROL
+        assert "_hit(os.posix_spawnp" not in LAYER1_CONTROL
+        assert 'calls["os.posix_spawn"]' in SENTINEL_CONTROL
+        assert 'if hasattr(os, "posix_spawn")' in SENTINEL_CONTROL
+
+    @pytest.mark.parametrize(
+        ("platform", "ps_path", "unavailable"),
+        [
+            ("win32", "C:/Git/usr/bin/ps.exe", True),  # present, but never run on Windows
+            ("win32", None, True),
+            ("linux", None, True),
+            ("darwin", "/bin/ps", False),
+            ("linux", "/usr/bin/ps", False),
+        ],
+    )
+    def test_ps_controls_are_skipped_on_windows_and_only_where_ps_is_missing(
+        self, platform: str, ps_path: str | None, unavailable: bool
+    ) -> None:
+        assert ps_unavailable(platform, lambda name: ps_path) is unavailable
+
+    @pytest.mark.parametrize(
+        ("platform", "environ", "expected"),
+        [
+            (
+                "win32",
+                {"SYSTEMROOT": "C:\\Windows", "PATH": "x", "ANTHROPIC_API_KEY": "y"},
+                {"SYSTEMROOT": "C:\\Windows"},
+            ),
+            ("win32", {"PATH": "x"}, {}),
+            ("linux", {"SYSTEMROOT": "C:\\Windows"}, {}),
+            ("darwin", {}, {}),
+        ],
+    )
+    def test_a_windows_child_keeps_systemroot_and_nothing_else_is_copied(
+        self, platform: str, environ: dict[str, str], expected: dict[str, str]
+    ) -> None:
+        assert windows_base_env(platform, environ) == expected
+
+    def test_the_constructed_child_environments_carry_the_platform_base(
+        self, scratch: Sandbox, tmp_path: Path
+    ) -> None:
+        base = windows_base_env(sys.platform, os.environ)
+        for env in (scratch.child_environment(), ClassC(tmp_path).environment()):
+            assert {k: v for k, v in env.items() if k in base} == base
+            assert ("SYSTEMROOT" in env) is (sys.platform == "win32" and "SYSTEMROOT" in os.environ)
+
+    # -- the skip is narrow: every other missing target fails loudly -------------------------
+
+    def test_the_optional_allowlist_is_exactly_the_four_posix_only_os_attributes(self) -> None:
+        assert {"posix_spawn", "posix_spawnp", "fork", "forkpty"} == set(
+            OPTIONAL_POSIX_OS_ATTRIBUTES
+        )
+
+    def test_only_an_absent_allowlisted_os_attribute_is_skipped(
+        self, without_posix_apis: list[str]
+    ) -> None:
+        for name in OPTIONAL_POSIX_OS_ATTRIBUTES:
+            assert target_is_absent_and_optional(os, name) is True  # absent on this "platform"
+        for name in ("system", "execv", "popen"):  # present: armed, never skipped
+            assert target_is_absent_and_optional(os, name) is False
+        with pytest.raises(AssertionError, match=r"tripwire target missing: os\.not_an_os_api"):
+            target_is_absent_and_optional(os, "not_an_os_api")
+        # the allowlist is for ``os`` only: the same name on another owner is an error
+        with pytest.raises(AssertionError, match="tripwire target missing"):
+            target_is_absent_and_optional(SimpleNamespace(), "posix_spawn")
+
+    def test_a_present_target_is_never_reported_absent(self) -> None:
+        for owner, name in ((os, "system"), (subprocess, "Popen"), (asyncio, "run")):
+            assert target_is_absent_and_optional(owner, name) is False
+
+    @staticmethod
+    def literal_arm_sites(function: str) -> list[tuple[str, str]]:
+        """``(owner expression, attribute)`` of every literal ``arm(...)`` call in a helper."""
+        fn = module_level_functions(ast.parse(Path(__file__).read_text()))[function]
+        return [
+            (ast.unparse(call.args[0]), ast.literal_eval(call.args[1]))
+            for call in ast.walk(fn)
+            if isinstance(call, ast.Call)
+            and getattr(call.func, "id", "") == "arm"
+            and len(call.args) >= 2
+        ]
+
+    @staticmethod
+    def sdk_transport() -> Any:
+        pytest.importorskip("anyio")  # only the SDK-side targets need the optional extra
+        module = pytest.importorskip("claude_agent_sdk._internal.transport.subprocess_cli")
+        return module.SubprocessCLITransport
+
+    def test_every_boundary_target_outside_the_allowlist_is_armed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import socket
+
+        sites = self.literal_arm_sites("armed_boundaries")
+        assert ("subprocess.Popen", "__init__") in sites and (
+            "socket",
+            "create_connection",
+        ) in sites
+        namespace: dict[str, Any] = {"subprocess": subprocess, "asyncio": asyncio, "os": os}
+        namespace["socket"] = socket
+        sdk_present = True
+        try:
+            import anyio
+
+            namespace["anyio"] = anyio
+            namespace["SubprocessCLITransport"] = self.sdk_transport()
+        except (ImportError, pytest.skip.Exception):
+            sdk_present = False
+        with monkeypatch.context() as scope:
+            armed_boundaries(scope)
+            for owner_source, attribute in sites:
+                if owner_source in ("anyio", "SubprocessCLITransport") and not sdk_present:
+                    continue
+                owner = eval(owner_source, namespace)  # noqa: S307 - our own literal arm sites
+                if owner is os and attribute in OPTIONAL_POSIX_OS_ATTRIBUTES:
+                    continue
+                armed = getattr(owner, attribute)
+                assert getattr(armed, "__name__", "") == "tripwire", (owner_source, attribute)
+
+    def test_every_scoped_target_outside_the_allowlist_is_armed(self) -> None:
+        import concurrent.futures
+        import multiprocessing.process
+        import socket
+        import threading
+
+        sites = self.literal_arm_sites("scoped_tripwires")
+        namespace: dict[str, Any] = {
+            "os": os,
+            "subprocess": subprocess,
+            "original_popen": subprocess.Popen,
+            "asyncio": asyncio,
+            "threading": threading,
+            "multiprocessing": multiprocessing,
+            "concurrent": concurrent,
+            "socket": socket,
+        }
+        problems: list[str] = []
+
+        async def inside() -> None:
+            for owner_source, attribute in sites:
+                owner = eval(owner_source, namespace)  # noqa: S307 - our own literal arm sites
+                if owner is os and attribute in OPTIONAL_POSIX_OS_ATTRIBUTES:
+                    continue
+                if getattr(getattr(owner, attribute), "__name__", "") != "raiser":
+                    problems.append(f"{owner_source}.{attribute}")
+
+        async def go() -> None:
+            async with scoped_tripwires([]):
+                await inside()
+
+        asyncio.run(go())
+        assert problems == []
+        assert {"os.system", "threading.Thread.start", "socket.socket.connect"} <= {
+            f"{o}.{a}" for o, a in sites
+        }
+
+    def test_removing_the_sdk_transport_connect_fails_the_boundary_arming(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.sdk_transport()  # skips without the optional extra
+        module = importlib.import_module("claude_agent_sdk._internal.transport.subprocess_cli")
+        with monkeypatch.context() as scope:
+            # ``connect`` is also inherited from the abstract base: a stand-in without it renames it
+            scope.setattr(module, "SubprocessCLITransport", type("SubprocessCLITransport", (), {}))
+            with pytest.raises(
+                AssertionError, match=r"tripwire target missing: SubprocessCLITransport\.connect"
+            ):
+                armed_boundaries(scope)
+
+    def test_removing_socket_create_connection_fails_the_boundary_arming(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import socket
+
+        with monkeypatch.context() as scope:
+            scope.delattr(socket, "create_connection")
+            with pytest.raises(
+                AssertionError, match=r"tripwire target missing: socket\.create_connection"
+            ):
+                armed_boundaries(scope)
+
+    @staticmethod
+    def entering_scope_fails(
+        monkeypatch: pytest.MonkeyPatch, mutate: Callable[[pytest.MonkeyPatch], None], match: str
+    ) -> None:
+        async def go() -> None:
+            async with scoped_tripwires([]):
+                await asyncio.sleep(0)
+
+        loop = asyncio.new_event_loop()  # created first: some mutations replace a socket class
+        try:
+            with monkeypatch.context() as scope:
+                mutate(scope)
+                with pytest.raises(AssertionError, match=match):
+                    loop.run_until_complete(go())
+        finally:
+            loop.close()
+
+    def test_removing_scoped_socket_connect_fails_the_scope(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import socket
+
+        def mutate(scope: pytest.MonkeyPatch) -> None:  # ``connect`` is inherited from C: rename
+            scope.setattr(socket, "socket", type("socket", (), {}))
+
+        self.entering_scope_fails(monkeypatch, mutate, r"tripwire target missing: socket\.connect")
+
+    def test_removing_scoped_os_system_fails_the_scope(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.entering_scope_fails(
+            monkeypatch, lambda scope: scope.delattr(os, "system"), r"missing: os\.system"
+        )
+
+    def test_removing_scoped_thread_start_fails_the_scope(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import threading
+
+        self.entering_scope_fails(
+            monkeypatch,
+            lambda scope: scope.delattr(threading.Thread, "start"),
+            r"missing: Thread\.start",
+        )
+
+    def test_a_failed_arming_leaves_nothing_patched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import threading
+
+        before = (os.system, subprocess.Popen, threading.Thread.start)
+        self.entering_scope_fails(
+            monkeypatch,
+            lambda scope: scope.delattr(threading.Thread, "start"),
+            r"missing: Thread\.start",
+        )
+        assert (os.system, subprocess.Popen, threading.Thread.start) == before
+
+    def test_the_child_plugin_skips_only_the_optional_posix_spawn_apis(self) -> None:
+        tree = ast.parse(LAYER1_PLUGIN)
+        wanted = [
+            node
+            for node in tree.body
+            if (isinstance(node, ast.FunctionDef) and node.name == "_arm")
+            or (isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "OPTIONAL")
+        ]
+        assert len(wanted) == 2
+        fake_os = SimpleNamespace(execv=0)
+        namespace: dict[str, Any] = {"os": fake_os, "ORIGINALS": {}}
+        exec(compile(ast.Module(body=wanted, type_ignores=[]), "<plugin>", "exec"), namespace)  # noqa: S102
+        arm = namespace["_arm"]
+        arm(fake_os, "posix_spawn", "os.posix_spawn")  # absent and optional: skipped quietly
+        arm(fake_os, "posix_spawnp", "os.posix_spawnp")
+        assert namespace["ORIGINALS"] == {}
+        for owner, attr in ((fake_os, "system"), (SimpleNamespace(), "posix_spawn")):
+            with pytest.raises(AssertionError, match="tripwire target missing"):
+                arm(owner, attr, f"x.{attr}")
+        arm(fake_os, "execv", "os.execv")  # present: armed
+        assert "os.execv" in namespace["ORIGINALS"]
+
+
 class TestScopedTripwireSelfControls:
     """H59 (vi) (p): the standalone controls; no ``boundary_hits`` and no real adapter."""
 
@@ -15258,13 +16246,14 @@ class TestScopedTripwireSelfControls:
     ) -> None:
         original_popen = subprocess.Popen
         original_execute_child = original_popen.__dict__["_execute_child"]
-        real_posix_spawn = os.posix_spawn
+        real_posix_spawn = getattr(os, "posix_spawn", None)  # absent on Windows
         assert _spawn_with_bound_default.__defaults__ is not None
         assert _spawn_with_bound_default.__defaults__[0] is original_popen
         assert original_popen.__init__.__qualname__ == "Popen.__init__"  # no class-level tripwire
         assert original_popen.__init__.__module__ == "subprocess"
-        assert hasattr(subprocess, "_fork_exec")  # fail closed on another CPython (R-AP)
-        real_fork_exec = subprocess._fork_exec
+        if os.name == "posix":
+            assert hasattr(subprocess, "_fork_exec")  # fail closed on another CPython (R-AP)
+        real_fork_exec = getattr(subprocess, "_fork_exec", None)
         violations: Violations = []
         backstops: list[str] = []
 
@@ -15279,8 +16268,10 @@ class TestScopedTripwireSelfControls:
             raise CountingFakeViolation()
 
         # control-local backstops below ``_execute_child``, installed before the scope is entered
-        monkeypatch.setattr(subprocess, "_fork_exec", fork_backstop)
-        monkeypatch.setattr(os, "posix_spawn", spawn_backstop)
+        if real_fork_exec is not None:  # Windows creates processes through ``_winapi`` instead
+            monkeypatch.setattr(subprocess, "_fork_exec", fork_backstop)
+        if real_posix_spawn is not None:
+            monkeypatch.setattr(os, "posix_spawn", spawn_backstop)
 
         async def go() -> None:
             async with scoped_tripwires(violations):
@@ -15293,11 +16284,15 @@ class TestScopedTripwireSelfControls:
         assert backstops == []  # neither backstop was reached: no child-creating call
         assert subprocess.Popen is original_popen
         assert subprocess.Popen.__dict__["_execute_child"] is original_execute_child
-        assert os.posix_spawn is spawn_backstop  # the scope restored what it found
-        assert subprocess._fork_exec is fork_backstop
+        assert getattr(os, "posix_spawn", None) is (
+            spawn_backstop if real_posix_spawn is not None else None
+        )  # the scope restored what it found
+        assert getattr(subprocess, "_fork_exec", None) is (
+            fork_backstop if real_fork_exec is not None else None
+        )
         monkeypatch.undo()  # a controlled point: the backstops themselves are restored
-        assert os.posix_spawn is real_posix_spawn
-        assert subprocess._fork_exec is real_fork_exec
+        assert getattr(os, "posix_spawn", None) is real_posix_spawn
+        assert getattr(subprocess, "_fork_exec", None) is real_fork_exec
 
     @pytest.mark.parametrize("suppress", [False, True], ids=["delayed", "suppressed"])
     def test_scoped_tripwire_pending_drain_is_bounded(self, suppress: bool) -> None:
@@ -15308,12 +16303,13 @@ class TestScopedTripwireSelfControls:
             order: list[str] = []
             holder: list[asyncio.Task[Any]] = []
             release = asyncio.Event()
-            before = {"popen": subprocess.Popen, "spawn": os.posix_spawn}
+            before = {"popen": subprocess.Popen, "spawn": getattr(os, "posix_spawn", None)}
             try:
                 async with scoped_tripwires(violations, None, order):
                     await _schedule_task(holder, release, suppress)
                 assert order == ["pending_checked", "restored"]
-                assert subprocess.Popen is before["popen"] and os.posix_spawn is before["spawn"]
+                assert subprocess.Popen is before["popen"]
+                assert getattr(os, "posix_spawn", None) is before["spawn"]
                 results["violations"] = violations
                 results["done"] = holder[0].done()
             finally:
@@ -16080,19 +17076,19 @@ CHANGELOG_FRAGMENT = (
     REPO_ROOT / "changelog.d" / "+claude-agent-sdk-subscription-validation.added.md"
 )
 POST_EVIDENCE_CLAUSE = (
-    "This detection relies on CLI-reported `apiProvider` / `subscriptionType` evidence; one "
-    "official live validation (readiness, then one subscription inference) confirmed a "
-    "first-party subscription login and subscription billing provenance, while fake-key "
-    "behavior, auto-mode or API-key precedence, fallback, wider compatibility and broader "
-    "environment coverage remain unvalidated;"
+    "This detection relies on CLI-reported `apiProvider` / `subscriptionType` evidence; a prior "
+    "readiness-plus-inference run observed a first-party subscription login and subscription "
+    "billing provenance, but that observation is provisional until it is revalidated, and "
+    "fake-key behavior, auto-mode or API-key precedence, fallback, wider compatibility and "
+    "broader environment coverage remain unvalidated;"
 )
 WORKFLOW_SYNTAX_PATH = REPO_ROOT / "docs" / "workflow-syntax.md"
 WORKFLOW_SYNTAX_POST_EVIDENCE_CLAUSE = (
     "Subscription detection relies on CLI-reported `apiProvider` / `subscriptionType` evidence. "
-    "One official live validation (readiness, then one subscription inference) confirmed a "
-    "first-party subscription login and subscription billing provenance; fake-key behavior, "
-    "auto-mode or API-key precedence, fallback, wider compatibility and broader environment "
-    "coverage remain unvalidated."
+    "A prior readiness-plus-inference run observed a first-party subscription login and "
+    "subscription billing provenance; that observation is provisional until it is revalidated, "
+    "and fake-key behavior, auto-mode or API-key precedence, fallback, wider compatibility and "
+    "broader environment coverage remain unvalidated."
 )
 CLAIM_PHRASES = (
     "fake key was rejected",
@@ -16145,7 +17141,7 @@ class TestClaimsAndDocs:
         assert normalized(PRECEDENCE_SENTENCE) in flat
         for claim in (
             "readiness reports a usable first-party subscription login",
-            "one real inference completes through the subscription path",
+            "one inference-capable workflow attempt completes through the subscription path",
             "neutralizes competing API-key variables",
             "an offline property proven by the production provider's tests",
         ):
@@ -16182,6 +17178,96 @@ class TestClaimsAndDocs:
         flat = normalized(WORKFLOW_SYNTAX_PATH.read_text())
         assert normalized(WORKFLOW_SYNTAX_POST_EVIDENCE_CLAUSE) in flat
         assert "has not yet been validated against a live" not in flat
+
+    # -- remediation: the prior observation is provisional, and the claims are precise -----------
+
+    @staticmethod
+    def public_texts() -> dict[str, str]:
+        return {
+            **user_facing_texts(),
+            "workflow_syntax": WORKFLOW_SYNTAX_PATH.read_text(),
+        }
+
+    @pytest.mark.parametrize(
+        "name", ["runbook", "experimental", "example", "changelog", "docstring", "workflow_syntax"]
+    )
+    def test_no_public_file_presents_the_prior_run_as_official_evidence(self, name: str) -> None:
+        flat = normalized(self.public_texts()[name])
+        for retired in (
+            RETIRED_VALIDATED_CELL,
+            "has passed",
+            "official live validation (readiness, then one subscription inference)",
+            "passing official evidence exists",
+            "completed with subscription billing provenance",
+        ):
+            assert retired not in flat, (name, retired)
+
+    def test_the_runbook_states_the_provisional_observation_and_what_revalidation_needs(
+        self,
+    ) -> None:
+        flat = normalized(RUNBOOK_PATH.read_text())
+        for fragment in (
+            "A prior readiness-plus-inference run observed a first-party subscription login",
+            "provisional, not official evidence",
+            "corrected harness to be reviewed and CI to be green",
+            "fresh explicit human approval and a new run",
+            "nothing is live-proven until it is revalidated",
+        ):
+            assert fragment in flat, fragment
+        assert flat.count(PROVISIONAL_CELL) == len(LIVE_PROVEN_CELLS) == 5
+        # the observation is kept, never erased or called a failure
+        assert "first-party subscription login and subscription billing provenance" in flat
+        assert "failed" not in normalized(RUNBOOK_STATUS_STATEMENT)
+
+    @pytest.mark.parametrize("name", ["runbook", "experimental", "workflow_syntax"])
+    def test_the_provisional_wording_names_no_evidence_detail(self, name: str) -> None:
+        flat = normalized(self.public_texts()[name])
+        marker = "A prior readiness-plus-inference run"
+        if name == "experimental":
+            marker = "a prior readiness-plus-inference run"
+        start = flat.index(marker)
+        window = flat[start : start + 900]
+        assert not re.search(r"\b20\d\d\b|\$\d|tokens?\b|\bPro\b|\bMax\b|@|/Users/|/tmp/", window)
+        for word in ("Haiku", "raw evidence", "account", "credential file", "Keychain"):
+            assert word not in window, word
+
+    def test_billing_documentation_matches_the_derivation(self) -> None:
+        text = normalized(RUNBOOK_PATH.read_text())
+        assert "an inherited value forces the billing source to `unknown`" in text
+        assert "Custom headers and proxy variables" in text
+        assert "billing derivation does not inspect them" in text
+        assert "custom headers and proxies are **not** neutralized" not in text
+        assert not re.search(r"headers?[^.]*(?:proxies|proxy)[^.]*make the billing source", text)
+
+    @pytest.mark.parametrize("name", ["runbook", "example", "docstring", "experimental"])
+    def test_no_file_says_one_inference_when_it_means_one_workflow_attempt(self, name: str) -> None:
+        flat = normalized(self.public_texts()[name])
+        guaranteed = re.compile(r"\bone (?:real |subscription |single )?inference\b(?!-)", re.I)
+        assert guaranteed.findall(flat) == [], name
+
+    def test_an_attempt_is_one_inference_capable_workflow_not_one_model_request(self) -> None:
+        flat = normalized(RUNBOOK_PATH.read_text())
+        assert "one inference-capable workflow run" in flat
+        assert "not one guaranteed model request" in flat
+        assert "several SDK turns and internal model requests" in flat
+        assert "those are not counted" in flat
+        assert "`max_agent_iterations` is not set to 1" in flat
+        example = normalized(EXAMPLE_FILE.read_text())
+        assert "one inference-capable workflow attempt" in example
+        assert "internal model requests" in example
+        assert "max_agent_iterations" not in EXAMPLE_FILE.read_text().split("workflow:", 1)[1]
+        assert "not one guaranteed model request" in normalized(lm.__doc__ or "")
+
+    def test_the_runbook_documents_the_fail_closed_gate_and_the_truthful_disposal(self) -> None:
+        flat = normalized(RUNBOOK_PATH.read_text())
+        for fragment in (
+            "or when the environment cannot be listed or checked",
+            "a failing `env` or `grep` is never read as a clean result",
+            "writes no environment dump anywhere",
+            "capture NOT deleted",
+            "remove it manually and never share, quote or commit it",
+        ):
+            assert fragment in flat, fragment
 
     def test_the_runbook_contains_the_literal_approval_sentence(self) -> None:
         flat = normalized(RUNBOOK_PATH.read_text())
@@ -16538,7 +17624,7 @@ def evidence_cell_problems(
     statement: str,
     *,
     not_yet: str = NOT_YET_CELL,
-    validated: str = VALIDATED_CELL,
+    validated: str = PROVISIONAL_CELL,
 ) -> list[str]:
     """The structural assertion of H65 (iii)-(v): row by row, with the exact document-wide count."""
     problems: list[str] = []
@@ -16579,11 +17665,13 @@ class TestEvidenceCellPins:
             "Bundled CLI reads the user's login",
             "Live harness (L0, L1)",
         }
-        assert set(LIVE_PROVEN_CELLS.values()) == {VALIDATED_CELL}
-        assert RUNBOOK_STATUS_STATEMENT.startswith("One official live validation")
+        assert set(LIVE_PROVEN_CELLS.values()) == {PROVISIONAL_CELL}
+        assert RUNBOOK_STATUS_STATEMENT.startswith("A prior readiness-plus-inference run")
+        assert "not official evidence" in RUNBOOK_STATUS_STATEMENT
         pre = normalized(EXPERIMENTAL_VALIDATION_CLAUSE)
         assert pre == normalized(EXPERIMENTAL_VALIDATION_CLAUSE)
-        assert VALIDATED_CELL == "yes (official live validation)"
+        assert PROVISIONAL_CELL == "provisional observation (revalidation pending)"
+        assert RETIRED_VALIDATED_CELL not in {PROVISIONAL_CELL, *LIVE_PROVEN_CELLS.values()}
 
     def test_the_real_runbook_matches_the_pins(self) -> None:
         text = RUNBOOK_PATH.read_text()
@@ -16593,22 +17681,22 @@ class TestEvidenceCellPins:
             flat.count(normalized(RUNBOOK_STATUS_STATEMENT)) == 4
         )  # intro, table, operations, commands
         assert text.count(NOT_YET_CELL) == 0
-        assert text.count(VALIDATED_CELL) == len(LIVE_PROVEN_CELLS)
+        assert text.count(PROVISIONAL_CELL) == len(LIVE_PROVEN_CELLS)
 
     def test_the_post_evidence_state_is_checked_exactly(self) -> None:
         """The checked-in runbook itself is in the post-evidence state, and drift is reported."""
         text = RUNBOOK_PATH.read_text()
-        validated = dict.fromkeys(LIVE_PROVEN_CELLS, VALIDATED_CELL)
+        validated = dict.fromkeys(LIVE_PROVEN_CELLS, PROVISIONAL_CELL)
         assert evidence_cell_problems(text, validated, RUNBOOK_STATUS_STATEMENT) == []
         # the checker reads its argument: each departure of the real text from the pins is reported
         pattern = r"\s+".join(re.escape(word) for word in RUNBOOK_STATUS_STATEMENT.split())
         drifted, count = re.subn(
-            pattern, RUNBOOK_STATUS_STATEMENT.replace("has passed", "has passed twice"), text
+            pattern, RUNBOOK_STATUS_STATEMENT.replace("is provisional", "is final"), text
         )
         assert count == 4
         assert evidence_cell_problems(drifted, validated, RUNBOOK_STATUS_STATEMENT)
         # one cell reverted to not-yet: a mixed state and a wrong document-wide count
-        reverted = text.replace(VALIDATED_CELL, NOT_YET_CELL, 1)
+        reverted = text.replace(PROVISIONAL_CELL, NOT_YET_CELL, 1)
         assert evidence_cell_problems(reverted, validated, RUNBOOK_STATUS_STATEMENT)
         # the retired pre-evidence statement is not accepted back
         assert "No passing official evidence exists" not in normalized(text)
@@ -16626,7 +17714,7 @@ class TestEvidenceCellPins:
             text, {**cells, first: NOT_YET_CELL}, RUNBOOK_STATUS_STATEMENT
         )
         assert evidence_cell_problems(
-            text.replace(VALIDATED_CELL, NOT_YET_CELL, 1), cells, RUNBOOK_STATUS_STATEMENT
+            text.replace(PROVISIONAL_CELL, NOT_YET_CELL, 1), cells, RUNBOOK_STATUS_STATEMENT
         )
         # a fixed row cell changed, a row removed, a row reordered, the count asserted by a ">="
         changed = text.replace("| out of scope |", "| yes |")
@@ -17123,6 +18211,8 @@ class TestRealSdkLoggerIsCaught:
     """H31 (vii): the pinned SDK child logger reaches the sink, with nothing left behind."""
 
     def test_the_pinned_child_logger_is_found_statically_without_importing_the_sdk(self) -> None:
+        if importlib.util.find_spec("claude_agent_sdk") is None:  # a lookup; nothing is imported
+            pytest.skip("the optional claude-agent-sdk extra is not installed")
         before = "claude_agent_sdk" in sys.modules
         bound, dotted = sdk_logger_source_facts()
         assert ("claude_agent_sdk" in sys.modules) is before  # the lookup imported nothing
@@ -17144,6 +18234,7 @@ class TestRealSdkLoggerIsCaught:
     @pytest.fixture
     def imported_runtime(self) -> None:
         """The runtime layer: only here are the SDK and the provider imported."""
+        pytest.importorskip("claude_agent_sdk")
         import claude_agent_sdk._internal.transport.subprocess_cli  # noqa: F401
 
         import conductor.providers.claude_agent_sdk  # noqa: F401

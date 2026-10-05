@@ -11,7 +11,8 @@
 #
 # See docs/providers/claude-subscription.md for the operator runbook.
 #
-# Run (makes one real inference on your subscription):
+# Run (one inference-capable workflow attempt on your subscription; the agent session may make
+# several SDK turns and internal model requests, which are not counted):
 #   conductor run examples/claude-agent-sdk-subscription.yaml --input question="What is Conductor?"
 
 workflow:
