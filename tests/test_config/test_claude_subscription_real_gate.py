@@ -4218,17 +4218,17 @@ def runbook_reference_problems(text: str, repo_root: Path) -> list[str]:
 
 RUNBOOK_PATH = REPO_ROOT / "docs" / "providers" / "claude-subscription.md"
 
-# The three state-dependent constants of H65 (the only literals the post-evidence commit may
-# change) and the state-independent ones.  At the tested commit every live-proven cell is
-# ``NOT_YET_CELL``.
+# The state-dependent constants of H65 (the status statement, the five live-proven cells and the
+# four Unverified cells of ``FIXED_STATUS_ROWS`` they qualify) and the state-independent ones.
+# After the official L0 -> L1 validation every live-proven cell is ``VALIDATED_CELL``.
 RUNBOOK_STATUS_STATEMENT = (
-    "No passing official evidence exists yet. The readiness-only check passed once during "
-    "development. Two earlier official validation attempts were retained as non-official failure "
-    "records; in both, the readiness and subscription-inference steps were observed to succeed "
-    "before a later credential-precedence step, since retired, failed without a typed "
-    "authentication signal. These records are not evidence: they are never reclassified, "
-    "authorize nothing and support no claim. Any future readiness or official operation requires "
-    "fresh explicit human approval, and no retry is ever automatic."
+    "One official live validation (readiness, then one subscription inference) has passed. "
+    "Readiness confirmed a first-party subscription login, and one Haiku inference completed with "
+    "subscription billing provenance. It does not validate fake-key behavior, auto-mode or API-key "
+    "credential precedence, fallback or any broader compatibility. Earlier readiness-only and "
+    "official attempts remain non-official records: they are never reclassified, authorize "
+    "nothing and support no claim. Any future readiness or official operation requires fresh "
+    "explicit human approval, and no retry is ever automatic."
 )
 EXPERIMENTAL_VALIDATION_CLAUSE = (
     "This detection currently relies on CLI-reported `apiProvider` / `subscriptionType` evidence "
@@ -4237,21 +4237,27 @@ EXPERIMENTAL_VALIDATION_CLAUSE = (
 NOT_YET_CELL = "*not yet*"
 VALIDATED_CELL = "yes (official live validation)"
 LIVE_PROVEN_CELLS = {
-    "Readiness (`claude auth status --json`)": NOT_YET_CELL,
-    "`billing_mode == subscription` derivation": NOT_YET_CELL,
-    "`API-equivalent estimate` label": NOT_YET_CELL,
-    "Bundled CLI reads the user's login": NOT_YET_CELL,
-    "Live harness (L0, L1)": NOT_YET_CELL,
+    "Readiness (`claude auth status --json`)": VALIDATED_CELL,
+    "`billing_mode == subscription` derivation": VALIDATED_CELL,
+    "`API-equivalent estimate` label": VALIDATED_CELL,
+    "Bundled CLI reads the user's login": VALIDATED_CELL,
+    "Live harness (L0, L1)": VALIDATED_CELL,
 }
-# row -> (Live-proven cell, or ``None`` when the row is state-dependent, Unverified cell)
+# row -> (Live-proven cell, or ``None`` when the row's cell is taken from ``LIVE_PROVEN_CELLS``,
+# Unverified cell).  Post-evidence state: the five ``None`` rows are all ``VALIDATED_CELL`` and
+# their Unverified cells list only what remains unverified beyond the one official L0 -> L1
+# validation; the Unverified column keeps its meaning (what a real run still has to settle).
 FIXED_STATUS_ROWS = {
     "`auth_mode` resolution and env blanking": ("not applicable (offline property, R2b′)", "—"),
-    "Readiness (`claude auth status --json`)": (None, "real field values (L0)"),
+    "Readiness (`claude auth status --json`)": (
+        None,
+        "other authentication states, hosts and CLI versions",
+    ),
     "`billing_mode == subscription` derivation": (
         None,
-        '`"firstParty"` constant, `subscriptionType` presence',
+        "other evidence combinations, hosts and CLI versions",
     ),
-    "`API-equivalent estimate` label": (None, "real console output"),
+    "`API-equivalent estimate` label": (None, "other output environments and display paths"),
     "`auto` + API key ⇒ `metered_api`": (
         "out of scope",
         "auto-mode credential precedence (unproven, R2′)",
@@ -4259,10 +4265,14 @@ FIXED_STATUS_ROWS = {
     "Cloud-selector / `setting_sources` refusal": ("not applicable", "managed/enterprise settings"),
     "Hard session timeout / interrupt": ("not in this PR", "real-CLI timing"),
     "Bundled CLI reads the user's login": (None, "cross-version compatibility"),
-    "Live harness (L0, L1)": (None, "every real-CLI behavior above"),
+    "Live harness (L0, L1)": (
+        None,
+        "other hosts, CLI versions and broader real-CLI behavior",
+    ),
     "`conductor run` entry point on a real login": ("*manual step only*", "—"),
 }
 STALE_RUNBOOK_STATEMENTS = (
+    "No passing official evidence exists " + "yet",  # the pre-evidence status statement
     "No live validation has been run yet.",
     "No live run has been performed, so there is no live result to report.",
     "neither has been run",
@@ -16071,8 +16081,18 @@ CHANGELOG_FRAGMENT = (
 )
 POST_EVIDENCE_CLAUSE = (
     "This detection relies on CLI-reported `apiProvider` / `subscriptionType` evidence; one "
-    "official live validation (readiness, then one subscription inference) has confirmed the "
-    "`subscription` result for one plan on one host;"
+    "official live validation (readiness, then one subscription inference) confirmed a "
+    "first-party subscription login and subscription billing provenance, while fake-key "
+    "behavior, auto-mode or API-key precedence, fallback, wider compatibility and broader "
+    "environment coverage remain unvalidated;"
+)
+WORKFLOW_SYNTAX_PATH = REPO_ROOT / "docs" / "workflow-syntax.md"
+WORKFLOW_SYNTAX_POST_EVIDENCE_CLAUSE = (
+    "Subscription detection relies on CLI-reported `apiProvider` / `subscriptionType` evidence. "
+    "One official live validation (readiness, then one subscription inference) confirmed a "
+    "first-party subscription login and subscription billing provenance; fake-key behavior, "
+    "auto-mode or API-key precedence, fallback, wider compatibility and broader environment "
+    "coverage remain unvalidated."
 )
 CLAIM_PHRASES = (
     "fake key was rejected",
@@ -16152,11 +16172,16 @@ class TestClaimsAndDocs:
         for token in (r"\bL3\b", r"\bL2\b", "invalid_key", "canary"):
             assert not re.search(token, text), (name, token)
 
-    def test_experimental_md_holds_exactly_one_of_the_two_clauses(self) -> None:
+    def test_experimental_md_holds_the_post_evidence_clause_only(self) -> None:
         flat = normalized(EXPERIMENTAL_PATH.read_text())
-        pre = normalized(EXPERIMENTAL_VALIDATION_CLAUSE) in flat
-        post = normalized(POST_EVIDENCE_CLAUSE) in flat
-        assert pre != post  # exactly one
+        assert normalized(POST_EVIDENCE_CLAUSE) in flat
+        assert normalized(EXPERIMENTAL_VALIDATION_CLAUSE) not in flat
+        assert "has not yet been validated against a live" not in flat
+
+    def test_workflow_syntax_md_agrees_with_the_post_evidence_state(self) -> None:
+        flat = normalized(WORKFLOW_SYNTAX_PATH.read_text())
+        assert normalized(WORKFLOW_SYNTAX_POST_EVIDENCE_CLAUSE) in flat
+        assert "has not yet been validated against a live" not in flat
 
     def test_the_runbook_contains_the_literal_approval_sentence(self) -> None:
         flat = normalized(RUNBOOK_PATH.read_text())
@@ -16554,10 +16579,8 @@ class TestEvidenceCellPins:
             "Bundled CLI reads the user's login",
             "Live harness (L0, L1)",
         }
-        assert set(LIVE_PROVEN_CELLS.values()) in ({NOT_YET_CELL}, {VALIDATED_CELL})
-        assert RUNBOOK_STATUS_STATEMENT.startswith(
-            (RUNBOOK_STATUS_STATEMENT.split(". ")[0] + ".", "One official live validation")
-        )
+        assert set(LIVE_PROVEN_CELLS.values()) == {VALIDATED_CELL}
+        assert RUNBOOK_STATUS_STATEMENT.startswith("One official live validation")
         pre = normalized(EXPERIMENTAL_VALIDATION_CLAUSE)
         assert pre == normalized(EXPERIMENTAL_VALIDATION_CLAUSE)
         assert VALIDATED_CELL == "yes (official live validation)"
@@ -16569,57 +16592,41 @@ class TestEvidenceCellPins:
         assert (
             flat.count(normalized(RUNBOOK_STATUS_STATEMENT)) == 4
         )  # intro, table, operations, commands
-        pre_state = set(LIVE_PROVEN_CELLS.values()) == {NOT_YET_CELL}
-        assert text.count(NOT_YET_CELL) == (5 if pre_state else 0)
+        assert text.count(NOT_YET_CELL) == 0
+        assert text.count(VALIDATED_CELL) == len(LIVE_PROVEN_CELLS)
 
     def test_the_post_evidence_state_is_checked_exactly(self) -> None:
+        """The checked-in runbook itself is in the post-evidence state, and drift is reported."""
         text = RUNBOOK_PATH.read_text()
         validated = dict.fromkeys(LIVE_PROVEN_CELLS, VALIDATED_CELL)
-        post_statement = RUNBOOK_STATUS_STATEMENT.replace(
-            RUNBOOK_STATUS_STATEMENT.split(". ")[0] + ".",
-            "One official live validation (readiness, then one subscription inference) has passed.",
-        )
-        post = self._with_statement(text, post_statement)
-        assert evidence_cell_problems(self._table_text(post), validated, post_statement) == []
-        # the checker reads its argument: a post text that differs from the pin is reported
-        assert evidence_cell_problems(self._table_text(text), validated, post_statement)
-        drifted = self._with_statement(
-            text, post_statement.replace("has passed", "has passed twice")
-        )
-        assert evidence_cell_problems(self._table_text(drifted), validated, post_statement)
-        assert evidence_cell_problems(post, validated, post_statement)  # cells left not-yet
-
-    @staticmethod
-    def _with_statement(text: str, statement: str) -> str:
-        """The raw text with every (whitespace-insensitive) status statement replaced."""
+        assert evidence_cell_problems(text, validated, RUNBOOK_STATUS_STATEMENT) == []
+        # the checker reads its argument: each departure of the real text from the pins is reported
         pattern = r"\s+".join(re.escape(word) for word in RUNBOOK_STATUS_STATEMENT.split())
-        replaced, count = re.subn(pattern, lambda _m: statement, text)
+        drifted, count = re.subn(
+            pattern, RUNBOOK_STATUS_STATEMENT.replace("has passed", "has passed twice"), text
+        )
         assert count == 4
-        return replaced
-
-    @staticmethod
-    def _table_text(text: str) -> str:
-        return text.replace(NOT_YET_CELL, VALIDATED_CELL)
+        assert evidence_cell_problems(drifted, validated, RUNBOOK_STATUS_STATEMENT)
+        # one cell reverted to not-yet: a mixed state and a wrong document-wide count
+        reverted = text.replace(VALIDATED_CELL, NOT_YET_CELL, 1)
+        assert evidence_cell_problems(reverted, validated, RUNBOOK_STATUS_STATEMENT)
+        # the retired pre-evidence statement is not accepted back
+        assert "No passing official evidence exists" not in normalized(text)
 
     def test_the_checker_catches_each_drift(self) -> None:
         text = RUNBOOK_PATH.read_text()
         cells = dict(LIVE_PROVEN_CELLS)
         first = next(iter(cells))
         assert evidence_cell_problems(text, cells, RUNBOOK_STATUS_STATEMENT) == []
-        # a narrative not-yet left behind (count 6), a cell left not-yet after E, a mixed state
+        # a narrative not-yet left behind, a cell claimed not-yet after E, a mixed state
         assert evidence_cell_problems(
             text + f"\nSee {NOT_YET_CELL}.\n", cells, RUNBOOK_STATUS_STATEMENT
         )
-        validated_text = text.replace(NOT_YET_CELL, VALIDATED_CELL)
-        validated_cells = dict.fromkeys(cells, VALIDATED_CELL)
-        assert (
-            evidence_cell_problems(validated_text, validated_cells, RUNBOOK_STATUS_STATEMENT) == []
+        assert evidence_cell_problems(
+            text, {**cells, first: NOT_YET_CELL}, RUNBOOK_STATUS_STATEMENT
         )
         assert evidence_cell_problems(
-            validated_text, {**validated_cells, first: NOT_YET_CELL}, RUNBOOK_STATUS_STATEMENT
-        )
-        assert evidence_cell_problems(
-            text, {**cells, first: VALIDATED_CELL}, RUNBOOK_STATUS_STATEMENT
+            text.replace(VALIDATED_CELL, NOT_YET_CELL, 1), cells, RUNBOOK_STATUS_STATEMENT
         )
         # a fixed row cell changed, a row removed, a row reordered, the count asserted by a ">="
         changed = text.replace("| out of scope |", "| yes |")
@@ -16635,9 +16642,7 @@ class TestEvidenceCellPins:
     def test_no_other_literal_holds_a_state_dependent_value(self) -> None:
         source = Path(__file__).read_text()
         assert source.count("*not " + "yet*") == 1  # only ``NOT_YET_CELL``
-        assert (
-            source.count("No passing official evidence exists " + "yet") == 1
-        )  # only the constant
+        assert source.count("No passing official evidence exists " + "yet") == 0  # retired
 
 
 # ============================================================================

@@ -4,12 +4,13 @@
 [Experimental Providers](experimental.md)). This page is the operator runbook for using it with a
 Claude subscription login, and for the maintainer-only live validation harness.
 
-**No passing official evidence exists yet. The readiness-only check passed once during development.
-Two earlier official validation attempts were retained as non-official failure records; in both, the
-readiness and subscription-inference steps were observed to succeed before a later
-credential-precedence step, since retired, failed without a typed authentication signal. These records are not
-evidence: they are never reclassified, authorize nothing and support no claim. Any future readiness
-or official operation requires fresh explicit human approval, and no retry is ever automatic.**
+**One official live validation (readiness, then one subscription inference) has passed. Readiness
+confirmed a first-party subscription login, and one Haiku inference completed with subscription
+billing provenance. It does not validate fake-key behavior, auto-mode or API-key credential
+precedence, fallback or any broader compatibility. Earlier readiness-only and official attempts
+remain non-official records: they are never reclassified, authorize nothing and support no claim.
+Any future readiness or official operation requires fresh explicit human approval, and no retry is
+ever automatic.**
 Live-proven cells change only from official evidence.
 
 ## What this is, and what it is not
@@ -128,24 +129,25 @@ real Claude CLI and login. *Unverified* lists what only a real run can settle.
 | Capability | Implemented | Hermetically tested | Live-proven | Unverified |
 |---|---|---|---|---|
 | `auth_mode` resolution and env blanking | yes | yes | not applicable (offline property, R2b′) | — |
-| Readiness (`claude auth status --json`) | yes | yes (fixtures) | *not yet* | real field values (L0) |
-| `billing_mode == subscription` derivation | yes | yes (fixtures) | *not yet* | `"firstParty"` constant, `subscriptionType` presence |
-| `API-equivalent estimate` label | yes | yes | *not yet* | real console output |
+| Readiness (`claude auth status --json`) | yes | yes (fixtures) | yes (official live validation) | other authentication states, hosts and CLI versions |
+| `billing_mode == subscription` derivation | yes | yes (fixtures) | yes (official live validation) | other evidence combinations, hosts and CLI versions |
+| `API-equivalent estimate` label | yes | yes | yes (official live validation) | other output environments and display paths |
 | `auto` + API key ⇒ `metered_api` | yes (by construction) | yes | out of scope | auto-mode credential precedence (unproven, R2′) |
 | Cloud-selector / `setting_sources` refusal | yes | yes | not applicable | managed/enterprise settings |
 | Hard session timeout / interrupt | yes (#570) | yes | not in this PR | real-CLI timing |
-| Bundled CLI reads the user's login | — | no | *not yet* | cross-version compatibility |
-| Live harness (L0, L1) | yes | yes (all boundaries replaced) | *not yet* | every real-CLI behavior above |
+| Bundled CLI reads the user's login | — | no | yes (official live validation) | cross-version compatibility |
+| Live harness (L0, L1) | yes | yes (all boundaries replaced) | yes (official live validation) | other hosts, CLI versions and broader real-CLI behavior |
 | `conductor run` entry point on a real login | yes | yes (mocked) | *manual step only* | — |
 
 Live-proven cells change only from official evidence, never from expectation.
 
-No passing official evidence exists yet. The readiness-only check passed once during development.
-Two earlier official validation attempts were retained as non-official failure records; in both, the
-readiness and subscription-inference steps were observed to succeed before a later
-credential-precedence step, since retired, failed without a typed authentication signal. These records are not
-evidence: they are never reclassified, authorize nothing and support no claim. Any future readiness
-or official operation requires fresh explicit human approval, and no retry is ever automatic.
+One official live validation (readiness, then one subscription inference) has passed. Readiness
+confirmed a first-party subscription login, and one Haiku inference completed with subscription
+billing provenance. It does not validate fake-key behavior, auto-mode or API-key credential
+precedence, fallback or any broader compatibility. Earlier readiness-only and official attempts
+remain non-official records: they are never reclassified, authorize nothing and support no claim.
+Any future readiness or official operation requires fresh explicit human approval, and no retry is
+ever automatic.
 
 ## Live validation (maintainers)
 
@@ -159,12 +161,13 @@ billing provenance; (3) explicit `subscription` mode neutralizes competing API-k
 Conductor's finalized child environment, an offline property proven by the production provider's
 tests; and (4) auto-mode credential precedence is unproven and out of scope.
 
-No passing official evidence exists yet. The readiness-only check passed once during development.
-Two earlier official validation attempts were retained as non-official failure records; in both, the
-readiness and subscription-inference steps were observed to succeed before a later
-credential-precedence step, since retired, failed without a typed authentication signal. These records are not
-evidence: they are never reclassified, authorize nothing and support no claim. Any future readiness
-or official operation requires fresh explicit human approval, and no retry is ever automatic.
+One official live validation (readiness, then one subscription inference) has passed. Readiness
+confirmed a first-party subscription login, and one Haiku inference completed with subscription
+billing provenance. It does not validate fake-key behavior, auto-mode or API-key credential
+precedence, fallback or any broader compatibility. Earlier readiness-only and official attempts
+remain non-official records: they are never reclassified, authorize nothing and support no claim.
+Any future readiness or official operation requires fresh explicit human approval, and no retry is
+ever automatic.
 
 There are two live operations:
 
@@ -218,12 +221,13 @@ the machine throughout **both** the readiness-only check and the official live v
 
 ### Commands
 
-No passing official evidence exists yet. The readiness-only check passed once during development.
-Two earlier official validation attempts were retained as non-official failure records; in both, the
-readiness and subscription-inference steps were observed to succeed before a later
-credential-precedence step, since retired, failed without a typed authentication signal. These records are not
-evidence: they are never reclassified, authorize nothing and support no claim. Any future readiness
-or official operation requires fresh explicit human approval, and no retry is ever automatic.
+One official live validation (readiness, then one subscription inference) has passed. Readiness
+confirmed a first-party subscription login, and one Haiku inference completed with subscription
+billing provenance. It does not validate fake-key behavior, auto-mode or API-key credential
+precedence, fallback or any broader compatibility. Earlier readiness-only and official attempts
+remain non-official records: they are never reclassified, authorize nothing and support no claim.
+Any future readiness or official operation requires fresh explicit human approval, and no retry is
+ever automatic.
 
 Run both operations in **Bash or Zsh** (zsh on macOS, bash on Linux), from a **plain terminal
 session**, never from inside a Claude Code session shell or another agent shell. Write the steps
@@ -564,8 +568,8 @@ deletes anything under `~/.claude`.
 
 - Whether the bundled CLI reads a login created by a different CLI version, and whether
   `claude auth status` performs a network call or raises a Keychain prompt.
-- The real `apiProvider`, `subscriptionType` and `apiKeySource` values; the validated plan class
-  would be one plan, one host and one date.
+- The real `apiProvider`, `subscriptionType` and `apiKeySource` values beyond the single plan on the
+  single host that the official validation covered.
 - Which credential the CLI uses under `auto` when an API key and a login are both present:
   auto-mode credential precedence is unproven and out of scope, and nothing here claims that a key
   was rejected or honored.

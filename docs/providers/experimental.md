@@ -154,10 +154,12 @@ The points that bear on this provider's experimental status:
   Console login). `apiProvider` is used only to exclude a non-first-party
   backend; it never identifies how the CLI authenticated. Subscription usage
   is shown as an **API-equivalent estimate**: token counts priced at API rates,
-  not an invoice or an additional charge. This detection currently relies on
-  CLI-reported `apiProvider` / `subscriptionType` evidence that has not yet
-  been validated against a live Claude CLI session; missing or different
-  evidence degrades safely to `unknown`. See
+  not an invoice or an additional charge. This detection relies on CLI-reported
+  `apiProvider` / `subscriptionType` evidence; one official live validation (readiness, then one subscription
+  inference) confirmed a first-party subscription login and subscription
+  billing provenance, while fake-key behavior, auto-mode or API-key precedence,
+  fallback, wider compatibility and broader environment coverage remain
+  unvalidated; missing or different evidence degrades safely to `unknown`. See
   [Cost labels and billing source](../workflow-syntax.md#cost-labels-and-billing-source).
 - **Doctor scope.** `conductor doctor --check` builds the provider with its
   default configuration (`auth_mode: auto`) and does not read workflows, so it
