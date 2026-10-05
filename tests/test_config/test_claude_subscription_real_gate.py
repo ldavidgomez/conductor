@@ -1,4 +1,4 @@
-"""Hermetic negative controls (H1-H58) for the real-subscription live harness.
+"""Hermetic negative controls (H1-H51, H59-H66) for the real-subscription live harness.
 
 Nothing here uses a real provider, the Claude CLI, credentials, the network or inference.
 Sandboxes run through ``pytester`` in a subprocess with a tripwire plugin (``-p``) that is
@@ -24,27 +24,28 @@ H8  helper reuse / marker expr .. ``TestHelperReuse::*`` and
 H9  readiness stub .............. ``TestSandboxPrerequisites::test_h9_readiness_stub_*``
 H10 zero-skip plugin (i)-(vi) ... ``TestZeroSkipSandbox::*``, ``TestZeroSkipUnit::*``
 H11 pure helpers ................ ``TestIsolationStatic``, ``TestSourceTree``, ``TestClassifier``,
-                                  ``TestEvidence``, ``TestCanary``, ``TestModel``, ``TestQuota``,
+                                  ``TestEvidence``, ``TestModel``, ``TestQuota``,
                                   ``TestCliClass``, ``TestStateMachine``, ``TestAggregation``
 H12 private-API pin ............. ``TestPrivateApiPins::*``, ``TestAdapterStructure::*``,
                                   ``TestReporterPins::*`` (the private pytest reporter state)
 H13 example pin ................. ``TestExamplePin::*``
 H14 runbook contract ............ ``TestRunbookReferences::*`` (checker, then the real runbook)
 H15 descendants ................. ``TestDescendants::*``
-H16 passive observer ............ ``TestObserver::*``
+H16 (retired: no observer)
 H17 ``_file_console`` preflight . ``TestSandboxPrerequisites::test_h17_file_console_preflight``
 H18 cancellation contract ....... ``TestCancellationContract::*`` (case wrapper and descendant
                                   check), ``TestRealInferenceAdapters::test_an_interrupt_at_the_*``
 H19 outcome precedence .......... ``TestOutcomePrecedence::*``
-H20 ``canary_scan`` evidence .... ``TestCanaryScanEvidence::*``, ``TestEvidenceContract::*``,
+H20 (retired: no canary scan) ... ``TestEvidenceContract::*``,
                                   ``TestRealL0Adapter``, ``TestRealInferenceAdapters``
-H21 private logs, output surface  ``TestPrivateLogCapture::*``, ``TestOutputSurface::*``,
+H21 private logs, output surface  ``TestPrivateLogSink::*``, ``TestRealSdkLoggerIsCaught::*``,
+                                  ``TestOutputSurface::*``,
                                   ``TestAuthorizedCommands::*``
-H22 stream names ................ ``TestEveryRequiredStreamIsScanned::*``
-H23 L2 aggregate billing ........ ``TestRealInferenceAdapters::test_l[12]_aggregate_*``
+H22 (retired: no stream scan)
+H23 L1 aggregate billing ........ ``TestRealInferenceAdapters::test_l1_aggregate_*``
 H24 structural-test tripwires ... ``TestStructuralTripwires::*``, ``TestAdapterStructure::*``
 H25 probe accounting ............ ``TestRealInferenceAdapters::test_probe_counts_per_case``,
-                                  ``...::test_official_total_is_five_*``
+                                  ``TestQuota::*`` (ceiling one)
 H26 stale-status guard .......... ``TestStaleStatusGuard::*``
 H27 report sanitizer (failures) . ``TestReportSanitizer::*``
 H28 KeyboardInterrupt sanitizer . ``TestInterruptSanitizer::*``
@@ -74,15 +75,19 @@ H48 operator shell gate ......... ``TestShellGate::*`` (bash and zsh, stand-ins 
 H49 classifier startup .......... ``TestClassifierStartup::*`` (Class C)
 H50 static head order ........... ``TestClassifierHeadStatic::*``
 H51 literal grammar tables ...... ``TestGrammarTables::*``
-H52 L3 diagnostic reducers ...... ``TestDiagnosticReducers::*``
-H53 diagnostic emission, guard .. ``TestDiagnosticEmission::*``, ``TestDiagnosticEndToEnd::*``
-                                  (Class R)
-H54 diagnostic classifier ....... ``TestDiagnosticClassifier::*``,
-                                  ``TestDiagnosticClassifierEntry::*`` (Class C)
-H55 raw values cannot enter ..... ``TestDiagnosticSafety::*``
-H56 classification unchanged .... ``TestClassificationUnchanged::*``
-H57 adapters cannot forge keys .. ``TestDiagnosticSpoofing::*``, ``TestDiagnosticEndToEnd::*``
-H58 decision-table oracle ....... ``TestDecisionTableOracle::*``
+H52-H58 (retired with the diagnostic triple; the decision-table oracle is H63)
+H59 official sequence L0 -> L1 .. ``TestOfficialSequence::*``
+H60 contract bindings ........... ``TestOfficialContractBindings::*``
+H61 no retroactive acceptance ... ``TestNoRetroactiveAcceptance::*``
+H62 claims and documentation .... ``TestClaimsAndDocs::*``
+H63 decision-table oracle ....... ``TestDecisionTableOracle::*``
+H64 fail-closed conditions ...... ``TestFailClosedConditions::*`` (Class R)
+H65 status-table pins ........... ``TestEvidenceCellPins::*``
+H66 module boundary ............. ``TestGateModuleBoundary::*``
+Structural allowlist ............ ``TestStructuralAllowlist::*``,
+                                  ``TestStructuralSingleExecution::*``
+Counting fakes, scoped tripwire . ``TestCountingFakes::*``, ``TestCountingOfficialSession::*``,
+                                  ``TestScopedTripwireSelfControls::*``
 
 Also: ``TestAdapterSeams`` (fakes), ``TestModuleShape`` (AST guards),
 ``TestSandboxPrerequisites::test_live_tests_build_real_adapters_and_fail_closed_on_prerequisite``.
@@ -94,11 +99,11 @@ import ast
 import asyncio
 import contextlib
 import dataclasses
+import enum
 import importlib
 import importlib.metadata
 import inspect
 import io
-import itertools
 import json
 import logging
 import os
@@ -108,16 +113,18 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import tokenize
 import types
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import yaml
 
 from conductor.exceptions import ProviderError
 from tests.test_integration import test_claude_agent_sdk_subscription_real as lm
@@ -126,7 +133,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SANDBOX_INI = "[pytest]\nmarkers =\n    real_api: opt-in real API tests\n"
 ROOT_CONFTEST = REPO_ROOT / "tests" / "conftest.py"
 LIVE_MODULE = Path(lm.__file__).resolve()
-CANARY = lm.make_canary("0123456789abcdef0123456789abcdef")
 GIT_SHA = "0123456789abcdef0123456789abcdef01234567"
 FACTS = {
     "date_utc": "2026-09-30T00:00:00Z",
@@ -194,10 +200,6 @@ def relabel(fn: Any, filename: Path) -> Callable[..., Any]:
 def as_conftest_fn(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Return a copy of ``fn`` whose code claims to come from the repo's ``tests/conftest.py``."""
     return relabel(fn, ROOT_CONFTEST)
-
-
-def clean_streams() -> dict[str, object]:
-    return dict.fromkeys(lm.REQUIRED_STREAMS, "")
 
 
 def raises_outcome(outcome: lm.Outcome) -> Any:
@@ -909,21 +911,20 @@ class TestSandboxPrerequisites:
         out = result.stdout.str()
         assert "prereq_file_console_active" in out
         assert "not_executed_after_safety_failure" in out
-        assert '"case"' not in out  # no L0/L1/L3/L2 evidence record was produced
+        assert '"case"' not in out  # no L0/L1 evidence record was produced
         # Path A: exactly one run-level record (the second test's hand-over is refused), never
         # duplicated by ``fail_closed``, with the session prefix and every case not executed
         (record,) = evidence_records(out)
         assert record["primary_failure"] == "session:prereq_file_console_active:HarnessFailure"
         assert record["not_executed"] == (
-            "L0:not_executed_after_safety_failure,L1:not_executed_after_safety_failure,"
-            "L3:not_executed_after_safety_failure,L2:not_executed_after_safety_failure"
+            "L0:not_executed_after_safety_failure,L1:not_executed_after_safety_failure"
         )
         assert sandbox.hits() == []  # readiness never called; no CLI/SDK/process/network entry
 
     def test_live_tests_build_real_adapters_and_fail_closed_on_prerequisite(
         self, sandbox: Sandbox
     ) -> None:
-        """Both live tests resolve their fixtures (capfd without capsys), construct the real
+        """Both live tests resolve their fixtures, construct the real
         adapter set, and stop at the preflight: no case, no adapter entry point, no hit."""
         pytest.importorskip("claude_agent_sdk")
         sandbox.conftest(EXTRA_CLI_NONE)
@@ -1077,8 +1078,8 @@ def plant(name: str, part: str) -> str:
 
 
 # A sandbox test module that behaves like a live case on the output surface.  Every scenario
-# writes a secret-like DEBUG record on a private logger and raw text to fd 1 / fd 2 / ``print``
-# inside the real ``PrivateLogCapture``, emits one real evidence record through the real
+# writes a secret-like WARNING record on each private logger and raw text to fd 1 / fd 2 / ``print``
+# inside the real ``PrivateLogSink``, emits one real evidence record through the real
 # terminal-summary hook, and then passes, fails, times out or is interrupted.  Each failing
 # scenario plants distinct secrets where pytest would render them: the message, ``__context__``,
 # ``__cause__``, a fixture repr, a source line and an absolute path.
@@ -1093,7 +1094,6 @@ from pathlib import Path
 
 pytestmark = pytest.mark.real_api
 SECRET = "SECRET-LIKE-DEBUG-LINE-9137"
-CANARY = lm.make_canary()
 
 
 def plant(name, part):
@@ -1111,14 +1111,14 @@ def leaky():
 
 
 def _noisy():
-    with lm.PrivateLogCapture(CANARY) as logs:
+    with lm.PrivateLogSink() as sink:
         logger = logging.getLogger("claude_agent_sdk._internal.transport.subprocess_cli")
-        logger.debug("Skipping non-JSON line from CLI stdout: %s", SECRET)
-        logging.getLogger("conductor.providers.claude_agent_sdk").debug("provider %s", SECRET)
+        logger.warning("Skipping non-JSON line from CLI stdout: %s", SECRET)
+        logging.getLogger("conductor.providers.claude_agent_sdk").warning("provider %s", SECRET)
         os.write(1, ("STDOUT " + SECRET + "\\n").encode())
         os.write(2, ("STDERR " + SECRET + "\\n").encode())
         print("PRINT " + SECRET)
-        assert SECRET in logs.text  # captured privately, and only there
+        assert sink.arrivals == 2  # reached the private sink, and only there
 
 
 def _emit(config, outcome=lm.Outcome.OK, interrupted="none"):
@@ -1131,10 +1131,10 @@ def _emit(config, outcome=lm.Outcome.OK, interrupted="none"):
             secondary_findings=[],
             interrupted=interrupted,
             descendants="no_descendants_remaining",
-            canary_scan=list(lm.EMPTY_SCAN),
+            attempted_quota_execution=False,
         )
     )
-    run = {"quota_attempts_total": 0, "quota_ceiling": 3}
+    run = {"quota_attempts_total": 0, "quota_ceiling": 1}
     if outcome is not lm.Outcome.OK:
         cls = {"keyboard_interrupt": "KeyboardInterrupt", "cancelled": "CancelledError"}
         who = cls.get(interrupted, "HarnessFailure")
@@ -1172,7 +1172,7 @@ def test_aggregate_failure(pytestconfig):
     first = lm.CaseResult(lm.Case.L0, "ok", lm.Outcome.OK)
     leak = (lm.Outcome.DESCENDANT_LEAK,)
     second = lm.CaseResult(lm.Case.L1, "failed", lm.Outcome.CASE_FAILED, "HarnessFailure", leak)
-    lm.finalize(lm.SessionResult((lm.Case.L0, lm.Case.L1), [first, second], 1, 3, []))
+    lm.finalize(lm.SessionResult((lm.Case.L0, lm.Case.L1), [first, second], 1, 1, []))
 
 
 def test_chained_provider_failure(pytestconfig):
@@ -1261,11 +1261,11 @@ def test_stdout_stderr(pytestconfig):
     _emit(pytestconfig)
 
 
-def test_private_debug(pytestconfig):
+def test_private_logger_warning(pytestconfig):
     _noisy()
-    with lm.PrivateLogCapture(CANARY) as logs:
-        logging.getLogger("claude_agent_sdk").debug("%s", plant("private_debug", "msg"))
-        assert plant("private_debug", "msg") in logs.text
+    with lm.PrivateLogSink() as sink:
+        logging.getLogger("claude_agent_sdk").warning("%s", plant("private_logger_warning", "msg"))
+        assert sink.arrivals == 1
     _emit(pytestconfig)
 
 
@@ -1341,7 +1341,7 @@ SCENARIOS: dict[str, tuple[int, str | None]] = {
     "test_absolute_path": (1, f"{UNEXPECTED}: FileNotFoundError"),
     "test_warning": (0, None),
     "test_stdout_stderr": (0, None),
-    "test_private_debug": (0, None),
+    "test_private_logger_warning": (0, None),
     "test_timeout": (1, "inconclusive:HarnessFailure"),
     "test_cancelled_error": (1, f"{UNEXPECTED}: CancelledError"),
     "test_cancelled_error_chained": (1, f"{UNEXPECTED}: CancelledError"),
@@ -1882,7 +1882,7 @@ class TestOutputMatrix:
             assert banned not in out, banned  # ``--tb=no -rN -q``: none of these is printed
         records = evidence_records(out)
         assert [r.get("case", "run") for r in records] == ["L0", "run"], out
-        assert records[0]["canary_scan"] == list(lm.EMPTY_SCAN)
+        assert "canary_scan" not in records[0]
         assert "claude subscription live evidence" in out  # emitted without ``-s``
         # pytest's own rendering of the failure is read through the report log: fixed text only
         if rendered is not None:
@@ -2477,7 +2477,7 @@ class TestExceptionRendering:
             "live_opt_in_error:LiveOptInError",
             "cases: L0:ok; first_failure: none:incomplete:none",
             "cases: L0:ok,L1:case_failed; first_failure: L1:case_failed:HarnessFailure; "
-            "also: L1:descendant_leak,L1:canary_leak",
+            "also: L0:descendant_leak,L1:descendant_leak",
             "cases: L0:not_executed_after_safety_failure; first_failure: "
             "session:prereq_cli_missing:HarnessFailure",
         ],
@@ -2800,14 +2800,14 @@ class TestZeroSkipUnit:
         plugin = lm.ZeroSkipPlugin()
         assert not plugin.official
         plugin.ordered_test_passed, plugin.git_dirty = True, False
-        plugin.canary_scans_complete = True
         assert plugin.official
         plugin.skipped_reports = 1
         assert not plugin.official
         plugin.skipped_reports, plugin.git_dirty = 0, True
         assert not plugin.official
-        plugin.git_dirty, plugin.canary_scans_complete = False, False
-        assert not plugin.official  # an incomplete or leaking canary scan is never official
+        plugin.skipped_reports, plugin.git_dirty = 0, False
+        plugin.ordered_test_passed = False
+        assert not plugin.official  # official needs the ordered test to have passed
 
 
 # ============================================================================
@@ -2823,7 +2823,7 @@ class Entered:
 
     def __call__(self, *args: object, **kwargs: object) -> Any:
         self.calls.append("called")
-        return ("", "")
+        raise AssertionError("an entry point was entered although the gate must reject first")
 
 
 def helper_invocations(entered: Entered, tmp_path: Path) -> list[tuple[str, Callable[[Any], Any]]]:
@@ -3158,74 +3158,6 @@ class TestSourceTree:
 
 
 # ============================================================================
-# H11: classifier
-# ============================================================================
-
-
-def obs(
-    error: str | None = None, status: int | None = None, is_error: bool | None = None
-) -> lm.Observation:
-    return lm.Observation("ResultMessage", error, status, is_error)
-
-
-class TestClassifier:
-    non_retryable = ProviderError("x", is_retryable=False)
-
-    def test_invalid_key_from_authentication_failed(self) -> None:
-        got = lm.classify_l3([obs(error="authentication_failed")], [self.non_retryable], [])
-        assert got is lm.Outcome.INVALID_KEY
-
-    def test_invalid_key_from_401(self) -> None:
-        assert lm.classify_l3([obs(status=401)], [self.non_retryable], []) is lm.Outcome.INVALID_KEY
-
-    def test_fell_back_on_successful_agent_completed(self) -> None:
-        assert (
-            lm.classify_l3([], [], [{"type": "agent_completed"}]) is lm.Outcome.FELL_BACK_TO_LOGIN
-        )
-        event = SimpleNamespace(type="agent_completed")
-        assert lm.classify_l3([], [], [event]) is lm.Outcome.FELL_BACK_TO_LOGIN
-
-    def test_fell_back_beats_an_error_signal(self) -> None:
-        got = lm.classify_l3([obs(status=401)], [self.non_retryable], [{"type": "agent_completed"}])
-        assert got is lm.Outcome.FELL_BACK_TO_LOGIN
-
-    def test_model_unavailable_on_404(self) -> None:
-        got = lm.classify_l3([obs(status=404)], [self.non_retryable], [])
-        assert got is lm.Outcome.MODEL_UNAVAILABLE
-
-    def test_generic_non_retryable_is_inconclusive(self) -> None:
-        assert lm.classify_l3([], [self.non_retryable], []) is lm.Outcome.INCONCLUSIVE
-        assert lm.classify_l3([obs()], [self.non_retryable], []) is lm.Outcome.INCONCLUSIVE
-        assert (
-            lm.classify_l3([obs(error="server_error", status=500)], [self.non_retryable], [])
-            is lm.Outcome.INCONCLUSIVE
-        )
-
-    def test_text_in_the_exception_never_counts(self) -> None:
-        error = ProviderError("401 authentication_failed invalid api key", is_retryable=False)
-        assert lm.classify_l3([], [error], []) is lm.Outcome.INCONCLUSIVE
-
-    def test_signal_without_a_non_retryable_provider_error_is_inconclusive(self) -> None:
-        signal = [obs(error="authentication_failed", status=401)]
-        assert lm.classify_l3(signal, [], []) is lm.Outcome.INCONCLUSIVE
-        assert lm.classify_l3(signal, [RuntimeError("x")], []) is lm.Outcome.INCONCLUSIVE
-        retryable = ProviderError("x", is_retryable=True)
-        assert lm.classify_l3(signal, [retryable], []) is lm.Outcome.INCONCLUSIVE
-
-    def test_no_signals_at_all_is_inconclusive(self) -> None:
-        assert lm.classify_l3([], [], []) is lm.Outcome.INCONCLUSIVE
-
-    def test_exception_chain_is_walked(self) -> None:
-        inner = ProviderError("x", is_retryable=False)
-        outer = RuntimeError("wrapped")
-        outer.__cause__ = inner
-        chain = lm.exception_chain(outer)
-        assert inner in chain
-        got = lm.classify_l3([obs(status=401)], chain, [])
-        assert got is lm.Outcome.INVALID_KEY
-
-
-# ============================================================================
 # H11: evidence
 # ============================================================================
 
@@ -3233,8 +3165,8 @@ class TestClassifier:
 class TestEvidence:
     def test_accepts_every_allowed_shape(self) -> None:
         record = lm.evidence(
-            case="L3",
-            outcome=lm.Outcome.INVALID_KEY,
+            case="L1",
+            outcome=lm.Outcome.OK,
             git_sha="c" * 40,
             git_dirty=False,
             env_names_set=["ANTHROPIC_API_KEY"],
@@ -3247,10 +3179,10 @@ class TestEvidence:
             adapter_outcome=lm.Outcome.INCONCLUSIVE,
             secondary_findings=["descendant_leak"],
             interrupted="none",
-            canary_scan=list(lm.EMPTY_SCAN),
+            quota_attempts_total=1,
+            quota_ceiling=1,
         )
-        assert record["outcome"] == "invalid_key"
-        assert record["canary_scan"] == list(lm.EMPTY_SCAN)
+        assert record["outcome"] == "ok"
         assert lm.emit_evidence(record).startswith("EVIDENCE {")
 
     @pytest.mark.parametrize(
@@ -3300,15 +3232,14 @@ class TestEvidence:
         # one representation of ``official``: the G4 section line, never a record key
         assert not {"official", "skipped_reports", "zero_skip_verdict"} & lm.EVIDENCE_KEYS
         assert not any(k in lm.EVIDENCE_KEYS for k in ("env", "stdout", "stderr", "raw", "email"))
-        assert {"adapter_outcome", "secondary_findings", "interrupted", "canary_scan"} <= (
-            lm.EVIDENCE_KEYS
-        )
+        assert {"adapter_outcome", "secondary_findings", "interrupted"} <= lm.EVIDENCE_KEYS
+        # retired with the canary and the diagnostic fields: no key can carry them (D32)
+        retired = {"canary_scan", "diag_provider_retryability", "diag_assistant_error"}
+        assert not (retired | {"diag_api_status"}) & lm.EVIDENCE_KEYS
 
 
 class TestEvidenceContract:
-    """The revision-4 fields: bounded fixed values, never free text, never a canary."""
-
-    GOOD_SCAN = list(lm.EMPTY_SCAN)
+    """Bounded fixed values, never free text; the retired keys can carry nothing."""
 
     @pytest.mark.parametrize(
         ("key", "value"),
@@ -3316,11 +3247,10 @@ class TestEvidenceContract:
             ("adapter_outcome", "made_up"),
             ("adapter_outcome", "RuntimeError: secret detail"),
             ("adapter_outcome", 7),
-            ("secondary_findings", "canary_leak"),  # not a list
+            ("secondary_findings", "descendant_leak"),  # not a list
             ("secondary_findings", ["anything else"]),
-            ("secondary_findings", ["canary_scan_incomplete"]),  # not a safety finding here
-            ("secondary_findings", ["canary_leak", "canary_leak"]),  # duplicate
-            ("secondary_findings", ["canary_leak", "descendant_leak", "canary_leak"]),
+            ("secondary_findings", ["canary_leak"]),  # retired with the canary
+            ("secondary_findings", ["descendant_leak", "descendant_leak"]),  # duplicate
             ("interrupted", True),  # the old boolean shape
             ("interrupted", "KeyboardInterrupt: secret detail"),
             ("interrupted", "CancelledError"),
@@ -3330,146 +3260,49 @@ class TestEvidenceContract:
             ("cleanup_failed", ["evidence", "descendants"]),  # out of cleanup order
             ("cleanup_failed", ["descendants", "descendants"]),  # a duplicate
             ("cleanup_failed", []),
-            ("canary_scan", "events=clean,console=clean"),  # the old free-text shape
-            ("canary_scan", {"stdout_stderr": "clean"}),  # a mapping
-            ("canary_scan", GOOD_SCAN[:-1]),  # missing an entry
-            ("canary_scan", [*GOOD_SCAN, "tmp_files:clean"]),  # an extra entry
-            ("canary_scan", [GOOD_SCAN[1], GOOD_SCAN[0], *GOOD_SCAN[2:]]),  # reordered
-            ("canary_scan", ["stdout_stderr:leak: matched text", *GOOD_SCAN[1:]]),
-            ("canary_scan", ["stdout_stderr:maybe", *GOOD_SCAN[1:]]),
-            ("canary_scan", ["capfd:clean", *GOOD_SCAN[1:]]),  # a retired stream name
-            ("canary_scan", [f"stdout_stderr:{CANARY}", *GOOD_SCAN[1:]]),
+            ("canary_scan", ["stdout_stderr:clean"]),  # a retired key
+            ("diag_provider_retryability", "absent"),  # retired keys
+            ("diag_assistant_error", "absent"),
+            ("diag_api_status", "absent"),
+            ("quota_ceiling", 0),  # exactly 1 (record check 8)
+            ("quota_ceiling", 2),
+            ("quota_ceiling", 3),
+            ("quota_ceiling", True),
+            ("quota_attempts_total", 2),  # exactly 0 or 1
+            ("quota_attempts_total", -1),
+            ("quota_attempts_total", True),
         ],
     )
     def test_rejects(self, key: str, value: object) -> None:
         with pytest.raises(lm.EvidenceError) as info:
             lm.evidence(**{key: value})
         assert "secret detail" not in str(info.value)
-        assert CANARY not in str(info.value)
 
-    def test_a_case_record_without_canary_scan_is_rejected(self) -> None:
-        for case in ("L0", "L1", "L3", "L2"):
+    def test_a_case_record_needs_no_scan(self) -> None:
+        for case in ("L0", "L1"):
+            assert lm.evidence(case=case, outcome=lm.Outcome.OK)["case"] == case
+        for retired in ("L3", "L2"):
             with pytest.raises(lm.EvidenceError):
-                lm.evidence(case=case, outcome=lm.Outcome.OK)
-            assert lm.evidence(case=case, outcome=lm.Outcome.OK, canary_scan=self.GOOD_SCAN)
-        # a session-level record describes no case scan
+                lm.evidence(case=retired, outcome=lm.Outcome.OK)
         assert lm.evidence(case="session", git_dirty=False)
 
     def test_accepts_every_fixed_value(self) -> None:
         for kind in lm.INTERRUPT_KINDS:
             assert lm.evidence(interrupted=kind)["interrupted"] == kind
-        for finding in (
-            [],
-            ["canary_leak"],
-            ["descendant_leak"],
-            ["canary_leak", "descendant_leak"],
-        ):
+        for finding in ([], ["descendant_leak"]):
             assert lm.evidence(secondary_findings=finding)["secondary_findings"] == finding
-        scan = [f"{name}:{state}" for name, state in zip(lm.REQUIRED_STREAMS, _STATES, strict=True)]
-        assert lm.evidence(canary_scan=scan)["canary_scan"] == scan
+        for total in (0, 1):
+            assert lm.evidence(quota_attempts_total=total)["quota_attempts_total"] == total
+        assert lm.evidence(quota_ceiling=1)["quota_ceiling"] == 1
 
     def test_arbitrary_text_cannot_enter_through_an_exception_or_a_log(self) -> None:
-        """A unique exception message, log line, auth value and canary never reach a record."""
+        """A unique exception message, log line and auth value never reach a record."""
         unique = "UNIQUE-EXCEPTION-TEXT-7731"
-        for value in (unique, f"{unique} {CANARY}", {"authMethod": unique}):
+        for value in (unique, f"{unique} sk-ant-api03-x", {"authMethod": unique}):
             for key in ("exception_class", "adapter_outcome", "interrupted", "secondary_findings"):
                 with pytest.raises(lm.EvidenceError) as info:
                     lm.evidence(**{key: value})
-                assert unique not in str(info.value) and CANARY not in str(info.value)
-
-
-_STATES = ("clean", "leak", "not_available", "clean", "clean", "not_available", "clean", "leak")
-
-
-# ============================================================================
-# H11: canary
-# ============================================================================
-
-
-class TestCanary:
-    def test_canary_shape_and_uniqueness(self) -> None:
-        one, two = lm.make_canary(), lm.make_canary()
-        assert one != two
-        assert re.fullmatch(r"sk-ant-api03-CANARY-[0-9a-f]{32}-DO-NOT-USE", one)
-        with pytest.raises(lm.HarnessFailure):
-            lm.validate_canary("sk-ant-api03-real-looking-key")
-
-    @pytest.mark.parametrize("stream", lm.REQUIRED_STREAMS)
-    def test_positive_control_for_every_stream_category(self, stream: str) -> None:
-        streams = clean_streams()
-        streams[stream] = f"prefix {CANARY} suffix"
-        with raises_outcome(lm.Outcome.CANARY_LEAK) as info:
-            lm.assert_no_canary(CANARY, streams)
-        assert stream in str(info.value)
-        assert CANARY not in str(info.value)
-
-    def test_clean_streams_pass(self) -> None:
-        lm.assert_no_canary(CANARY, clean_streams())
-
-    def test_fragment_of_twelve_characters_is_detected(self) -> None:
-        streams = clean_streams()
-        streams["console"] = "x " + CANARY[20:32] + " y"  # 12 characters of the random part
-        with raises_outcome(lm.Outcome.CANARY_LEAK):
-            lm.assert_no_canary(CANARY, streams)
-
-    def test_short_fragment_is_not_a_leak(self) -> None:
-        streams = clean_streams()
-        streams["console"] = CANARY[20:31]  # 11 characters
-        lm.assert_no_canary(CANARY, streams)
-
-    def test_missing_stream_category_is_incomplete_not_a_pass(self) -> None:
-        for missing in lm.REQUIRED_STREAMS:
-            streams = clean_streams()
-            del streams[missing]
-            with raises_outcome(lm.Outcome.CANARY_SCAN_INCOMPLETE):
-                lm.assert_no_canary(CANARY, streams)
-        with raises_outcome(lm.Outcome.CANARY_SCAN_INCOMPLETE):
-            lm.assert_no_canary(CANARY, {})  # the old "called with no streams" bug
-
-    def test_exception_chain_scanning(self) -> None:
-        cause = RuntimeError(f"key {CANARY}")
-        top = ValueError("innocent")
-        top.__cause__ = cause
-        assert CANARY in lm.render_exception_chain(top)
-        context_only = ValueError("innocent")
-        context_only.__context__ = KeyError(CANARY)
-        assert CANARY in lm.render_exception_chain(context_only)
-        group = ExceptionGroup("g", [OSError(CANARY)])
-        assert CANARY in lm.render_exception_chain(group)
-        streams = clean_streams()
-        streams["exceptions"] = top
-        with raises_outcome(lm.Outcome.CANARY_LEAK):
-            lm.assert_no_canary(CANARY, streams)
-
-    def test_exception_chain_handles_cycles(self) -> None:
-        a, b = RuntimeError("a"), RuntimeError("b")
-        a.__cause__, b.__cause__ = b, a
-        assert len(lm.exception_chain(a)) == 2
-
-    def test_structured_and_bytes_streams(self) -> None:
-        streams = clean_streams()
-        streams["events"] = [{"type": "x", "data": {"k": CANARY}}]
-        with raises_outcome(lm.Outcome.CANARY_LEAK):
-            lm.assert_no_canary(CANARY, streams)
-        streams = clean_streams()
-        streams["stdout_stderr"] = CANARY.encode()
-        with raises_outcome(lm.Outcome.CANARY_LEAK):
-            lm.assert_no_canary(CANARY, streams)
-
-    def test_tmp_files_stream_reads_files(self, tmp_path: Path) -> None:
-        (tmp_path / "sub").mkdir()
-        (tmp_path / "sub" / "log.txt").write_text(f"oops {CANARY}")
-        streams = clean_streams()
-        streams["tmp_files"] = lm.read_tmp_files(tmp_path)
-        with raises_outcome(lm.Outcome.CANARY_LEAK):
-            lm.assert_no_canary(CANARY, streams)
-
-    def test_leak_message_is_fixed_text(self) -> None:
-        streams = clean_streams()
-        streams["evidence"] = CANARY
-        with pytest.raises(lm.HarnessFailure) as info:
-            lm.assert_no_canary(CANARY, streams)
-        assert str(info.value) == "canary_leak: canary present in evidence"
+                assert unique not in str(info.value)
 
 
 # ============================================================================
@@ -3521,18 +3354,18 @@ class TestModel:
 
 
 class TestQuota:
-    def test_fourth_attempt_is_refused(self) -> None:
+    def test_the_ceiling_is_one_and_the_second_attempt_is_refused(self) -> None:
         quota = lm.QuotaCounter()
-        assert quota.ceiling == 3
-        for expected in (1, 2, 3):
-            quota.begin_attempt()
-            assert quota.attempts == expected
+        assert quota.ceiling == 1 == lm.DEFAULT_QUOTA_CEILING
+        quota.begin_attempt()
+        assert quota.attempts == 1
         with raises_outcome(lm.Outcome.QUOTA_CEILING_EXCEEDED):
             quota.begin_attempt()
-        assert quota.attempts == 3
+        assert quota.attempts == 1
 
     def test_custom_ceiling(self) -> None:
-        quota = lm.QuotaCounter(1)
+        quota = lm.QuotaCounter(2)
+        quota.begin_attempt()
         quota.begin_attempt()
         with pytest.raises(lm.HarnessFailure):
             quota.begin_attempt()
@@ -3638,103 +3471,53 @@ def run_machine(
     script: dict[lm.Case, object] | None = None,
     *,
     quota: lm.QuotaCounter | None = None,
-    pre_hooks: dict[lm.Case, Callable[[], None]] | None = None,
 ) -> tuple[lm.SessionResult, Scripted, list[dict[str, object]]]:
     counter = quota or lm.QuotaCounter()
     scripted = Scripted(script or {}, counter)
     emitted: list[dict[str, object]] = []
     result = asyncio.run(
-        lm.run_ordered_cases(
-            scripted.runners(), quota=counter, emit=emitted.append, pre_hooks=pre_hooks
-        )
+        lm.run_ordered_cases(scripted.runners(), quota=counter, emit=emitted.append)
     )
     return result, scripted, emitted
 
 
 TABLE = [
     # (id, script, called, outcomes per case in order, succeeded)
-    (
-        "all-ok",
-        {},
-        [S.L0, S.L1, S.L3, S.L2],
-        [O.OK, O.OK, O.INVALID_KEY, O.OK],
-        True,
-    ),
+    ("all-ok", {}, [S.L0, S.L1], [O.OK, O.OK], True),
     (
         "l0-fails",
         {S.L0: O.NOT_LOGGED_IN},
         [S.L0],
-        [O.NOT_LOGGED_IN] + [O.NOT_EXECUTED_AFTER_L0_FAILURE] * 3,
+        [O.NOT_LOGGED_IN, O.NOT_EXECUTED_AFTER_L0_FAILURE],
         False,
     ),
     (
         "l0-raises",
         {S.L0: RuntimeError("boom")},
         [S.L0],
-        [O.CASE_FAILED] + [O.NOT_EXECUTED_AFTER_L0_FAILURE] * 3,
+        [O.CASE_FAILED, O.NOT_EXECUTED_AFTER_L0_FAILURE],
         False,
     ),
+    ("l1-fails", {S.L1: O.INCONCLUSIVE}, [S.L0, S.L1], [O.OK, O.INCONCLUSIVE], False),
     (
-        "l1-fails",
-        {S.L1: O.INCONCLUSIVE},
+        "l1-raises",
+        {S.L1: ProviderError("x", is_retryable=False)},
         [S.L0, S.L1],
-        [O.OK, O.INCONCLUSIVE, O.NOT_EXECUTED_AFTER_L1_FAILURE, O.NOT_EXECUTED_AFTER_L1_FAILURE],
+        [O.OK, O.CASE_FAILED],
         False,
     ),
     (
-        "descendant-leak",
+        "descendant-leak-in-l1",
         {S.L1: lm.HarnessFailure(O.DESCENDANT_LEAK)},
         [S.L0, S.L1],
-        [O.OK, O.DESCENDANT_LEAK] + [O.NOT_EXECUTED_AFTER_SAFETY_FAILURE] * 2,
+        [O.OK, O.DESCENDANT_LEAK],
         False,
     ),
     (
-        "canary-leak-in-l3",
-        {S.L3: lm.HarnessFailure(O.CANARY_LEAK)},
-        [S.L0, S.L1, S.L3],
-        [O.OK, O.OK, O.CANARY_LEAK, O.NOT_EXECUTED_AFTER_SAFETY_FAILURE],
-        False,
-    ),
-    (
-        "l3-fell-back",
-        {S.L3: O.FELL_BACK_TO_LOGIN},
-        [S.L0, S.L1, S.L3],
-        [O.OK, O.OK, O.FELL_BACK_TO_LOGIN, O.NOT_EXECUTED_L3_FELL_BACK_TO_LOGIN],
-        False,
-    ),
-    (
-        "l3-inconclusive",
-        {S.L3: O.INCONCLUSIVE},
-        [S.L0, S.L1, S.L3],
-        [O.OK, O.OK, O.INCONCLUSIVE, O.NOT_EXECUTED_L3_INCONCLUSIVE],
-        False,
-    ),
-    (
-        "l3-model-unavailable",
-        {S.L3: O.MODEL_UNAVAILABLE},
-        [S.L0, S.L1, S.L3],
-        [O.OK, O.OK, O.MODEL_UNAVAILABLE, O.NOT_EXECUTED_L3_MODEL_UNAVAILABLE],
-        False,
-    ),
-    (
-        "l3-generic-exception-is-inconclusive",
-        {S.L3: ProviderError("x", is_retryable=False)},
-        [S.L0, S.L1, S.L3],
-        [O.OK, O.OK, O.INCONCLUSIVE, O.NOT_EXECUTED_L3_INCONCLUSIVE],
-        False,
-    ),
-    (
-        "l3-ok-value-is-not-a-pass",
-        {S.L3: O.OK},
-        [S.L0, S.L1, S.L3],
-        [O.OK, O.OK, O.OK, O.NOT_EXECUTED_L3_INCONCLUSIVE],
-        False,
-    ),
-    (
-        "l2-fails",
-        {S.L2: O.INCONCLUSIVE},
-        [S.L0, S.L1, S.L3, S.L2],
-        [O.OK, O.OK, O.INVALID_KEY, O.INCONCLUSIVE],
+        "descendant-leak-in-l0",
+        {S.L0: lm.HarnessFailure(O.DESCENDANT_LEAK)},
+        [S.L0],
+        [O.DESCENDANT_LEAK, O.NOT_EXECUTED_AFTER_SAFETY_FAILURE],
         False,
     ),
 ]
@@ -3762,18 +3545,24 @@ class TestStateMachine:
         for record in emitted:
             lm.emit_evidence(record)  # every record passes the sanitizer
 
-    def test_l3_invalid_key_alone_proceeds_to_l2(self) -> None:
-        _, scripted, _ = run_machine({S.L3: O.INVALID_KEY})
-        assert scripted.called[-1] is S.L2
-        for other in (O.FELL_BACK_TO_LOGIN, O.INCONCLUSIVE, O.MODEL_UNAVAILABLE, O.OK):
-            _, scripted, _ = run_machine({S.L3: other})
-            assert S.L2 not in scripted.called, other
+    @pytest.mark.parametrize(
+        "script",
+        [
+            {S.L0: O.NOT_LOGGED_IN},
+            {S.L0: RuntimeError("x")},
+            {S.L0: lm.HarnessFailure(O.DESCENDANT_LEAK)},
+        ],
+    )
+    def test_l1_never_runs_after_an_l0_failure(self, script: dict[lm.Case, object]) -> None:
+        result, scripted, _ = run_machine(script)
+        assert scripted.called == [S.L0]
+        assert result.quota_attempts == 0  # no inference attempt was started
 
     def test_transition_function_is_pure_and_total(self) -> None:
         assert lm.not_executed_value(S.L0, O.OK) is None
         assert lm.not_executed_value(S.L1, O.OK) is None
-        assert lm.not_executed_value(S.L3, O.INVALID_KEY) is None
-        assert lm.not_executed_value(S.L2, O.INCONCLUSIVE) is None
+        assert lm.not_executed_value(S.L1, O.INCONCLUSIVE) is None  # no case follows L1
+        assert lm.not_executed_value(S.L0, O.NOT_LOGGED_IN) is O.NOT_EXECUTED_AFTER_L0_FAILURE
         for safety in lm.SAFETY_OUTCOMES:
             for case in lm.ORDER:
                 assert lm.not_executed_value(case, safety) is O.NOT_EXECUTED_AFTER_SAFETY_FAILURE
@@ -3802,11 +3591,12 @@ class TestStateMachine:
         assert case_records[-1]["outcome"] == "interrupted"
         assert case_records[-1]["interrupted"] == "cancelled"
 
+    @pytest.mark.parametrize("where", [S.L0, S.L1])
     @pytest.mark.parametrize("make", [KeyboardInterrupt, asyncio.CancelledError])
-    def test_an_interrupt_after_completed_cases_keeps_them_and_is_the_primary_failure(
-        self, make: Callable[[], BaseException]
+    def test_an_interrupt_keeps_completed_cases_and_is_the_primary_failure(
+        self, make: Callable[[], BaseException], where: lm.Case
     ) -> None:
-        """L0 and L1 complete, L3 is interrupted: the earlier ``ok`` cases are never the failure."""
+        """An earlier ``ok`` case is never the failure; a later case never runs."""
 
         def deterministic_clock() -> Callable[[], float]:
             ticks = iter(range(10_000))
@@ -3829,7 +3619,7 @@ class TestStateMachine:
         original = make()
         counter = lm.QuotaCounter()
         emitted: list[dict[str, object]] = []
-        scripted = Scripted({S.L3: original}, counter)
+        scripted = Scripted({where: original}, counter)
 
         async def interrupted() -> None:
             await lm.run_ordered_cases(
@@ -3842,47 +3632,45 @@ class TestStateMachine:
         with pytest.raises(type(original)) as info:
             asyncio.run(interrupted())
         assert info.value is original  # the very same object, unchanged
-        assert scripted.called == [S.L0, S.L1, S.L3]  # the later L2 never ran
+        ran = list(lm.ORDER)[: list(lm.ORDER).index(where) + 1]
+        assert scripted.called == ran  # a later case never ran
         cases = [r for r in emitted if "case" in r]
-        assert [r["case"] for r in cases] == ["L0", "L1", "L3"]
-        assert cases[:2] == [r for r in baseline if r.get("case") in ("L0", "L1")]  # unchanged
-        assert [r["outcome"] for r in cases[:2]] == ["ok", "ok"]
-        assert cases[2]["outcome"] == "interrupted"
-        assert cases[2]["interrupted"] in ("keyboard_interrupt", "cancelled")
+        assert [r["case"] for r in cases] == [c.value for c in ran]
+        earlier = [r for r in baseline if r.get("case") in [c.value for c in ran[:-1]]]
+        assert cases[:-1] == earlier  # unchanged
+        assert all(r["outcome"] == "ok" for r in cases[:-1])
+        assert cases[-1]["outcome"] == "interrupted"
+        assert cases[-1]["interrupted"] in ("keyboard_interrupt", "cancelled")
         (run_level,) = [r for r in emitted if "case" not in r]
         assert emitted[-1] is run_level  # written last
-        assert run_level["primary_failure"] == f"L3:interrupted:{type(original).__name__}"
-        assert run_level["not_executed"] == "L2:not_executed_after_interrupt"
-        assert run_level["quota_attempts_total"] == 2 and run_level["quota_ceiling"] == 3
+        assert (
+            run_level["primary_failure"] == f"{where.value}:interrupted:{type(original).__name__}"
+        )
+        if where is S.L0:
+            assert run_level["not_executed"] == "L1:not_executed_after_interrupt"
+            assert run_level["quota_attempts_total"] == 0
+        else:
+            assert "not_executed" not in run_level
+            assert run_level["quota_attempts_total"] == 1
+        assert run_level["quota_ceiling"] == 1
         assert "ok" not in str(run_level["primary_failure"]).split(":")[1:2]
         for record in emitted:
             lm.emit_evidence(record)  # every record passes the sanitizer
 
-    def test_quota_counter_increments_before_each_inference_runner(self) -> None:
+    def test_quota_counter_increments_before_the_inference_runner(self) -> None:
         result, scripted, emitted = run_machine()
-        assert scripted.attempts_at_entry == {S.L0: 0, S.L1: 1, S.L3: 2, S.L2: 3}
-        assert result.quota_attempts == 3
-        assert [r["attempted_quota_execution"] for r in emitted] == [False, True, True, True]
+        assert scripted.attempts_at_entry == {S.L0: 0, S.L1: 1}
+        assert result.quota_attempts == 1
+        assert [r["attempted_quota_execution"] for r in emitted] == [False, True]
 
     def test_exhausted_quota_refuses_before_the_runner(self) -> None:
         quota = lm.QuotaCounter()
-        quota.attempts = 3  # a fourth attempt
-        result, scripted, _ = run_machine(quota=quota)
+        quota.attempts = 1  # a second attempt
+        result, scripted, emitted = run_machine(quota=quota)
         assert scripted.called == [S.L0]
         assert result.results[1].outcome is O.QUOTA_CEILING_EXCEEDED
-        assert result.results[2].outcome is O.NOT_EXECUTED_AFTER_SAFETY_FAILURE
-        assert quota.attempts == 3
-
-    def test_pairing_hooks_abort_before_the_case(self) -> None:
-        def boom() -> None:
-            raise lm.HarnessFailure(O.L2_L3_NOT_PAIRED)
-
-        result, scripted, _ = run_machine(pre_hooks={S.L2: boom})
-        assert S.L2 not in scripted.called
-        assert result.results[-1].outcome is O.L2_L3_NOT_PAIRED
-        assert result.succeeded is False
-        # the ceiling was not consumed by the refused case
-        assert result.quota_attempts == 2
+        assert quota.attempts == 1
+        assert emitted[1]["attempted_quota_execution"] is False  # no attempt was consumed
 
     def test_preflight_failure_runs_nothing_and_records_no_case_evidence(self) -> None:
         counter = lm.QuotaCounter()
@@ -3918,34 +3706,31 @@ class TestStateMachine:
         )
         assert result.session_failure == (O.LIVE_OPT_IN_ERROR, "LiveOptInError")
 
-    def test_l3_l2_workflows_differ_only_by_auth_mode_and_env_names_equal(self) -> None:
-        variants = lm.build_variants(lm.EXAMPLE_PATH.read_text(), CANARY, os.environ)
-        l3, l2 = variants[S.L3], variants[S.L2]
-        assert lm.config_diff_paths(l3.config, l2.config) == ["workflow.runtime.provider.auth_mode"]
-        assert (l3.auth_mode, l2.auth_mode) == ("auto", "subscription")
-        assert set(l3.env.set_names) == set(l2.env.set_names) == {"ANTHROPIC_API_KEY"}
-        assert set(l3.env.removed_names) == set(l2.env.removed_names)
-        assert CANARY not in repr(l3) and CANARY not in repr(l3.env)
-        lm.assert_config_paired(l3, l2)
-        lm.assert_env_paired(l3, l2)
+    def test_the_l1_configuration_is_the_shipped_example(self) -> None:
+        text = lm.EXAMPLE_PATH.read_text()
+        parsed = yaml.safe_load(text)
+        assert lm.build_l1_config(text, None) == parsed
+        assert parsed["workflow"]["runtime"]["provider"]["auth_mode"] == "subscription"
+        changed = lm.build_l1_config(text, "claude-haiku-4-5-20251001")
+        assert changed["workflow"]["runtime"]["provider"]["auth_mode"] == "subscription"
+        assert changed["workflow"]["runtime"]["default_model"] == "claude-haiku-4-5-20251001"
+        changed["workflow"]["runtime"]["default_model"] = parsed["workflow"]["runtime"][
+            "default_model"
+        ]
+        assert changed == parsed  # the model is the only possible difference
 
-    def test_pairing_detects_config_and_env_drift(self) -> None:
-        variants = lm.build_variants(lm.EXAMPLE_PATH.read_text(), CANARY, {})
-        l3, l2 = variants[S.L3], variants[S.L2]
-        drifted = {**l2.config, "agents": [{"name": "other"}]}
-        with raises_outcome(O.L2_L3_NOT_PAIRED):
-            lm.assert_config_paired(l3, lm.CaseVariant(S.L2, "subscription", drifted, l2.env))
-        with raises_outcome(O.L2_L3_NOT_PAIRED):
-            lm.assert_config_paired(l3, lm.CaseVariant(S.L2, "subscription", l3.config, l2.env))
-        other_env = lm.EnvPlan(("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"), (), dict(l2.env.values))
-        with raises_outcome(O.L2_L3_NOT_PAIRED):
-            lm.assert_env_paired(l3, lm.CaseVariant(S.L2, "subscription", l2.config, other_env))
-        removed_env = lm.EnvPlan(l2.env.set_names, ("ANTHROPIC_BASE_URL",), dict(l2.env.values))
-        with raises_outcome(O.L2_L3_NOT_PAIRED):
-            lm.assert_env_paired(l3, lm.CaseVariant(S.L2, "subscription", l2.config, removed_env))
-        other_value = lm.EnvPlan(l2.env.set_names, l2.env.removed_names, {"ANTHROPIC_API_KEY": "x"})
-        with raises_outcome(O.L2_L3_NOT_PAIRED):
-            lm.assert_env_paired(l3, lm.CaseVariant(S.L2, "subscription", l2.config, other_value))
+    def test_scrub_routes_removes_names_inside_the_context_and_sets_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = {"ANTHROPIC_API_KEY": "x", "ANTHROPIC_BASE_URL": "y", "PATH": "/bin"}
+        monkeypatch.setattr(os, "environ", dict(env))
+        seen: list[dict[str, str]] = []
+        with monkeypatch.context() as mp:
+            removed = lm.scrub_routes(mp, os.environ)
+            seen.append(dict(os.environ))
+        assert removed == ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")
+        assert seen == [{"PATH": "/bin"}]  # removed, nothing set
+        assert dict(os.environ) == env  # restored with the context
 
     def test_scrub_list_names_only_route_variables(self) -> None:
         env = {
@@ -3985,12 +3770,10 @@ class TestAggregation:
             lm.finalize(result)
 
     def test_primary_enum_and_exception_class_survive_later_failures(self) -> None:
-        result, _, _ = run_machine(
-            {S.L1: ProviderError("secret-message-xyz"), S.L2: O.INCONCLUSIVE}
-        )
+        result, _, _ = run_machine({S.L1: ProviderError("secret-message-xyz")})
         text = lm.aggregate_text(result)
         assert "first_failure: L1:case_failed:ProviderError" in text
-        assert text.startswith("cases: L0:ok,L1:case_failed,")
+        assert text.startswith("cases: L0:ok,L1:case_failed")
         assert "secret-message-xyz" not in text
         with pytest.raises(pytest.fail.Exception) as info:
             lm.finalize(result)
@@ -4005,11 +3788,12 @@ class TestAggregation:
         assert result2.succeeded is False
 
     def test_run_level_record_is_sanitized(self) -> None:
-        result, _, _ = run_machine({S.L3: O.FELL_BACK_TO_LOGIN})
+        result, _, _ = run_machine({S.L0: O.NOT_LOGGED_IN})
         record = lm.run_level_record(result)
-        assert record["not_executed"] == "L2:not_executed_l3_fell_back_to_login"
-        assert record["primary_failure"] == "L3:fell_back_to_login:none"
-        assert record["quota_attempts_total"] == 2
+        assert record["not_executed"] == "L1:not_executed_after_l0_failure"
+        assert record["primary_failure"] == "L0:not_logged_in:none"
+        assert record["quota_attempts_total"] == 0
+        assert record["quota_ceiling"] == 1
 
 
 # ============================================================================
@@ -4139,30 +3923,6 @@ class TestPrivateApiPins:
         assert inspect.iscoroutinefunction(ProviderRegistry.__aexit__)
         assert SUBSCRIPTION_LABEL == "API-equivalent estimate"
 
-    def test_the_sdk_client_method_the_observer_wraps_exists(self) -> None:
-        pytest.importorskip("claude_agent_sdk")
-        import claude_agent_sdk
-
-        method = claude_agent_sdk.ClaudeSDKClient.__dict__["receive_response"]
-        assert inspect.isasyncgenfunction(method) or inspect.iscoroutinefunction(method)
-
-    def test_assistant_error_literals_match_the_sdk(self) -> None:
-        pytest.importorskip("claude_agent_sdk")
-        import typing
-
-        from claude_agent_sdk.types import AssistantMessageError
-
-        assert set(typing.get_args(AssistantMessageError)) == set(lm.ASSISTANT_ERRORS)
-
-    def test_result_message_carries_the_typed_status_field(self) -> None:
-        pytest.importorskip("claude_agent_sdk")
-        import dataclasses
-
-        from claude_agent_sdk.types import AssistantMessage, ResultMessage
-
-        assert "api_error_status" in {f.name for f in dataclasses.fields(ResultMessage)}
-        assert "error" in {f.name for f in dataclasses.fields(AssistantMessage)}
-
     def test_every_live_test_is_covered_by_the_marker_and_env_gate(self) -> None:
         tree = module_ast()
         marks = next(
@@ -4219,15 +3979,14 @@ class TestPrivateApiPins:
             for ref in ast.walk(node)
             if isinstance(ref, ast.Attribute) and ref.attr in {"setLevel", "propagate", "disabled"}
         }
-        assert holders == {"PrivateLogCapture"}  # logger state changes live in one class
+        assert holders == {"PrivateLogSink"}  # logger state changes live in one class
         assert lm.PRIVATE_LOGGERS == ("claude_agent_sdk", "conductor.providers.claude_agent_sdk")
 
-    def test_no_live_test_requests_both_capture_fixtures_or_log_capture(self) -> None:
+    def test_no_live_test_requests_a_capture_fixture(self) -> None:
         for node in module_ast().body:
             if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
                 params = {a.arg for a in node.args.args}
-                assert not {"capfd", "capsys"} <= params, node.name
-                assert "caplog" not in params, node.name
+                assert not {"capfd", "capsys", "caplog"} & params, node.name
 
     def test_no_signal_is_sent_to_a_discovered_pid(self) -> None:
         """``os.kill*`` appears only in the helper that owns its own process group."""
@@ -4409,19 +4168,13 @@ class TestExamplePin:
         mutation(raw)
         assert expected in example_problems(raw)
 
-    def test_l3_variant_differs_only_in_auth_mode_and_validates(self) -> None:
-        import yaml
-
+    def test_the_l1_configuration_is_the_example_and_validates(self) -> None:
         from conductor.config.loader import load_config_string
 
-        variants = lm.build_variants(self.example.read_text(), CANARY, {})
-        assert lm.config_diff_paths(variants[S.L3].config, self._raw()) == [
-            "workflow.runtime.provider.auth_mode"
-        ]
-        assert lm.config_diff_paths(variants[S.L2].config, self._raw()) == []
-        for case in (S.L3, S.L2):
-            config = load_config_string(yaml.safe_dump(dict(variants[case].config)))
-            assert config.workflow.runtime.provider.auth_mode == variants[case].auth_mode
+        text = self.example.read_text()
+        assert lm.build_l1_config(text, None) == self._raw()  # unchanged, ``subscription``
+        config = load_config_string(yaml.safe_dump(lm.build_l1_config(text, None)))
+        assert config.workflow.runtime.provider.auth_mode == "subscription"
 
 
 # ============================================================================
@@ -4465,19 +4218,108 @@ def runbook_reference_problems(text: str, repo_root: Path) -> list[str]:
 
 RUNBOOK_PATH = REPO_ROOT / "docs" / "providers" / "claude-subscription.md"
 
+# The three state-dependent constants of H65 (the only literals the post-evidence commit may
+# change) and the state-independent ones.  At the tested commit every live-proven cell is
+# ``NOT_YET_CELL``.
 RUNBOOK_STATUS_STATEMENT = (
     "No passing official evidence exists yet. The readiness-only check passed once during "
-    "development. The first official validation attempt was retained as a non-official failure "
-    "record, which authorizes nothing. Any future readiness or official operation requires fresh "
-    "explicit human approval, and no retry is ever automatic."
+    "development. Two earlier official validation attempts were retained as non-official failure "
+    "records; in both, the readiness and subscription-inference steps were observed to succeed "
+    "before a later credential-precedence step, since retired, failed without a typed "
+    "authentication signal. These records are not evidence: they are never reclassified, "
+    "authorize nothing and support no claim. Any future readiness or official operation requires "
+    "fresh explicit human approval, and no retry is ever automatic."
 )
+EXPERIMENTAL_VALIDATION_CLAUSE = (
+    "This detection currently relies on CLI-reported `apiProvider` / `subscriptionType` evidence "
+    "that has not yet been validated against a live Claude CLI session;"
+)
+NOT_YET_CELL = "*not yet*"
+VALIDATED_CELL = "yes (official live validation)"
+LIVE_PROVEN_CELLS = {
+    "Readiness (`claude auth status --json`)": NOT_YET_CELL,
+    "`billing_mode == subscription` derivation": NOT_YET_CELL,
+    "`API-equivalent estimate` label": NOT_YET_CELL,
+    "Bundled CLI reads the user's login": NOT_YET_CELL,
+    "Live harness (L0, L1)": NOT_YET_CELL,
+}
+# row -> (Live-proven cell, or ``None`` when the row is state-dependent, Unverified cell)
+FIXED_STATUS_ROWS = {
+    "`auth_mode` resolution and env blanking": ("not applicable (offline property, R2b′)", "—"),
+    "Readiness (`claude auth status --json`)": (None, "real field values (L0)"),
+    "`billing_mode == subscription` derivation": (
+        None,
+        '`"firstParty"` constant, `subscriptionType` presence',
+    ),
+    "`API-equivalent estimate` label": (None, "real console output"),
+    "`auto` + API key ⇒ `metered_api`": (
+        "out of scope",
+        "auto-mode credential precedence (unproven, R2′)",
+    ),
+    "Cloud-selector / `setting_sources` refusal": ("not applicable", "managed/enterprise settings"),
+    "Hard session timeout / interrupt": ("not in this PR", "real-CLI timing"),
+    "Bundled CLI reads the user's login": (None, "cross-version compatibility"),
+    "Live harness (L0, L1)": (None, "every real-CLI behavior above"),
+    "`conductor run` entry point on a real login": ("*manual step only*", "—"),
+}
 STALE_RUNBOOK_STATEMENTS = (
     "No live validation has been run yet.",
     "No live run has been performed, so there is no live result to report.",
     "neither has been run",
     "none has been run",
     "means no passing official evidence exists",  # the removed reinterpretation wording
+    "The first official validation attempt was retained",  # the revision-14 statement
 )
+# A claim that the automated harness never exercised a real CLI contradicts the recorded history
+# and any later official evidence; neither the sentence nor an equivalent wording may return.
+CONTRADICTORY_HARNESS_CLAIM_RE = re.compile(r"nothing\s+on\s+this\s+page\s+claims", re.IGNORECASE)
+# A harness together with a CLI, login or inference and an execution verb, in any order, active or
+# passive: within one sentence, and within one whole Markdown table line.
+HARNESS_SENTENCE_TERMS = (
+    re.compile(r"\bharness\b", re.IGNORECASE),
+    re.compile(r"\b(?:clis?|logins?|inference)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:exercis\w*|runs?|ran|running|executed|tested)\b|"
+        r"(?<!['\u2019]s )(?<!\bthe )(?<!\bits )(?<!\bunit )(?<!\boffline )\btests?\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _makes_harness_claim(unit: str) -> bool:
+    return all(term.search(unit) for term in HARNESS_SENTENCE_TERMS)
+
+
+def contradictory_harness_claims(text: str) -> list[str]:
+    """Sentences and whole table lines (inline code is not prose) making such a claim."""
+
+    def prose(unit: str) -> str:
+        return re.sub(r"`[^`]*`", " ", unit)
+
+    lines = text.splitlines()
+    table_lines = [prose(line) for line in lines if "|" in line]
+    flat = prose(normalized(text)).replace("|", ". ")
+    sentences = re.split(r"(?<=[.!?])\s+", flat)
+    return [u for u in (*sentences, *table_lines) if _makes_harness_claim(u)]
+
+
+# ``exception_class`` is present whenever a case raised an exception, interrupted or not.
+INTERRUPT_ONLY_EXCEPTION_CLASS_RE = re.compile(
+    r"interrupted\s+case\s+only[^.]{0,40}`exception_class`|"
+    r"`exception_class`[^.]{0,80}(?:only|solely)\s+(?:for|when|if)\s+an?\s+interrupt",
+    re.IGNORECASE,
+)
+
+
+def stale_claim_problems(text: str) -> list[str]:
+    flat = normalized(text)
+    problems = [f"stale statement: {stale}" for stale in STALE_RUNBOOK_STATEMENTS if stale in flat]
+    if CONTRADICTORY_HARNESS_CLAIM_RE.search(flat) or contradictory_harness_claims(text):
+        problems.append("a claim that the harness never exercised a real CLI")
+    if INTERRUPT_ONLY_EXCEPTION_CLASS_RE.search(flat):
+        problems.append("exception_class described as interrupted-only")
+    return problems
+
 
 # Every statement the maintainer section must make (design 13.2.1), as exact text.
 REQUIRED_RUNBOOK_STATEMENTS = (
@@ -4491,7 +4333,6 @@ REQUIRED_RUNBOOK_STATEMENTS = (
     "**never signals**",
     "API-equivalent estimate",
     "not** invoices",
-    "makes no such claim",
     RUNBOOK_STATUS_STATEMENT,
     "readiness-only check",
     "official live validation",
@@ -4610,10 +4451,10 @@ def runbook_contract_problems(text: str) -> list[str]:
         problems.append("claims that reaching the gate fixture guarantees fixed lines")
     if not re.search(r"\*\*one\*\*\s+authentication probe", text):
         problems.append("the readiness-only probe count is not stated as one")
-    if not re.search(r"\*\*five\*\*\s+authentication probes", text):
-        problems.append("the official probe count is not stated as five")
-    if re.search(r"\bthree\b[^.\n]*\bprobes?\b", text, flags=re.IGNORECASE):
-        problems.append("a stale three-probe count")
+    if not re.search(r"\*\*three\*\*\s+authentication probes", text):
+        problems.append("the official probe count is not stated as three")
+    if re.search(r"\bfive\b[^.\n]*\bprobes?\b", text, flags=re.IGNORECASE):
+        problems.append("a stale five-probe count")
     return problems
 
 
@@ -4674,11 +4515,48 @@ class TestRunbookReferences:
     def test_the_real_runbook_satisfies_the_contract(self) -> None:
         text = RUNBOOK_PATH.read_text()
         assert runbook_contract_problems(text) == []
-        assert text.count("*not yet*") >= 6  # every live-proven cell still reads "not yet"
         flat = normalized(text)
         assert flat.count(RUNBOOK_STATUS_STATEMENT) == 4  # intro, status, operations, commands
-        for stale in STALE_RUNBOOK_STATEMENTS:
-            assert stale not in flat, stale
+        assert stale_claim_problems(text) == []
+        assert "includes interrupted cases but is not limited to them" in flat
+        assert "non-interrupted L0 or L1 failure may carry it too" in flat
+        v6 = next(line for line in text.splitlines() if line.startswith("| **V6** |"))
+        assert "`exception_class`" in v6
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            "Nothing on this page claims that a real Claude CLI, login or inference has been "
+            "exercised by the automated harness.",
+            "Nothing on this page claims anything about a real login.",
+            "A real Claude CLI, login or inference has been exercised by the automated harness.",
+            "A real Claude login has not been exercised by the automated harness.",
+            "The automated harness never exercised a real CLI, login or inference.",
+            "A real CLI, login or inference has not been exercised by the harness.",
+            "A real CLI, login or inference has not been exercised by automated harness.",
+            "A real CLI, login or inference has not been exercised by the automated test harness.",
+            "A real CLI, login or inference has been run by the automated harness.",
+            "| Live harness | Real CLI, login and inference: never exercised |",
+        ],
+    )
+    def test_the_contradictory_harness_claim_is_rejected_in_any_wording(self, claim: str) -> None:
+        text = RUNBOOK_PATH.read_text()
+        assert stale_claim_problems(text) == []
+        assert stale_claim_problems(f"{text}\n{claim}\n")
+
+    def test_the_approved_history_statement_is_not_rejected(self) -> None:
+        assert stale_claim_problems(RUNBOOK_STATUS_STATEMENT) == []
+
+    @pytest.mark.parametrize(
+        "wording",
+        [
+            "and, for an interrupted case only, `exception_class`: the ASCII class name.",
+            "`exception_class` appears only for an interrupt.",
+        ],
+    )
+    def test_exception_class_is_not_described_as_interrupted_only(self, wording: str) -> None:
+        assert stale_claim_problems(wording)
+        assert stale_claim_problems(RUNBOOK_PATH.read_text() + "\n" + wording)
 
     def test_the_runbook_commands_are_the_modules_authorized_commands(self) -> None:
         text = RUNBOOK_PATH.read_text()
@@ -4757,7 +4635,7 @@ class TestRunbookReferences:
                 "location line",
             ),
             ("-q --color=no", "-q -s --color=no", "command block uses -s"),
-            ("**five** authentication probes", "**three** authentication probes", "five"),
+            ("**three** authentication probes", "**five** authentication probes", "three"),
             ("**one**\n  authentication probe", "**two** authentication probe", "one"),
             ("outside the repository", "somewhere", "missing statement: outside"),
             ("before changing any documentation claim", "afterwards", "missing statement: before"),
@@ -4814,12 +4692,10 @@ class TestRunbookReferences:
         assert runbook_contract_problems("") != []
         assert runbook_contract_problems("readiness-only check") != []
 
-    def test_the_runbook_does_not_name_the_retired_streams(self) -> None:
+    def test_the_runbook_does_not_name_the_retired_machinery(self) -> None:
         text = RUNBOOK_PATH.read_text()
-        for retired in ("capfd", "capsys", "caplog", "raw_response"):
+        for retired in ("capfd", "capsys", "caplog", "raw_response", "canary_scan", "diag_"):
             assert retired not in text, retired
-        for stream in lm.REQUIRED_STREAMS:
-            assert f"`{stream}`" in text, stream
 
     def test_the_runbook_does_not_overclaim_or_install(self) -> None:
         text = RUNBOOK_PATH.read_text()
@@ -5059,11 +4935,14 @@ class TestDescendants:
         wrapped = lm.with_descendant_check(
             runner, read_table=read, root_pid=self.ROOT, board=board, clock=clock, sleep=clock.sleep
         )
+        raised: BaseException | None = None
         with monkeypatch.context() as scoped:
             no_signals(scoped)
-            with pytest.raises(RuntimeError) as info:
+            try:
                 await wrapped(lm.Case.L1)
-        assert info.value is failure  # the runner's own exception, unchanged
+            except BaseException as exc:
+                raised = exc
+        assert raised is failure  # the runner's own exception, unchanged
         findings = board.for_case(lm.Case.L1)
         assert findings.descendant_leak
         assert findings.descendant_report == [{"pid": self.ROOT + 1, "name": "leaky"}]
@@ -5115,8 +4994,8 @@ class TestDescendants:
         with pytest.raises(ValueError, match="kept"):
             await lm.with_descendant_check(failing, **kwargs)(lm.Case.L1)
         assert board.for_case(lm.Case.L1).descendants is lm.Outcome.NO_DESCENDANTS_REMAINING
-        assert await lm.with_descendant_check(fine, **kwargs)(lm.Case.L3) is lm.Outcome.OK
-        assert board.for_case(lm.Case.L3).descendants is lm.Outcome.NO_DESCENDANTS_REMAINING
+        assert await lm.with_descendant_check(fine, **kwargs)(lm.Case.L0) is lm.Outcome.OK
+        assert board.for_case(lm.Case.L0).descendants is lm.Outcome.NO_DESCENDANTS_REMAINING
 
     def test_positive_control_real_ps_sees_an_owned_child(
         self, monkeypatch: pytest.MonkeyPatch
@@ -5145,7 +5024,7 @@ class TestDescendants:
 
 
 # ============================================================================
-# H18 / H19 / H20: cancellation, precedence and canary_scan, through the case wrapper
+# H18 / H19: cancellation and precedence, through the case wrapper
 # ============================================================================
 
 ROOT_PID = 4242
@@ -5164,7 +5043,7 @@ class Driven:
         self.marks: list[str] = []
         self.result: lm.SessionResult | None = None
         self.raised: BaseException | None = None
-        self.board = lm.FindingsBoard(CANARY)
+        self.board = lm.FindingsBoard()
 
     def case_records(self) -> list[dict[str, object]]:
         return [r for r in self.records if "case" in r]
@@ -5177,8 +5056,7 @@ def drive(
     script: object,
     *,
     cases: Sequence[lm.Case] = (S.L1,),
-    canary_in: str | None = None,
-    incomplete: bool = False,
+    at: lm.Case | None = None,
     descendant: bool = False,
     observation_error: bool = False,
     emit_error: bool = False,
@@ -5186,19 +5064,20 @@ def drive(
     emit_fails: Callable[[dict[str, object]], bool] | None = None,
     mark: Callable[[str], None] | None = None,
 ) -> Driven:
-    """Run ``script`` (an outcome, or an exception the runner raises) through the wrappers."""
+    """Run ``script`` (an outcome, or an exception the runner raises) through the wrappers.
+
+    ``at`` names the one case that raises ``script`` (every other case returns ``ok``); by default
+    every case does.  ``assembly_error`` breaks the record assembly of that same case.
+    """
     out = Driven()
     clock = Clock()
     table: dict[int, tuple[int, str]] = {}
+    ordered = list(cases)
 
     async def runner(case: lm.Case) -> Any:
         out.called.append(case)
-        streams = clean_streams()
-        if canary_in is not None:
-            streams[canary_in] = f"leaked {CANARY}"
-        if incomplete:
-            del streams["events"]
-        out.board.for_case(case).record_streams(CANARY, streams)
+        if at is not None and case is not at:
+            return O.OK
         if descendant:
             table[ROOT_PID + 1] = (ROOT_PID, "leaky")
         if isinstance(script, BaseException):
@@ -5218,10 +5097,13 @@ def drive(
         out.records.append(record)
 
     ticks = {"n": 0}
+    breaks_at = 2 * (ordered.index(at) + 1 if at is not None else 1)
 
     def case_clock() -> float:
         ticks["n"] += 1
-        if assembly_error and ticks["n"] >= 2:  # the case record is assembled after the case
+        if (
+            assembly_error and ticks["n"] >= breaks_at
+        ):  # the case record is assembled after the case
             raise RuntimeError("PLANTED-assembly-4417")
         return float(ticks["n"])
 
@@ -5269,62 +5151,53 @@ INTERRUPTS = [
     pytest.param(OtherInterrupt, "other_base_exception", id="other-BaseException"),
 ]
 FINDING_ROWS = [
-    pytest.param(None, False, [], id="no-findings"),  # (a) / (c)
-    pytest.param("console", False, ["canary_leak"], id="canary"),  # (b) / (d)
-    pytest.param(None, True, ["descendant_leak"], id="descendant"),  # (e)
-    pytest.param("logs", True, ["canary_leak", "descendant_leak"], id="both"),  # (f)
+    pytest.param(False, [], id="no-findings"),  # (a) / (b)
+    pytest.param(True, ["descendant_leak"], id="descendant"),  # (c) / (d)
 ]
+BOTH_CASES = [pytest.param(S.L0, id="L0"), pytest.param(S.L1, id="L1")]
 
 
 class TestCancellationContract:
-    """H18: the original interrupt is primary and is re-raised unchanged."""
+    """H18: the original interrupt is primary and is re-raised unchanged, in L0 and in L1."""
 
+    @pytest.mark.parametrize("where", BOTH_CASES)
     @pytest.mark.parametrize(("factory", "kind"), INTERRUPTS)
-    @pytest.mark.parametrize(("canary_in", "descendant", "secondary"), FINDING_ROWS)
+    @pytest.mark.parametrize(("descendant", "secondary"), FINDING_ROWS)
     def test_original_exception_object_is_reraised_with_secondary_findings(
         self,
         factory: type[BaseException],
         kind: str,
-        canary_in: str | None,
         descendant: bool,
         secondary: list[str],
+        where: lm.Case,
     ) -> None:
         original = factory()
-        out = drive(
-            original,
-            cases=(S.L1, S.L3, S.L2),
-            canary_in=canary_in,
-            descendant=descendant,
-        )
+        out = drive(original, cases=(S.L0, S.L1), at=where, descendant=descendant)
         assert_preserved(out, original)
         assert out.result is None  # nothing was converted into an ordinary session result
-        (record,) = out.case_records()
-        assert record["case"] == "L1"
+        record = out.case_records()[-1]
+        assert record["case"] == where.value
         assert record["outcome"] == "interrupted"
         assert record["adapter_outcome"] == "interrupted"
         assert record["interrupted"] == kind
         assert record["secondary_findings"] == secondary
-        expected_scan = [
-            f"{name}:{'leak' if name == canary_in else 'clean'}" for name in lm.REQUIRED_STREAMS
-        ]
-        assert record["canary_scan"] == expected_scan
-        assert ("descendants" in record and record["descendants"] == "descendant_leak") == (
-            descendant
+        assert record["descendants"] == (
+            "descendant_leak" if descendant else "no_descendants_remaining"
         )
-        assert CANARY not in json.dumps(out.records)
-        # no later case runs, and each is recorded as not executed
-        assert out.called == [S.L1]
-        assert out.run_level()["not_executed"] == (
-            "L3:not_executed_after_interrupt,L2:not_executed_after_interrupt"
-        )
-        assert str(out.run_level()["primary_failure"]).startswith("L1:interrupted:")
-        for record in out.records:
-            lm.emit_evidence(record)  # every record passes the sanitizer
+        if where is S.L1:  # the earlier case completed and is untouched
+            assert out.case_records()[0]["outcome"] == "ok"
+            assert "not_executed" not in out.run_level()
+        else:  # no later case runs, and it is recorded as not executed
+            assert out.run_level()["not_executed"] == "L1:not_executed_after_interrupt"
+        assert out.called == [c for c in (S.L0, S.L1) if c.value <= where.value]
+        assert str(out.run_level()["primary_failure"]).startswith(f"{where.value}:interrupted:")
+        for item in out.records:
+            lm.emit_evidence(item)  # every record passes the sanitizer
 
     def test_the_descendant_check_alone_preserves_the_interrupt(self) -> None:
         original = KeyboardInterrupt()
         clock = Clock()
-        board = lm.FindingsBoard(CANARY)
+        board = lm.FindingsBoard()
         state = {"leaked": False}
 
         async def runner(case: lm.Case) -> lm.Outcome:
@@ -5346,9 +5219,9 @@ class TestCancellationContract:
         assert board.for_case(S.L1).descendant_leak  # recorded, not converted
 
     def test_asyncio_run_lets_keyboard_interrupt_escape_not_an_ordinary_failure(self) -> None:
-        """The worst case: a canary and a descendant on top of a Ctrl-C."""
+        """The worst case: a descendant on top of a Ctrl-C."""
         original = KeyboardInterrupt()
-        out = drive(original, canary_in="stdout_stderr", descendant=True)
+        out = drive(original, descendant=True)
         assert_preserved(out, original)
         with pytest.raises(KeyboardInterrupt):
             raise out.raised  # type: ignore[misc]
@@ -5367,26 +5240,26 @@ class TestCancellationContract:
         assert_preserved(out, original)
 
     def test_an_ordinary_exception_is_still_an_ordinary_failure(self) -> None:
-        out = drive(RuntimeError("boom"), cases=(S.L1, S.L3))
+        out = drive(RuntimeError("boom"), cases=(S.L0, S.L1))
         assert out.raised is None and out.result is not None
         assert out.result.results[0].outcome is O.CASE_FAILED
-        assert out.result.results[1].outcome is O.NOT_EXECUTED_AFTER_L1_FAILURE
+        assert out.result.results[1].outcome is O.NOT_EXECUTED_AFTER_L0_FAILURE
         assert out.case_records()[0]["interrupted"] == "none"
 
-    def test_an_interrupt_before_any_case_state_is_recorded_still_reraises(self) -> None:
-        """A pre-hook that is interrupted never starts the case, and is not converted."""
+    def test_an_interrupt_from_the_quota_guard_still_reraises(self) -> None:
+        """An interrupt before the runner starts is recorded and never converted."""
         original = KeyboardInterrupt()
 
-        def hook() -> None:
-            raise original
+        class Guard(lm.QuotaCounter):
+            def begin_attempt(self) -> None:
+                raise original
 
         async def go() -> None:
             await lm.run_ordered_cases(
                 {S.L1: Scripted({}, lm.QuotaCounter()).runners()[S.L1]},
-                quota=lm.QuotaCounter(),
+                quota=Guard(),
                 emit=lambda r: None,
                 cases=(S.L1,),
-                pre_hooks={S.L1: hook},
             )
 
         with pytest.raises(KeyboardInterrupt) as info:
@@ -5406,12 +5279,15 @@ FALLBACK_FIELDS = {
     "exception_class",
     "cleanup_failed",
     "secondary_findings",
-    "canary_scan",
 }
 
 
-def only_marker(out: Driven) -> None:
-    assert out.marks == [lm.fallback_failure_marker(S.L1)] == ["evidence_fallback_failed: L1"]
+def only_marker(out: Driven, case: lm.Case = S.L1) -> None:
+    assert (
+        out.marks
+        == [lm.fallback_failure_marker(case)]
+        == [f"evidence_fallback_failed: {case.value}"]
+    )
     assert out.case_records() == []  # no record at all: the marker is the only report
     assert "PLANTED" not in json.dumps(out.marks) and "PLANTED" not in json.dumps(out.records)
 
@@ -5419,50 +5295,43 @@ def only_marker(out: Driven) -> None:
 class TestFallbackEvidence:
     """H32: the record emitted when normal evidence assembly fails during a cancellation."""
 
+    @pytest.mark.parametrize("where", BOTH_CASES)
     @pytest.mark.parametrize(("factory", "kind"), INTERRUPTS)
     def test_the_fallback_carries_every_required_field(
-        self, factory: type[BaseException], kind: str
+        self, factory: type[BaseException], kind: str, where: lm.Case
     ) -> None:
         original = factory()
-        out = drive(original, cases=(S.L1, S.L3), assembly_error=True)
+        out = drive(original, cases=(S.L0, S.L1), at=where, assembly_error=True)
         assert_preserved(out, original)
-        (record,) = out.case_records()
-        assert set(record) == {*FALLBACK_FIELDS, "descendants"}
+        record = out.case_records()[-1]
+        assert set(record) == {*FALLBACK_FIELDS, "descendants"}  # and no attempted_quota_execution
         assert record["descendants"] == "no_descendants_remaining"
-        assert record["case"] == "L1"
+        assert record["case"] == where.value
         assert record["outcome"] == record["adapter_outcome"] == "interrupted"
         assert record["interrupted"] == kind
         assert record["exception_class"] == type(original).__name__
         assert record["cleanup_failed"] == ["evidence"]
         assert record["secondary_findings"] == []
-        assert record["canary_scan"] == [f"{name}:clean" for name in lm.REQUIRED_STREAMS]
-        assert len(record["canary_scan"]) == 8  # type: ignore[arg-type]
         assert out.marks == []
-        assert out.called == [S.L1]  # no later case runs
-        assert out.run_level()["not_executed"] == "L3:not_executed_after_interrupt"
+        assert out.called == [c for c in (S.L0, S.L1) if c.value <= where.value]  # no later case
+        if where is S.L0:
+            assert out.run_level()["not_executed"] == "L1:not_executed_after_interrupt"
         assert "PLANTED" not in json.dumps(out.records)
 
     @pytest.mark.parametrize(("factory", "kind"), INTERRUPTS)
-    @pytest.mark.parametrize(("canary_in", "descendant", "secondary"), FINDING_ROWS)
+    @pytest.mark.parametrize(("descendant", "secondary"), FINDING_ROWS)
     def test_no_finding_is_lost(
         self,
         factory: type[BaseException],
         kind: str,
-        canary_in: str | None,
         descendant: bool,
         secondary: list[str],
     ) -> None:
         original = factory()
-        out = drive(original, canary_in=canary_in, descendant=descendant, assembly_error=True)
+        out = drive(original, descendant=descendant, assembly_error=True)
         assert_preserved(out, original)
         (record,) = out.case_records()
         assert record["secondary_findings"] == secondary  # never hard-coded empty
-        scan = scan_of(record)
-        assert len(scan) == 8
-        leaks = [entry for entry in scan if entry.endswith(":leak")]
-        assert leaks == ([f"{canary_in}:leak"] if canary_in else [])
-        # a record that says ``leak`` always says ``canary_leak``, and the reverse
-        assert ("canary_leak" in secondary) == bool(leaks)
         if descendant:
             assert record["descendants"] == "descendant_leak"
             assert record["descendant_report"] == [{"pid": ROOT_PID + 1, "name": "leaky"}]
@@ -5470,7 +5339,6 @@ class TestFallbackEvidence:
             assert record["descendants"] == "no_descendants_remaining"
             assert "descendant_report" not in record
         assert record["cleanup_failed"] == ["evidence"]
-        assert CANARY not in json.dumps(out.records)
 
     @pytest.mark.parametrize(
         "name",
@@ -5479,63 +5347,33 @@ class TestFallbackEvidence:
     def test_an_unsafe_exception_class_becomes_unknown_exception(self, name: str) -> None:
         for assembly_error in (True, False):
             original = named(name, BaseException)
-            out = drive(original, canary_in="logs", assembly_error=assembly_error)
+            out = drive(original, descendant=True, assembly_error=assembly_error)
             assert out.raised is original
             (record,) = out.case_records()
             assert record["exception_class"] == "unknown_exception"
-            assert record["secondary_findings"] == ["canary_leak"]  # the finding is not dropped
-            assert "logs:leak" in record["canary_scan"]  # type: ignore[operator]
+            assert record["secondary_findings"] == ["descendant_leak"]  # the finding is not dropped
             assert name.strip() == "" or name not in json.dumps(out.records)
             assert str(out.run_level()["primary_failure"]).endswith(":unknown_exception")
 
-    def test_both_findings_and_a_failing_observation_are_all_kept(self) -> None:
+    def test_a_descendant_and_a_failing_observation_are_all_kept(self) -> None:
         original = KeyboardInterrupt()
-        out = drive(
-            original,
-            canary_in="console",
-            descendant=True,
-            observation_error=True,
-            assembly_error=True,
-        )
+        out = drive(original, descendant=True, observation_error=True, assembly_error=True)
         assert_preserved(out, original)
         (record,) = out.case_records()
         assert record["cleanup_failed"] == ["descendants", "evidence"]  # in cleanup order
-        assert record["secondary_findings"] == ["canary_leak"]  # no descendant was observed
+        assert record["secondary_findings"] == []  # no descendant was observed
         assert record["outcome"] == "interrupted"
 
     def test_the_fallback_is_built_from_the_findings_not_the_failed_record(self) -> None:
         """The clock that broke the normal record is never consulted again."""
         findings = lm.CaseFindings(S.L1)
-        findings.record_streams(CANARY, {**clean_streams(), "events": f"x {CANARY}"})
         findings.descendants = O.DESCENDANT_LEAK
         findings.descendant_report = [{"pid": 7, "name": "leaky"}]
         findings.cleanup_failed.append("evidence")
-        record = lm._fallback_record(findings, CANARY, case=S.L1, interrupt=KeyboardInterrupt())
+        record = lm._fallback_record(findings, case=S.L1, interrupt=KeyboardInterrupt())
         assert set(record) == {*FALLBACK_FIELDS, "descendants", "descendant_report"}
-        assert record["secondary_findings"] == ["canary_leak", "descendant_leak"]
-        assert record["canary_scan"][4] == "events:leak"  # type: ignore[index]
-        assert lm.evidence(**record) == record  # validated, with its canary_scan
-        assert len(record["canary_scan"]) == 8  # type: ignore[arg-type]
-
-    def test_a_fallback_missing_canary_scan_is_rejected_not_swallowed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        real = lm.evidence
-
-        def without_scan(**fields: object) -> dict[str, object]:
-            if "cleanup_failed" in fields:
-                fields.pop("canary_scan", None)
-            return real(**fields)
-
-        monkeypatch.setattr(lm, "evidence", without_scan)
-        with pytest.raises(lm.EvidenceError):
-            lm._fallback_record(
-                lm.CaseFindings(S.L1), CANARY, case=S.L1, interrupt=KeyboardInterrupt()
-            )
-        original = KeyboardInterrupt()
-        out = drive(original, assembly_error=True)
-        assert_preserved(out, original)
-        only_marker(out)  # detected: nothing is emitted silently, the fixed marker is reported
+        assert record["secondary_findings"] == ["descendant_leak"]
+        assert lm.evidence(**record) == record  # validated
 
     def test_a_failing_fallback_format_reports_only_the_fixed_marker(
         self, monkeypatch: pytest.MonkeyPatch
@@ -5549,22 +5387,28 @@ class TestFallbackEvidence:
 
         monkeypatch.setattr(lm, "evidence", refuse)
         original = asyncio.CancelledError("PLANTED-original-4417")
-        out = drive(original, cases=(S.L1, S.L3), assembly_error=True, canary_in="logs")
+        out = drive(original, cases=(S.L0, S.L1), at=S.L0, assembly_error=True, descendant=True)
         assert_preserved(out, original)
-        only_marker(out)
-        assert out.called == [S.L1]  # still no later case
+        only_marker(out, S.L0)
+        assert out.called == [S.L0]  # still no later case
 
-    def test_a_failing_fallback_emission_reports_only_the_fixed_marker(self) -> None:
+    @pytest.mark.parametrize("where", BOTH_CASES)
+    def test_a_failing_fallback_emission_reports_only_the_fixed_marker(
+        self, where: lm.Case
+    ) -> None:
         original = KeyboardInterrupt("PLANTED-original-4417")
         out = drive(
             original,
+            cases=(S.L0, S.L1),
+            at=where,
             assembly_error=True,
             emit_fails=lambda record: "cleanup_failed" in record,
             descendant=True,
-            canary_in="events",
         )
         assert_preserved(out, original)
-        only_marker(out)
+        assert out.marks == [f"evidence_fallback_failed: {where.value}"]
+        assert "PLANTED" not in json.dumps(out.marks) and "PLANTED" not in json.dumps(out.records)
+        assert [r["case"] for r in out.case_records()] == (["L0"] if where is S.L1 else [])
 
     def test_when_even_the_marker_fails_nothing_is_printed_and_the_interrupt_propagates(
         self,
@@ -5589,7 +5433,7 @@ class TestFallbackEvidence:
     def test_the_marker_is_fixed_text_for_every_case(self) -> None:
         for case in lm.Case:
             assert re.fullmatch(
-                r"evidence_fallback_failed: L[0-3]", lm.fallback_failure_marker(case)
+                r"evidence_fallback_failed: L[01]", lm.fallback_failure_marker(case)
             )
         with pytest.raises(ValueError):
             lm.fallback_failure_marker("PLANTED-not-a-case")  # type: ignore[arg-type]
@@ -5601,6 +5445,7 @@ class TestFallbackEvidence:
         mark = lm._default_marker(config)
         mark("PLANTED-free-text-4417")
         mark("evidence_fallback_failed: L9")
+        mark("evidence_fallback_failed: L3")  # a retired case name
         mark("evidence_fallback_failed: L1\nmore")
         mark("evidence_fallback_failed: L1")
         assert plugin.evidence_lines == ["evidence_fallback_failed: L1"]
@@ -5738,12 +5583,12 @@ class TestCleanupSchema:
         out = drive(KeyboardInterrupt(), observation_error=True, assembly_error=True)
         assert out.case_records()[0]["cleanup_failed"] == ["descendants", "evidence"]
 
-    @pytest.mark.parametrize(("canary_in", "descendant", "secondary"), FINDING_ROWS)
+    @pytest.mark.parametrize(("descendant", "secondary"), FINDING_ROWS)
     def test_it_never_overrides_the_cancellation_or_hides_a_finding(
-        self, canary_in: str | None, descendant: bool, secondary: list[str]
+        self, descendant: bool, secondary: list[str]
     ) -> None:
         original = KeyboardInterrupt()
-        out = drive(original, canary_in=canary_in, descendant=descendant, assembly_error=True)
+        out = drive(original, descendant=descendant, assembly_error=True)
         assert_preserved(out, original)
         (record,) = out.case_records()
         assert record["outcome"] == "interrupted"
@@ -5836,461 +5681,76 @@ class TestStaleLiteralHygiene:
 
 
 def precedence_rows() -> list[Any]:
-    """Every ordinary row T1-T7 of the design's precedence table."""
+    """Every ordinary row of the design's precedence table (revision 15: T1, T3, T6)."""
     timeout = TimeoutError("timed out")
     return [
-        # id, cases, script, canary_in, descendant, incomplete, primary, secondary, adapter
+        # id, cases, at, script, descendant, primary, secondary, adapter
+        ("T1", (S.L0, S.L1), S.L1, O.INCONCLUSIVE, False, O.INCONCLUSIVE, [], O.INCONCLUSIVE),
+        ("T3-l1", (S.L0, S.L1), S.L1, O.OK, True, O.DESCENDANT_LEAK, [], O.OK),
+        ("T3-l0", (S.L0, S.L1), S.L0, O.OK, True, O.DESCENDANT_LEAK, [], O.OK),
+        ("T6", (S.L0, S.L1), S.L1, timeout, True, O.DESCENDANT_LEAK, [], O.CASE_FAILED),
         (
-            "T1",
-            (S.L1, S.L3),
-            O.INCONCLUSIVE,
-            None,
+            "scripted-descendant-outcome",
+            (S.L0, S.L1),
+            S.L1,
+            lm.HarnessFailure(O.DESCENDANT_LEAK),
             False,
-            False,
-            O.INCONCLUSIVE,
+            O.DESCENDANT_LEAK,
             [],
-            O.INCONCLUSIVE,
-        ),
-        ("T2", (S.L1, S.L3), O.OK, "console", False, False, O.CANARY_LEAK, [], O.OK),
-        ("T3", (S.L1, S.L3), O.OK, None, True, False, O.DESCENDANT_LEAK, [], O.OK),
-        (
-            "T4",
-            (S.L1, S.L3),
-            O.INCONCLUSIVE,
-            "console",
-            True,
-            False,
-            O.CANARY_LEAK,
-            [O.DESCENDANT_LEAK],
-            O.INCONCLUSIVE,
-        ),
-        ("T5", (S.L1, S.L3), O.OK, "events", False, False, O.CANARY_LEAK, [], O.OK),
-        (
-            "T5-both",
-            (S.L1, S.L3),
-            O.OK,
-            "events",
-            True,
-            False,
-            O.CANARY_LEAK,
-            [O.DESCENDANT_LEAK],
-            O.OK,
-        ),
-        (
-            "T6",
-            (S.L3, S.L2),
-            timeout,
-            "exceptions",
-            True,
-            False,
-            O.CANARY_LEAK,
-            [O.DESCENDANT_LEAK],
-            O.INCONCLUSIVE,
-        ),
-        (
-            "T7-incomplete",
-            (S.L1, S.L3),
-            O.OK,
-            None,
-            False,
-            True,
-            O.CANARY_SCAN_INCOMPLETE,
-            [],
-            O.OK,
-        ),
-        ("T7-descendant", (S.L1, S.L3), O.OK, None, True, True, O.DESCENDANT_LEAK, [], O.OK),
-        (
-            "leak-beats-incomplete",
-            (S.L1, S.L3),
-            O.OK,
-            "tmp_files",
-            False,
-            True,
-            O.CANARY_LEAK,
-            [],
-            O.OK,
-        ),
-        (
-            "scripted-canary-outcome",
-            (S.L1, S.L3),
-            lm.HarnessFailure(O.CANARY_LEAK),
-            None,
-            True,
-            False,
-            O.CANARY_LEAK,
-            [O.DESCENDANT_LEAK],
-            O.CANARY_LEAK,
+            O.DESCENDANT_LEAK,
         ),
     ]
 
 
 class TestOutcomePrecedence:
-    """H19: canary leak > descendant leak > incomplete scan > adapter outcome."""
+    """H19: descendant leak > adapter outcome; the cancellation rows are H18."""
 
     @pytest.mark.parametrize("row", precedence_rows(), ids=lambda r: r[0])
     def test_row(self, row: tuple[Any, ...]) -> None:
-        _, cases, script, canary_in, descendant, incomplete, primary, secondary, adapter = row
-        out = drive(
-            script, cases=cases, canary_in=canary_in, descendant=descendant, incomplete=incomplete
-        )
+        _, cases, at, script, descendant, primary, secondary, adapter = row
+        out = drive(script, cases=cases, at=at, descendant=descendant)
         assert out.result is not None and out.raised is None
-        first = out.result.results[0]
-        assert first.outcome is primary
-        assert first.secondary == tuple(secondary)
-        assert first.adapter_outcome is adapter
-        (record, *_) = out.case_records()
+        index = list(cases).index(at)
+        result = out.result.results[index]
+        assert result.outcome is primary
+        assert result.secondary == tuple(secondary)
+        assert result.adapter_outcome is adapter
+        record = out.case_records()[index]
         assert record["outcome"] == primary.value
         assert record["adapter_outcome"] == adapter.value
         assert record["secondary_findings"] == [o.value for o in secondary]
         assert record["interrupted"] == "none"
         # the abort behaviour follows the primary outcome: no later case runs
-        assert out.called == [cases[0]]
-        assert out.result.results[1].status == "not_executed"
-        if primary in lm.SAFETY_OUTCOMES:
-            assert {r.outcome for r in out.result.results[1:]} == {
-                O.NOT_EXECUTED_AFTER_SAFETY_FAILURE
-            }
-        # the aggregate keeps the primary and lists every secondary finding
+        assert out.called == list(cases[: index + 1])
+        if primary in lm.SAFETY_OUTCOMES and index + 1 < len(cases):
+            later = out.result.results[index + 1]
+            assert (later.status, later.outcome) == (
+                "not_executed",
+                O.NOT_EXECUTED_AFTER_SAFETY_FAILURE,
+            )
+        # the aggregate and the run-level record name the primary enum with the case prefix
         text = lm.aggregate_text(out.result)
-        assert f"first_failure: {cases[0].value}:{primary.value}:" in text
-        for finding in secondary:
-            assert f"{cases[0].value}:{finding.value}" in text.split("also:")[1]
-        assert CANARY not in text and CANARY not in json.dumps(out.records)
+        assert f"first_failure: {at.value}:{primary.value}:" in text
+        assert lm.run_level_record(out.result)["primary_failure"].startswith(  # type: ignore[union-attr]
+            f"{at.value}:{primary.value}:"
+        )
 
     def test_a_passing_adapter_never_masks_a_leak(self) -> None:
-        out = drive(O.OK, canary_in="workflow_result")
+        out = drive(O.OK, descendant=True)
         assert out.result is not None
-        assert out.result.results[0].outcome is O.CANARY_LEAK
+        assert out.result.results[0].outcome is O.DESCENDANT_LEAK
         assert not out.result.succeeded
         with pytest.raises(pytest.fail.Exception):
             lm.finalize(out.result)
 
-    def test_the_resolution_function_covers_every_combination(self) -> None:
-        for canary in (False, True):
-            for descendant in (False, True):
-                for incomplete in (False, True):
-                    got = lm.resolve_outcome(
-                        O.INCONCLUSIVE,
-                        canary_leak=canary,
-                        descendant_leak=descendant,
-                        scan_incomplete=incomplete,
-                    )
-                    assert got.adapter_outcome is O.INCONCLUSIVE
-                    if canary:
-                        assert got.primary is O.CANARY_LEAK
-                        assert got.secondary == ((O.DESCENDANT_LEAK,) if descendant else ())
-                    elif descendant:
-                        assert (got.primary, got.secondary) == (O.DESCENDANT_LEAK, ())
-                    elif incomplete:
-                        assert (got.primary, got.secondary) == (O.CANARY_SCAN_INCOMPLETE, ())
-                    else:
-                        assert (got.primary, got.secondary) == (O.INCONCLUSIVE, ())
-
-
-class TestCanaryScanEvidence:
-    """H20: every case carries eight fixed strings, on every path, and never a value."""
-
-    @pytest.mark.parametrize("stream", lm.REQUIRED_STREAMS)
-    def test_a_canary_planted_in_each_stream_leaks_that_stream_only(self, stream: str) -> None:
-        out = drive(O.OK, canary_in=stream)
-        (record,) = out.case_records()
-        assert record["canary_scan"] == [
-            f"{name}:{'leak' if name == stream else 'clean'}" for name in lm.REQUIRED_STREAMS
-        ]
-        assert record["outcome"] == "canary_leak"
-        assert CANARY not in json.dumps(out.records)
-
-    @pytest.mark.parametrize(
-        "script",
-        [O.OK, O.INCONCLUSIVE, RuntimeError("x"), TimeoutError("t"), KeyboardInterrupt()],
-        ids=["success", "ordinary-failure", "exception", "timeout", "cancellation-cleanup"],
-    )
-    def test_emitted_on_every_path(self, script: object) -> None:
-        out = drive(script)
-        (record,) = out.case_records()
-        assert lm.scan_is_clean_and_complete(record["canary_scan"], "L1")
-        assert isinstance(record["canary_scan"], list) and len(record["canary_scan"]) == 8
-        assert [e.split(":")[0] for e in scan_of(record)] == list(lm.REQUIRED_STREAMS)
-
-    def test_a_case_that_never_reached_its_adapter_is_reported_as_produced_nothing(self) -> None:
-        """A refused case scanned nothing because nothing ran; the entry says so."""
-        result, _, emitted = run_machine(pre_hooks={S.L2: _raise(O.L2_L3_NOT_PAIRED)})
-        refused = next(r for r in emitted if r["case"] == "L2")
-        assert refused["canary_scan"] == list(lm.EMPTY_SCAN)
-        assert result.results[-1].outcome is O.L2_L3_NOT_PAIRED
-
-    def test_no_matched_text_canary_value_or_path_is_retained(self, tmp_path: Path) -> None:
-        out = drive(O.OK, canary_in="stdout_stderr", descendant=True)
-        text = json.dumps(out.records)
-        assert CANARY not in text and str(tmp_path) not in text and "leaked" not in text
-        for record in out.records:
-            for entry in cast("list[str]", record.get("canary_scan", [])):
-                assert re.fullmatch(
-                    r"(stdout_stderr|console|logs|exceptions|events|workflow_result|evidence"
-                    r"|tmp_files):(clean|leak|not_available)",
-                    entry,
-                )
-
-    def test_not_available_only_where_the_design_allows_it(self) -> None:
-        base = clean_streams()
-        for name in lm.REQUIRED_STREAMS:
-            streams = {**base, name: lm.NOT_AVAILABLE}
-            for case in ("L0", "L1", "L3", "L2"):
-                report = lm.scan_report(CANARY, streams, case=case)
-                allowed = name == "workflow_result" or (
-                    case == "L0" and name in ("console", "events")
-                )
-                assert report.incomplete is (not allowed), (name, case)
-                assert report.entries[lm.REQUIRED_STREAMS.index(name)] == f"{name}:not_available"
-                assert lm.scan_is_clean_and_complete(list(report.entries), case) is allowed
-
-    def test_a_missing_stream_is_incomplete_for_every_case_and_stream(self) -> None:
-        for name in lm.REQUIRED_STREAMS:
-            streams = clean_streams()
-            del streams[name]
-            assert lm.scan_report(CANARY, streams, case="L0").incomplete
-
-    def test_a_scan_error_is_incomplete_not_clean(self) -> None:
-        class Unscannable:
-            def __repr__(self) -> str:
-                raise RuntimeError("no repr")
-
-            def __str__(self) -> str:
-                raise RuntimeError("no str")
-
-        streams = clean_streams()
-        streams["events"] = Unscannable()
-        report = lm.scan_report(CANARY, streams, case="L1")
-        assert report.incomplete and "events:not_available" in report.entries
-
-    def test_a_leak_seen_at_emit_time_survives_a_later_clean_scan(self) -> None:
-        findings = lm.CaseFindings(S.L1)
-        findings.record_streams(CANARY, clean_streams(), forced_leaks=("logs",))
-        findings.record_streams(CANARY, clean_streams())  # the bounded buffer no longer holds it
-        assert findings.entries[lm.REQUIRED_STREAMS.index("logs")] == "logs:leak"
-        assert findings.canary_leak
-
-    def test_official_is_false_when_the_scan_is_incomplete_or_leaks(self) -> None:
-        assert lm.scan_is_clean_and_complete(list(lm.EMPTY_SCAN), "L1")
-        assert not lm.scan_is_clean_and_complete(["x"], "L1")
-        leaky = [
-            f"{n}:leak" if n == "logs" else e
-            for n, e in zip(lm.REQUIRED_STREAMS, lm.EMPTY_SCAN, strict=True)
-        ]
-        assert not lm.scan_is_clean_and_complete(leaky, "L1")
-        incomplete = [
-            f"{n}:not_available" if n == "events" else e
-            for n, e in zip(lm.REQUIRED_STREAMS, lm.EMPTY_SCAN, strict=True)
-        ]
-        assert not lm.scan_is_clean_and_complete(incomplete, "L1")
-        assert lm.scan_is_clean_and_complete(incomplete, "L0")
-
-
-# ============================================================================
-# H16: passive observer
-# ============================================================================
-
-
-class FakeInner:
-    def __init__(
-        self,
-        items: Sequence[object],
-        *,
-        raise_after: BaseException | None = None,
-        block: bool = False,
-    ) -> None:
-        self.items = list(items)
-        self.raise_after = raise_after
-        self.block = block
-        self.index = 0
-        self.aiter_calls = 0
-        self.aclose_calls = 0
-
-    def __aiter__(self) -> FakeInner:
-        self.aiter_calls += 1
-        return self
-
-    async def __anext__(self) -> object:
-        if self.index < len(self.items):
-            self.index += 1
-            return self.items[self.index - 1]
-        if self.block:
-            await asyncio.Event().wait()
-        if self.raise_after is not None:
-            raise self.raise_after
-        raise StopAsyncIteration
-
-    async def aclose(self) -> None:
-        self.aclose_calls += 1
-
-
-class FakeAssistant:
-    def __init__(self, error: object = None) -> None:
-        self.error = error
-        self.content = "SECRET-TEXT-NEVER-RECORDED"
-
-
-class FakeResult:
-    def __init__(self, status: object = None, is_error: object = None) -> None:
-        self.api_error_status = status
-        self.is_error = is_error
-        self.result = "SECRET-RESULT-NEVER-RECORDED"
-
-
-def make_client_class(inner: FakeInner) -> type:
-    class FakeClient:
-        original_calls = 0
-
-        def receive_response(self) -> FakeInner:
-            type(self).original_calls += 1
-            return inner
-
-    return FakeClient
-
-
-class TestObserver:
-    async def test_normal_completion_is_transparent(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        messages = [FakeAssistant("authentication_failed"), FakeResult(401, True)]
-        inner = FakeInner(messages)
-        client_cls = make_client_class(inner)
-        sink: list[lm.Observation] = []
-        with monkeypatch.context() as scoped:
-            lm.install_spy(scoped, client_cls, sink)
-            out = [m async for m in client_cls().receive_response()]
-        assert client_cls.original_calls == 1  # type: ignore[attr-defined]
-        assert inner.aiter_calls == 1  # iterated exactly once
-        assert len(out) == 2 and all(a is b for a, b in zip(out, messages, strict=True))
-        assert inner.aclose_calls == 1  # explicit, not left to garbage collection
-        assert sink == [
-            lm.Observation("FakeAssistant", "authentication_failed", None, None),
-            lm.Observation("FakeResult", None, 401, True),
-        ]
-
-    async def test_early_outer_close_finalizes_inner(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        inner = FakeInner([FakeResult(), FakeResult()])
-        client_cls = make_client_class(inner)
-        with monkeypatch.context() as scoped:
-            lm.install_spy(scoped, client_cls, [])
-            gen = client_cls().receive_response()
-            await gen.__anext__()
-            await gen.aclose()
-        assert inner.aclose_calls == 1
-        assert inner.index == 1  # nothing pre-fetched
-
-    async def test_unstarted_outer_needs_no_close(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        inner = FakeInner([FakeResult()])
-        client_cls = make_client_class(inner)
-        with monkeypatch.context() as scoped:
-            lm.install_spy(scoped, client_cls, [])
-            gen = client_cls().receive_response()
-            await gen.aclose()
-        assert client_cls.original_calls == 1  # type: ignore[attr-defined]
-        assert inner.aiter_calls == 0 and inner.aclose_calls == 0
-
-    async def test_exception_is_preserved_and_inner_closed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        boom = ValueError("same object")
-        inner = FakeInner([FakeResult()], raise_after=boom)
-        client_cls = make_client_class(inner)
-        with monkeypatch.context() as scoped:
-            lm.install_spy(scoped, client_cls, [])
-            with pytest.raises(ValueError) as info:
-                async for _ in client_cls().receive_response():
-                    pass
-        assert info.value is boom
-        assert inner.aclose_calls == 1
-
-    async def test_cancellation_is_preserved_and_inner_closed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        inner = FakeInner([FakeResult()], block=True)
-        client_cls = make_client_class(inner)
-        started = asyncio.Event()
-
-        async def consume() -> None:
-            async for _ in client_cls().receive_response():
-                started.set()
-
-        with monkeypatch.context() as scoped:
-            lm.install_spy(scoped, client_cls, [])
-            task = asyncio.create_task(consume())
-            await started.wait()
-            await asyncio.sleep(0)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-        assert inner.aclose_calls == 1
-
-    async def test_patch_is_removed_after_each_case_and_reinstallable(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        inner = FakeInner([])
-        client_cls = make_client_class(inner)
-        original = client_cls.__dict__["receive_response"]
-        for _ in range(2):
-            sink: list[lm.Observation] = []
-            with monkeypatch.context() as scoped:
-                lm.install_spy(scoped, client_cls, sink)
-                assert client_cls.__dict__["receive_response"] is not original
-            assert client_cls.__dict__["receive_response"] is original  # nothing survives
-
-    def test_recorder_keeps_typed_fields_only(self) -> None:
-        assert set(lm.Observation.__dataclass_fields__) == {
-            "type_name",
-            "assistant_error",
-            "api_error_status",
-            "is_error",
-        }
-        recorded = lm.record_observation(FakeAssistant("free text that is not a literal"))
-        assert recorded.assistant_error == "other"
-        assert "SECRET" not in repr(recorded)
-        assert "SECRET" not in repr(lm.record_observation(FakeResult(401)))
-
-    @pytest.mark.parametrize(
-        ("status", "expected"),
-        [
-            (401, 401),
-            (100, 100),
-            (599, 599),
-            (99, None),
-            (600, None),
-            (True, None),
-            ("401", None),
-            (None, None),
-            (401.0, None),
-        ],
-    )
-    def test_recorder_status_rules(self, status: object, expected: int | None) -> None:
-        assert lm.record_observation(FakeResult(status)).api_error_status == expected
-
-    def test_recorder_rejects_non_bool_is_error_and_unknown_error(self) -> None:
-        assert lm.record_observation(FakeResult(is_error="yes")).is_error is None
-        assert lm.record_observation(FakeResult(is_error=False)).is_error is False
-        assert lm.record_observation(object()).assistant_error is None
-
-    def test_missing_typed_signals_are_inconclusive(self) -> None:
-        error = ProviderError("x", is_retryable=False)
-        recorded = [lm.record_observation(FakeAssistant()), lm.record_observation(FakeResult())]
-        assert lm.classify_l3(recorded, [error], []) is lm.Outcome.INCONCLUSIVE
-        assert lm.classify_l3([], [error], []) is lm.Outcome.INCONCLUSIVE
-
-    def test_real_sdk_client_attribute_exists_and_is_restored(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        pytest.importorskip("claude_agent_sdk")
-        from claude_agent_sdk import ClaudeSDKClient
-
-        original = ClaudeSDKClient.__dict__["receive_response"]
-        with monkeypatch.context() as scoped:
-            lm.install_spy(scoped, ClaudeSDKClient, [])  # installs only; nothing is instantiated
-            assert ClaudeSDKClient.__dict__["receive_response"] is not original
-        assert ClaudeSDKClient.__dict__["receive_response"] is original
-
-
-# ============================================================================
-# Adapter seams with fakes
-# ============================================================================
+    def test_the_resolution_function_has_two_ranks(self) -> None:
+        for descendant in (False, True):
+            got = lm.resolve_outcome(O.INCONCLUSIVE, descendant_leak=descendant)
+            assert got.adapter_outcome is O.INCONCLUSIVE and got.secondary == ()
+            assert got.primary is (O.DESCENDANT_LEAK if descendant else O.INCONCLUSIVE)
+        assert lm.resolve_outcome(O.DESCENDANT_LEAK, descendant_leak=False).primary is (
+            O.DESCENDANT_LEAK
+        )
 
 
 def l0_fields(**overrides: object) -> dict[str, object]:
@@ -6317,7 +5777,7 @@ SUBSCRIPTION_USAGE: dict[str, object] = {
 
 
 def run_ok(**overrides: Any) -> lm.RunObservation:
-    """A complete, successful L1 / L2 observation; tests break exactly one part of it."""
+    """A complete, successful L1 observation; tests break exactly one part of it."""
     from conductor.billing import SUBSCRIPTION_LABEL
 
     base: dict[str, Any] = {
@@ -6328,7 +5788,6 @@ def run_ok(**overrides: Any) -> lm.RunObservation:
             }
         ],
         "exception": None,
-        "streams": clean_streams(),
         "total_cost_usd": 0.001,
         "effective_model": "claude-haiku-4-5-20251001",
         "fields": {},
@@ -6339,30 +5798,22 @@ def run_ok(**overrides: Any) -> lm.RunObservation:
     return lm.RunObservation(**{**base, **overrides})
 
 
-def run_invalid_key(sink: list[lm.Observation]) -> lm.RunObservation:
-    sink.append(obs(error="authentication_failed", status=401))
-    return lm.RunObservation(
-        events=[],
-        exception=ProviderError("rejected", is_retryable=False),
-        streams=clean_streams(),
-    )
-
-
 class FakeAdapterSet:
     """Fakes for every seam; every external entry is recorded in ``calls``."""
 
     def __init__(
         self,
-        script: dict[lm.Case, Callable[[list[lm.Observation]], lm.RunObservation]] | None = None,
+        script: Callable[[], lm.RunObservation] | None = None,
         *,
         ready: bool = True,
     ) -> None:
         self.calls: list[str] = []
-        self.script = script or {}
+        self.script = script or (lambda: run_ok())
         self.ready = ready
         self.table: dict[int, tuple[int, str]] = {}
-        self.sink: list[lm.Observation] = []
         self.on_execute: Callable[[lm.Case], None] | None = None
+        self.on_probe: Callable[[], None] | None = None
+        self.configs: list[Mapping[str, Any]] = []
 
     def as_set(self) -> lm.AdapterSet:
         outer = self
@@ -6370,21 +5821,17 @@ class FakeAdapterSet:
         class Readiness:
             async def probe(self) -> lm.ReadinessObservation:
                 outer.calls.append("readiness")
+                if outer.on_probe is not None:
+                    outer.on_probe()
                 return lm.ReadinessObservation(outer.ready, l0_fields())
 
         class Workflow:
-            async def execute(self, variant: lm.CaseVariant) -> lm.RunObservation:
-                outer.calls.append(f"execute:{variant.case.value}")
+            async def execute(self, config: Mapping[str, Any]) -> lm.RunObservation:
+                outer.calls.append("execute:L1")
+                outer.configs.append(config)
                 if outer.on_execute is not None:
-                    outer.on_execute(variant.case)
-                default = lm.EXPECTED_OUTCOME[variant.case]
-                builder = outer.script.get(
-                    variant.case,
-                    run_invalid_key
-                    if default is lm.Outcome.INVALID_KEY
-                    else (lambda sink: run_ok()),
-                )
-                return builder(outer.sink)
+                    outer.on_execute(S.L1)
+                return outer.script()
 
         class Cli:
             def resolve(self) -> lm.CliEvidence:
@@ -6395,18 +5842,7 @@ class FakeAdapterSet:
             def snapshot(self) -> dict[int, tuple[int, str]]:
                 return outer.table
 
-        class Observer:
-            def observing(self) -> Any:
-                import contextlib
-
-                @contextlib.contextmanager
-                def cm() -> Any:
-                    outer.sink = []
-                    yield outer.sink
-
-                return cm()
-
-        return lm.AdapterSet(Readiness(), Workflow(), Cli(), Descendants(), Observer())
+        return lm.AdapterSet(Readiness(), Workflow(), Cli(), Descendants())
 
 
 def official(
@@ -6434,108 +5870,17 @@ class TestAdapterSeams:
         fake = FakeAdapterSet()
         result = official(tmp_path, fake)
         assert result.succeeded
-        assert fake.calls == ["cli", "readiness", "execute:L1", "execute:L3", "execute:L2"]
+        assert fake.calls == ["cli", "readiness", "execute:L1"]
         assert [r["case"] for r in result.evidence if "case" in r and r["case"] != "session"] == [
             "L0",
             "L1",
-            "L3",
-            "L2",
         ]
         lm.finalize(result)
-        assert result.quota_attempts == 3
-        assert all(
-            "descendants" in r for r in result.evidence if r.get("case") in {"L1", "L3", "L2"}
-        )
-
-    @pytest.fixture
-    def tripwire_hits(self, monkeypatch: pytest.MonkeyPatch) -> list[str]:
-        """In-process external-entry tripwires; the test asserts the list stays empty."""
-        import socket
-
-        hits: list[str] = []
-
-        def arm(owner: Any, attr: str, name: str) -> None:
-            def tripwire(*args: object, **kwargs: object) -> None:
-                hits.append(name)
-                raise AssertionError(f"tripwire: {name}")
-
-            monkeypatch.setattr(owner, attr, tripwire)
-
-        arm(subprocess.Popen, "__init__", "Popen")
-        arm(asyncio, "create_subprocess_exec", "create_subprocess_exec")
-        arm(asyncio, "create_subprocess_shell", "create_subprocess_shell")
-        arm(os, "posix_spawn", "posix_spawn")
-        arm(socket.socket, "connect", "socket.connect")
-        arm(socket, "create_connection", "create_connection")
-        return hits
-
-    @staticmethod
-    def _drifted(kind: str) -> Callable[..., dict[lm.Case, lm.CaseVariant]]:
-        real = lm.build_variants
-
-        def build(
-            yaml_text: str, canary: str, environ: Any, **kwargs: Any
-        ) -> dict[lm.Case, lm.CaseVariant]:
-            variants = real(yaml_text, canary, environ, **kwargs)
-            l2 = variants[S.L2]
-            if kind == "config":
-                config = dict(l2.config)
-                config["agents"] = [{"name": "drifted"}]  # more than auth_mode differs
-                variants[S.L2] = dataclasses.replace(l2, config=config)
-            else:
-                env = dataclasses.replace(
-                    l2.env, set_names=(*l2.env.set_names, "ANTHROPIC_BASE_URL")
-                )
-                variants[S.L2] = dataclasses.replace(l2, env=env)
-            return variants
-
-        return build
-
-    def test_m23_config_drift_stops_before_l3_and_l2(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tripwire_hits: list[str]
-    ) -> None:
-        monkeypatch.setattr(lm, "build_variants", self._drifted("config"))
-        fake = FakeAdapterSet()
-        result = official(tmp_path, fake)
-        assert [r.outcome for r in result.results] == [
-            O.OK,
-            O.OK,
-            O.L2_L3_NOT_PAIRED,
-            O.NOT_EXECUTED_AFTER_SAFETY_FAILURE,
-        ]
-        assert fake.calls == ["cli", "readiness", "execute:L1"]  # L3 and L2 never invoked
-        assert result.quota_attempts == 1  # only L1; nothing consumed for L3/L2
-        l3 = next(r for r in result.evidence if r.get("case") == "L3")
-        assert l3["outcome"] == "l2_l3_not_paired"
-        assert l3["attempted_quota_execution"] is False
-        assert lm.run_level_record(result)["not_executed"] == (
-            "L2:not_executed_after_safety_failure"
-        )
-        assert result.primary_failure == "L3:l2_l3_not_paired:HarnessFailure"
-        assert not result.succeeded
-        assert tripwire_hits == []
-
-    def test_m23_env_name_drift_stops_before_l2(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tripwire_hits: list[str]
-    ) -> None:
-        monkeypatch.setattr(lm, "build_variants", self._drifted("env"))
-        fake = FakeAdapterSet()
-        result = official(tmp_path, fake)
-        # L3 runs only to reach the L2 boundary (invalid_key); L2 is refused by the env hook.
-        assert [r.outcome for r in result.results] == [
-            O.OK,
-            O.OK,
-            O.INVALID_KEY,
-            O.L2_L3_NOT_PAIRED,
-        ]
-        assert fake.calls == ["cli", "readiness", "execute:L1", "execute:L3"]
-        assert result.quota_attempts == 2  # the L2 attempt was not consumed
-        l2 = next(r for r in result.evidence if r.get("case") == "L2")
-        assert l2["outcome"] == "l2_l3_not_paired"
-        assert l2["attempted_quota_execution"] is False
-        assert result.primary_failure == "L2:l2_l3_not_paired:HarnessFailure"
-        assert not result.succeeded
-        assert tripwire_hits == []
+        assert result.quota_attempts == 1
+        assert all("descendants" in r for r in result.evidence if r.get("case") in {"L1"})
+        # L1 runs the shipped ``subscription`` document, parsed and otherwise unchanged
+        (config,) = fake.configs
+        assert config["workflow"]["runtime"]["provider"]["auth_mode"] == "subscription"
 
     def test_cli_evidence_is_recorded_once_after_preflight(self, tmp_path: Path) -> None:
         fake = FakeAdapterSet()
@@ -6557,71 +5902,28 @@ class TestAdapterSeams:
     def test_l0_not_ready_aborts_everything_after_it(self, tmp_path: Path) -> None:
         fake = FakeAdapterSet(ready=False)
         result = official(tmp_path, fake)
-        assert [r.outcome for r in result.results] == [O.NOT_LOGGED_IN] + [
-            O.NOT_EXECUTED_AFTER_L0_FAILURE
-        ] * 3
+        assert [r.outcome for r in result.results] == [
+            O.NOT_LOGGED_IN,
+            O.NOT_EXECUTED_AFTER_L0_FAILURE,
+        ]
         assert fake.calls == ["cli", "readiness"]
+        assert result.quota_attempts == 0  # no inference attempt was started
         with pytest.raises(pytest.fail.Exception):
             lm.finalize(result)
 
-    def test_l3_fallback_never_reaches_l2(self, tmp_path: Path) -> None:
-        fake = FakeAdapterSet({S.L3: lambda sink: run_ok()})
-        result = official(tmp_path, fake)
-        assert [r.outcome for r in result.results][-2:] == [
-            O.FELL_BACK_TO_LOGIN,
-            O.NOT_EXECUTED_L3_FELL_BACK_TO_LOGIN,
-        ]
-        assert "execute:L2" not in fake.calls
-
-    def test_l3_without_typed_signal_is_inconclusive(self, tmp_path: Path) -> None:
-        fake = FakeAdapterSet(
-            {
-                S.L3: lambda sink: lm.RunObservation(
-                    events=[],
-                    exception=ProviderError("x", is_retryable=False),
-                    streams=clean_streams(),
-                )
-            }
-        )
-        result = official(tmp_path, fake)
-        assert result.results[2].outcome is O.INCONCLUSIVE
-        assert "execute:L2" not in fake.calls
-
-    def test_canary_leak_overrides_and_aborts(self, tmp_path: Path) -> None:
-        leaked = clean_streams()
-        leaked["console"] = "the key was sk-ant-api03-CANARY-not-this-one"
-        fake = FakeAdapterSet({S.L1: lambda sink: run_ok(streams=leaked)})
-        canary = lm.make_canary("f" * 32)
-        leaked["console"] = f"printed {canary}"
-        result = official(tmp_path, fake, canary=canary)
-        assert result.results[1].outcome is O.CANARY_LEAK
-        assert [r.outcome for r in result.results[2:]] == [O.NOT_EXECUTED_AFTER_SAFETY_FAILURE] * 2
-        assert fake.calls == ["cli", "readiness", "execute:L1"]
-        assert canary not in str(result.evidence)
-
-    def test_incomplete_streams_abort_even_when_the_run_succeeded(self, tmp_path: Path) -> None:
-        partial = {"events": ""}
-        fake = FakeAdapterSet({S.L1: lambda sink: run_ok(streams=partial)})
-        result = official(tmp_path, fake)
-        assert result.results[1].outcome is O.CANARY_SCAN_INCOMPLETE
-
     def test_l1_exception_is_inconclusive_and_class_is_recorded(self, tmp_path: Path) -> None:
-        fake = FakeAdapterSet(
-            {S.L1: lambda sink: run_ok(events=[], exception=TimeoutError("secret-detail"))}
-        )
+        fake = FakeAdapterSet(lambda: run_ok(events=[], exception=TimeoutError("secret-detail")))
         result = official(tmp_path, fake)
         assert result.results[1].outcome is O.INCONCLUSIVE
         record = next(r for r in result.evidence if r.get("case") == "L1")
         assert record["exception_class"] == "TimeoutError"
         assert "secret-detail" not in str(result.evidence)
-        assert result.results[2].outcome is O.NOT_EXECUTED_AFTER_L1_FAILURE
+        assert len(result.results) == 2  # nothing follows L1
 
     def test_unpriced_or_unreported_model_fails_l1(self, tmp_path: Path) -> None:
-        result = official(
-            tmp_path, FakeAdapterSet({S.L1: lambda sink: run_ok(total_cost_usd=None)})
-        )
+        result = official(tmp_path, FakeAdapterSet(lambda: run_ok(total_cost_usd=None)))
         assert result.results[1].outcome is O.UNPRICED_MODEL_LABEL_UNEXERCISED
-        result = official(tmp_path, FakeAdapterSet({S.L1: lambda sink: run_ok(effective_model="")}))
+        result = official(tmp_path, FakeAdapterSet(lambda: run_ok(effective_model="")))
         assert result.results[1].outcome is O.EFFECTIVE_MODEL_MISSING
 
     def test_descendant_leak_aborts_and_reports_pid_and_name(self, tmp_path: Path) -> None:
@@ -6634,7 +5936,7 @@ class TestAdapterSeams:
         fake.on_execute = leak
         result = official(tmp_path, fake)
         assert result.results[1].outcome is O.DESCENDANT_LEAK
-        assert result.results[-1].outcome is O.NOT_EXECUTED_AFTER_SAFETY_FAILURE
+        assert len(result.results) == 2  # nothing follows L1
         record = next(r for r in result.evidence if r.get("case") == "L1")
         assert record["descendant_report"] == [{"pid": os.getpid() + 100000, "name": "leaky"}]
 
@@ -6797,7 +6099,7 @@ def _raise(outcome: lm.Outcome) -> Callable[[], Any]:
 #   * the SDK's process transport -> ``FakeTransport`` handed to the *real* ``ClaudeSDKClient``
 # Everything above them is the shipped code: ``create_provider``, ``ProviderRegistry``,
 # ``WorkflowEngine``, ``ClaudeAgentSdkProvider`` (readiness, billing derivation, execution),
-# ``display_usage_summary`` and the real passive observer on ``ClaudeSDKClient.receive_response``.
+# ``display_usage_summary`` and the private log sink of the two real adapters.
 # Tripwires are armed before any adapter is constructed, and every test asserts zero hits.
 
 sdk = importlib.import_module("conductor.providers.claude_agent_sdk")
@@ -6917,12 +6219,10 @@ class Stack:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        capfd: pytest.CaptureFixture[str] | None,
         hits: list[str],
     ) -> None:
         self.tmp_path = tmp_path
         self.monkeypatch = monkeypatch
-        self.capfd = capfd
         self.hits = hits
         self.config = make_config()
         self.probe = AuthProbe()
@@ -6930,14 +6230,13 @@ class Stack:
         self.pending: list[Any] = []
         self.consumed = 0
         self.records: list[dict[str, object]] = []
-        self.board = lm.FindingsBoard(CANARY)
+        self.board = lm.FindingsBoard()
         import claude_agent_sdk
 
         from tests.test_providers.claude_sdk_harness import FakeTransport
 
         self.transport_type = FakeTransport
         self.real_client = claude_agent_sdk.ClaudeSDKClient
-        self.receive_original = claude_agent_sdk.ClaudeSDKClient.receive_response
         monkeypatch.setattr(sdk, "_run_auth_status_subprocess", self.probe)
         self.cli_path = tmp_path / "fake-claude"
         monkeypatch.setattr(sdk, "_find_claude_cli", lambda: self.cli_path)
@@ -6976,21 +6275,13 @@ class Stack:
         self.pending.append(transport)
         return transport
 
-    def adapters(self, canary: str = CANARY, **workflow: Any) -> lm.AdapterSet:
-        adapters = lm.configured_adapters(
-            self.config, self.tmp_path, self.monkeypatch, self.capfd, canary=canary
-        )
+    def adapters(self, **workflow: Any) -> lm.AdapterSet:
+        adapters = lm.configured_adapters(self.config, self.tmp_path, self.monkeypatch)
         if workflow:
             adapters = dataclasses.replace(
                 adapters,
                 workflow=lm.RealWorkflowAdapter(
-                    self.config,
-                    self.tmp_path,
-                    self.monkeypatch,
-                    capfd=self.capfd,
-                    canary=canary,
-                    board=adapters.board,
-                    **workflow,
+                    self.config, self.tmp_path, self.monkeypatch, **workflow
                 ),
             )
         bundled = Path(importlib.import_module("claude_agent_sdk").__file__ or "").parent
@@ -7002,10 +6293,8 @@ class Stack:
         )
         return dataclasses.replace(adapters, cli=cli)
 
-    def variants(self, canary: str = CANARY) -> dict[lm.Case, lm.CaseVariant]:
-        return lm.build_variants(
-            lm.EXAMPLE_PATH.read_text(), canary, os.environ, model=lm.DEFAULT_MODEL
-        )
+    def l1_config(self) -> dict[str, Any]:
+        return lm.build_l1_config(lm.EXAMPLE_PATH.read_text(), lm.DEFAULT_MODEL)
 
     def run_cases(
         self,
@@ -7021,8 +6310,7 @@ class Stack:
         adapters = self.adapters(**workflow)
         runners = lm.build_case_runners(
             adapters,
-            variants=self.variants(),
-            canary=CANARY,
+            l1_config=self.l1_config(),
             requested_model=lm.DEFAULT_MODEL,
         )
         clock = Clock()
@@ -7063,7 +6351,6 @@ class Stack:
                 adapters,
                 readiness_check=lambda: None,
                 prereq_check=lambda: "bundled",
-                canary=CANARY,
                 read_table=dict,
                 grace_s=0.0,
                 sleep=clock.sleep,
@@ -7077,35 +6364,27 @@ class Stack:
 def stack(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capfd: pytest.CaptureFixture[str],
     boundary_hits: list[str],
     gates_on: None,
 ) -> Stack:
     pytest.importorskip("claude_agent_sdk")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    return Stack(tmp_path, monkeypatch, capfd, boundary_hits)
+    return Stack(tmp_path, monkeypatch, boundary_hits)
 
 
 def record_for(records: Sequence[dict[str, object]], case: str) -> dict[str, object]:
     return next(r for r in records if r.get("case") == case)
 
 
-def scan_of(record: dict[str, object]) -> list[str]:
-    """The ``canary_scan`` entries of an emitted record (the evidence contract makes it a list)."""
-    return cast("list[str]", record["canary_scan"])
-
-
 @pytest.mark.claude_auth_readiness_mocked
 class TestRealAdaptersHappyPath:
     def test_full_official_session_through_real_production_paths(self, stack: Stack) -> None:
         stack.script(sdk_frames())  # L1
-        stack.script(sdk_frames(error="authentication_failed", is_error=True, status=401))  # L3
-        stack.script(sdk_frames())  # L2
         result = stack.session()
-        assert [r.outcome for r in result.results] == [O.OK, O.OK, O.INVALID_KEY, O.OK]
+        assert [r.outcome for r in result.results] == [O.OK, O.OK]
         assert result.succeeded, result.primary_failure
         assert stack.hits == []
-        assert stack.consumed == 3
+        assert stack.consumed == 1
 
 
 def private_logger_state() -> dict[str, tuple[int, list[logging.Handler], bool, bool]]:
@@ -7134,9 +6413,9 @@ def env_recorder(seen: dict[str, str | None]) -> Callable[[], None]:
 SDK_LOGGER = "claude_agent_sdk._internal.transport.subprocess_cli"
 
 
-def canary_logger() -> None:
-    """A DEBUG record naming the canary, from a logger the SDK really uses."""
-    logging.getLogger(SDK_LOGGER).debug("leaked key %s", CANARY)
+def warning_logger() -> None:
+    """A secret-like WARNING record from a logger the SDK really uses."""
+    logging.getLogger(SDK_LOGGER).warning("Skipping non-JSON line from CLI stdout: %s", SECRET)
 
 
 def raising(exc: BaseException) -> Callable[[], None]:
@@ -7161,7 +6440,6 @@ def probe_l0(stack: Stack, payload: dict[str, object] | None = None) -> Any:
             read_table=dict,
             grace_s=0.0,
             sleep=Clock().sleep,
-            canary=CANARY,
         )
     )
     return result, records
@@ -7237,7 +6515,9 @@ class TestRealL0Adapter:
         assert l0["api_provider_is_first_party"] is False
         assert not result.succeeded
 
-    def test_no_raw_auth_value_reaches_any_retained_stream(self, stack: Stack) -> None:
+    def test_no_raw_auth_value_reaches_any_retained_stream(
+        self, stack: Stack, capfd: pytest.CaptureFixture[str]
+    ) -> None:
         raw = ("RAW-AUTH-METHOD-VALUE", "RAW-PLAN-VALUE", "RAW-KEY-SOURCE-VALUE")
         payload = {
             "loggedIn": True,
@@ -7248,8 +6528,7 @@ class TestRealL0Adapter:
         }
         result, records = probe_l0(stack, payload)
         assert result.results[0].outcome is O.BILLING_NOT_SUBSCRIPTION
-        assert stack.capfd is not None
-        text = json.dumps(records) + "".join(stack.capfd.readouterr())
+        text = json.dumps(records) + "".join(capfd.readouterr())
         assert not any(value in text for value in raw)
 
     def test_readiness_exception_is_a_failed_case_with_its_class(self, stack: Stack) -> None:
@@ -7265,55 +6544,15 @@ class TestRealL0Adapter:
         assert result.results[0].exc_class == "Boom"
         record = record_for(records, "L0")
         assert record["exception_class"] == "Boom"
-        assert lm.scan_is_clean_and_complete(record["canary_scan"], "L0")
         assert "UNIQUE-READINESS-TEXT" not in json.dumps(records)  # exception text never retained
+        assert record["attempted_quota_execution"] is False  # L0 never attempts the quota
 
-    def test_readiness_exception_naming_the_canary_is_a_canary_leak_not_a_plain_failure(
-        self, stack: Stack
-    ) -> None:
-        class Boom(Exception):
-            pass
-
-        async def explode(*args: object, **kwargs: object) -> tuple[bytes, bytes, int]:
-            raise Boom("unsafe text " + CANARY)
-
-        stack.monkeypatch.setattr(sdk, "_run_auth_status_subprocess", explode)
-        result, records = probe_l0(stack)
-        assert result.results[0].outcome is O.CANARY_LEAK
-        assert result.results[0].adapter_outcome is O.CASE_FAILED
-        record = record_for(records, "L0")
-        assert record["exception_class"] == "Boom"
-        assert "exceptions:leak" in scan_of(record)
-        assert CANARY not in json.dumps(records)
-
-    def test_l0_console_and_events_are_not_available_and_that_is_complete(
-        self, stack: Stack
-    ) -> None:
+    def test_l0_records_a_normal_case_record_without_any_scan(self, stack: Stack) -> None:
         result, records = probe_l0(stack)
         assert result.succeeded
-        scan = record_for(records, "L0")["canary_scan"]
-        assert scan == [
-            "stdout_stderr:clean",
-            "console:not_available",
-            "logs:clean",
-            "exceptions:clean",
-            "events:not_available",
-            "workflow_result:not_available",
-            "evidence:clean",
-            "tmp_files:clean",
-        ]
-        assert lm.scan_is_clean_and_complete(scan, "L0")
-        assert not lm.scan_is_clean_and_complete(scan, "L1")  # not allowed for an inference case
-
-    def test_a_canary_in_l0_stdout_is_found(self, stack: Stack) -> None:
-        async def loud(*args: object, **kwargs: object) -> tuple[bytes, bytes, int]:
-            os.write(1, f"status {CANARY}\n".encode())
-            return json.dumps(LOGIN_PAYLOAD).encode(), b"", 0
-
-        stack.monkeypatch.setattr(sdk, "_run_auth_status_subprocess", loud)
-        result, records = probe_l0(stack)
-        assert result.results[0].outcome is O.CANARY_LEAK
-        assert "stdout_stderr:leak" in scan_of(record_for(records, "L0"))
+        l0 = record_for(records, "L0")
+        assert l0["attempted_quota_execution"] is False and l0["interrupted"] == "none"
+        assert "canary_scan" not in l0
 
 
 class TestL0Predicates:
@@ -7371,7 +6610,7 @@ class TestL0Predicates:
 
 
 class TestInferencePredicates:
-    """The L1 / L2 success predicate, one broken part at a time."""
+    """The L1 success predicate, one broken part at a time."""
 
     def test_complete_success(self) -> None:
         fields = lm.assert_inference_success(run_ok(), "claude-haiku-4-5")
@@ -7432,47 +6671,54 @@ class TestInferencePredicates:
         assert set(info.value.extra) <= lm.EVIDENCE_KEYS
 
 
+class TestEvidenceSanitization:
+    """`_safe_fields` keeps only allowlisted evidence keys; free text never survives."""
+
+    def test_safe_fields_drops_unallowed_keys(self) -> None:
+        free_text = "FREE TEXT THAT MUST NOT SURVIVE 5f0c"
+        fields = {
+            "api_provider_is_first_party": True,
+            "stdout": free_text,
+            "unlisted_note": free_text,
+        }
+        assert "api_provider_is_first_party" in lm.EVIDENCE_KEYS
+        assert not {"stdout", "unlisted_note"} & lm.EVIDENCE_KEYS
+        safe = lm._safe_fields(fields)
+        assert safe == {"api_provider_is_first_party": True}
+        assert "stdout" not in safe
+        assert set(safe) <= lm.EVIDENCE_KEYS
+        assert free_text not in repr(safe)
+
+
 def outcome_of(result: lm.SessionResult) -> lm.Outcome:
     return result.results[0].outcome
 
 
 @pytest.mark.claude_auth_readiness_mocked
 class TestRealInferenceAdapters:
-    """L1 / L3 / L2 through ``load_config`` -> ``ProviderRegistry`` -> ``WorkflowEngine``."""
+    """L1 through ``load_config`` -> ``ProviderRegistry`` -> ``WorkflowEngine``."""
 
     # -- happy path and reachability ------------------------------------------------------
     def test_full_session_reaches_the_real_engine_registry_and_provider(self, stack: Stack) -> None:
-        seen: dict[str, dict[str, str | None]] = {"L1": {}, "L3": {}, "L2": {}}
-        transports = [
-            stack.script(sdk_frames(), on_connect=env_recorder(seen["L1"])),
-            stack.script(
-                sdk_frames(error="authentication_failed", is_error=True, status=401),
-                on_connect=env_recorder(seen["L3"]),
-            ),
-            stack.script(sdk_frames(), on_connect=env_recorder(seen["L2"])),
-        ]
+        seen: dict[str, str | None] = {}
+        transport = stack.script(sdk_frames(), on_connect=env_recorder(seen))
         result = stack.session()
         assert result.succeeded, result.primary_failure
-        assert [r.outcome for r in result.results] == [O.OK, O.OK, O.INVALID_KEY, O.OK]
+        assert [r.outcome for r in result.results] == [O.OK, O.OK]
         lm.finalize(result)
-        # Every session was a real SDK client over a fake transport, and the real engine
-        # rendered and sent one prompt in each.
-        assert stack.consumed == 3
-        assert all(t.connect_calls == 1 and len(t.user_messages) == 1 for t in transports)
-        assert "What is Conductor" not in json.dumps(transports[0].user_messages)  # our question
-        assert lm.LIVE_QUESTION in json.dumps(transports[0].user_messages)
-        # Auth-status probes: L0 once; L1 and L2 twice each (registry validation + execute);
-        # L3 (auto with a key) never.
-        assert len(stack.probe.envs) == 5
-        # The canary is in the process environment only for L3 and L2.
-        assert seen["L1"]["key"] is None
-        assert seen["L3"]["key"] == CANARY and seen["L2"]["key"] == CANARY
+        # The session was a real SDK client over a fake transport, and the real engine
+        # rendered and sent one prompt in it.
+        assert stack.consumed == 1
+        assert transport.connect_calls == 1 and len(transport.user_messages) == 1
+        assert lm.LIVE_QUESTION in json.dumps(transport.user_messages)
+        # Auth-status probes: L0 once; L1 twice (registry validation + execute).
+        assert len(stack.probe.envs) == 3
+        # No credential variable is ever set by the harness.
+        assert seen["key"] is None
         assert "ANTHROPIC_API_KEY" not in os.environ
         assert stack.hits == []
 
     def test_evidence_of_a_full_session_is_complete_and_sanitized(self, stack: Stack) -> None:
-        stack.script(sdk_frames())
-        stack.script(sdk_frames(error="authentication_failed", is_error=True, status=401))
         stack.script(sdk_frames())
         result = stack.session()
         l1 = record_for(result.evidence, "L1")
@@ -7481,12 +6727,11 @@ class TestRealInferenceAdapters:
         assert l1["requested_model"] == "claude-haiku-4-5"
         assert l1["effective_model"] == "claude-haiku-4-5-20251001"
         assert isinstance(l1["est_cost_usd"], float) and l1["est_cost_usd"] > 0
-        assert l1["env_names_set"] == []
-        l3 = record_for(result.evidence, "L3")
-        assert l3["outcome"] == "invalid_key" and l3["env_names_set"] == ["ANTHROPIC_API_KEY"]
-        assert l3["exception_class"] == "ProviderError"
-        assert record_for(result.evidence, "L2")["env_names_set"] == ["ANTHROPIC_API_KEY"]
-        assert CANARY not in json.dumps(result.evidence)
+        assert l1["env_names_set"] == []  # the harness set no variable
+        assert l1["attempted_quota_execution"] is True
+        assert record_for(result.evidence, "L0")["attempted_quota_execution"] is False
+        run_level = lm.run_level_record(result)
+        assert (run_level["quota_attempts_total"], run_level["quota_ceiling"]) == (1, 1)
 
     # -- L1 ------------------------------------------------------------------------------
     def test_l1_output_present_but_billing_mode_wrong(self, stack: Stack) -> None:
@@ -7535,131 +6780,30 @@ class TestRealInferenceAdapters:
         assert outcome_of(result) is O.INCONCLUSIVE
         assert record_for(records, "L1")["exception_class"] == "ProviderError"
 
-    # -- L3 ------------------------------------------------------------------------------
-    def test_l3_typed_invalid_key(self, stack: Stack) -> None:
-        stack.script(sdk_frames(error="authentication_failed", is_error=True, status=401))
-        result, records = stack.run_case(S.L3)
-        assert outcome_of(result) is O.INVALID_KEY
-        assert record_for(records, "L3")["attempted_quota_execution"] is True
-
-    def test_l3_success_is_fallback_not_success(self, stack: Stack) -> None:
-        stack.script(sdk_frames())
-        result, _ = stack.run_case(S.L3)
-        assert outcome_of(result) is O.FELL_BACK_TO_LOGIN
-        assert not result.succeeded
-
-    def test_l3_generic_non_retryable_is_inconclusive(self, stack: Stack) -> None:
-        stack.script(sdk_frames(is_error=True, status=400))
-        result, _ = stack.run_case(S.L3)
-        assert outcome_of(result) is O.INCONCLUSIVE
-
-    def test_l3_error_text_alone_is_never_a_classification(self, stack: Stack) -> None:
-        """Text that *says* authentication failed, with no typed signal, stays inconclusive."""
-        stack.script(
-            sdk_frames(
-                text="authentication_failed 401 invalid x-api-key", is_error=True, status=400
-            )
-        )
-        result, _ = stack.run_case(S.L3)
-        assert outcome_of(result) is O.INCONCLUSIVE
-
-    def test_l3_timeout_returns_an_observation_and_scans_the_canary(self, stack: Stack) -> None:
+    def test_l1_timeout_returns_an_observation_and_is_inconclusive(self, stack: Stack) -> None:
+        stack.monkeypatch.setitem(lm.CASE_TIMEOUTS_S, S.L1, 0.05)
         stack.script(None)  # never answers
-        result, records = stack.run_case(S.L3, timeouts={S.L3: 0.05})
+        result, records = stack.run_case(S.L1)
         assert outcome_of(result) is O.INCONCLUSIVE
-        record = record_for(records, "L3")
+        record = record_for(records, "L1")
         assert record["exception_class"] == "TimeoutError"
-        # a timeout is an ordinary outcome: the scan is complete and no result exists
+        # a timeout is an ordinary outcome: no interrupt, no finding, never retried
         assert record["interrupted"] == "none" and record["secondary_findings"] == []
-        assert scan_of(record)[lm.REQUIRED_STREAMS.index("workflow_result")] == (
-            "workflow_result:not_available"
-        )
-        assert lm.scan_is_clean_and_complete(record["canary_scan"], "L3")
+        assert stack.consumed == 1  # one session only
+        assert stack.hits == []
 
-    def test_l3_timeout_with_a_leak_is_a_canary_failure_not_inconclusive(
-        self, stack: Stack
-    ) -> None:
-        stack.script(None, on_connect=canary_logger)
-        result, records = stack.run_case(S.L3, timeouts={S.L3: 0.05})
-        assert outcome_of(result) is O.CANARY_LEAK
-        record = record_for(records, "L3")
-        assert record["adapter_outcome"] == "inconclusive"  # what the case itself produced
-        assert record["exception_class"] == "TimeoutError"
-        assert "logs:leak" in scan_of(record)
-        assert CANARY not in json.dumps(records)
-
-    # -- L2 ------------------------------------------------------------------------------
-    def test_l2_complete_success(self, stack: Stack) -> None:
-        stack.script(sdk_frames())
-        result, records = stack.run_case(S.L2)
-        assert result.succeeded
-        l2 = record_for(records, "L2")
-        assert l2["billing_mode"] == "subscription" and l2["billing_label_seen"] is True
-
-    def test_l2_canary_used_is_a_blocker(self, stack: Stack) -> None:
-        stack.script(sdk_frames(error="authentication_failed", is_error=True, status=401))
-        result, _ = stack.run_case(S.L2)
-        assert outcome_of(result) is O.CANARY_USED_IN_L2
-        assert O.CANARY_USED_IN_L2 in lm.SAFETY_OUTCOMES
-
-    def test_l2_canary_leak_is_detected_in_the_log_stream(self, stack: Stack) -> None:
-        stack.script(sdk_frames(), on_connect=canary_logger)
-        result, _ = stack.run_case(S.L2)
-        assert outcome_of(result) is O.CANARY_LEAK
-
-    def test_l2_billing_mismatch(self, stack: Stack) -> None:
-        stack.probe.payload = without(LOGIN_PAYLOAD, "subscriptionType")
-        stack.script(sdk_frames())
-        result, _ = stack.run_case(S.L2)
-        assert outcome_of(result) is O.BILLING_NOT_SUBSCRIPTION
-
-    def test_l2_label_mismatch(self, stack: Stack) -> None:
-        stack.monkeypatch.setattr(
-            "conductor.cli.run.display_usage_summary", lambda *args, **kwargs: None
-        )
-        stack.script(sdk_frames())
-        result, _ = stack.run_case(S.L2)
-        assert outcome_of(result) is O.BILLING_LABEL_MISSING
-
-    # -- exceptions still produce a scanned observation ----------------------------------
-    @pytest.mark.parametrize("case", [S.L1, S.L3, S.L2])
-    def test_adapter_exception_is_scanned_before_the_state_machine_decides(
-        self, stack: Stack, case: lm.Case
-    ) -> None:
-        stack.script(sdk_frames(), on_connect=raising(RuntimeError(f"cannot connect {CANARY}")))
-        result, records = stack.run_case(case)
-        assert outcome_of(result) is O.CANARY_LEAK  # not case_failed / inconclusive
-        assert CANARY not in json.dumps(records)
-
-    def test_adapter_exception_without_a_leak_keeps_its_class(self, stack: Stack) -> None:
+    def test_adapter_exception_keeps_its_class(self, stack: Stack) -> None:
         stack.script(sdk_frames(), on_connect=raising(RuntimeError("cannot connect")))
         result, records = stack.run_case(S.L1)
         assert outcome_of(result) is O.INCONCLUSIVE
         assert record_for(records, "L1")["exception_class"] == "ProviderError"
+        assert "cannot connect" not in json.dumps(records)
 
-    # -- H21: a secret-like DEBUG record stays private --------------------------------------
-    def test_an_evicted_log_record_naming_the_canary_is_still_a_leak(self, stack: Stack) -> None:
-        """The bounded buffer may drop a record; the emit-time check has already seen it."""
-        import functools
-
-        stack.monkeypatch.setattr(
-            lm, "_BufferHandler", functools.partial(lm._BufferHandler, max_records=1)
-        )
-
-        def flood() -> None:
-            logging.getLogger(SDK_LOGGER).debug("leaked key %s", CANARY)
-            for _ in range(5):
-                logging.getLogger(SDK_LOGGER).debug("innocent")
-
-        stack.script(sdk_frames(), on_connect=flood)
-        result, records = stack.run_case(S.L2)
-        assert outcome_of(result) is O.CANARY_LEAK
-        assert "logs:leak" in scan_of(record_for(records, "L2"))
-        assert CANARY not in json.dumps(records)
-
-    def test_a_secret_like_debug_record_reaches_neither_pytest_nor_the_evidence(
-        self, stack: Stack, caplog: pytest.LogCaptureFixture
+    # -- H21: a secret-like WARNING record stays private --------------------------------------
+    def test_a_secret_like_warning_record_reaches_neither_pytest_nor_the_evidence(
+        self, stack: Stack, caplog: pytest.LogCaptureFixture, capfd: pytest.CaptureFixture[str]
     ) -> None:
+        loggers_before = private_logger_state()
         probe = RecordingHandler()
         root = logging.getLogger()
         root.addHandler(probe)
@@ -7667,15 +6811,13 @@ class TestRealInferenceAdapters:
 
         def noisy() -> None:
             seen["root_level"] = root.level
-            logging.getLogger(SDK_LOGGER).debug(
-                "Skipping non-JSON line from CLI stdout: %s", SECRET
-            )
-            logging.getLogger("conductor.providers.claude_agent_sdk").debug("p %s", SECRET)
+            warning_logger()
+            logging.getLogger("conductor.providers.claude_agent_sdk").warning("p %s", SECRET)
 
         level_before = root.level
         stack.script(sdk_frames(), on_connect=noisy)
         try:
-            result, records = stack.run_case(S.L2)
+            result, records = stack.run_case(S.L1)
         finally:
             root.removeHandler(probe)
         assert result.succeeded
@@ -7683,13 +6825,14 @@ class TestRealInferenceAdapters:
         assert [r for r in probe.records if SECRET in r.getMessage()] == []
         assert SECRET not in caplog.text  # pytest's captured-log section
         assert SECRET not in json.dumps(records)  # nor the future saved evidence
-        assert stack.capfd is not None and SECRET not in "".join(stack.capfd.readouterr())
+        assert SECRET not in "".join(capfd.readouterr())
+        assert private_logger_state() == loggers_before  # the sink is detached again
         assert stack.hits == []
 
-    # -- H23: the aggregate billing state, per case ---------------------------------------
+    # -- H23: the aggregate billing state --------------------------------------------------------
     @staticmethod
-    def _mixed_aggregate(stack: Stack, on_call: int) -> dict[str, int]:
-        """Make the ``on_call``-th execution summary report a mixed billing aggregate."""
+    def _mixed_aggregate(stack: Stack) -> dict[str, int]:
+        """Make the execution summary report a mixed billing aggregate."""
         from conductor.engine.workflow import WorkflowEngine
 
         real = WorkflowEngine.get_execution_summary
@@ -7698,57 +6841,44 @@ class TestRealInferenceAdapters:
         def summary(self: Any) -> dict[str, Any]:
             calls["n"] += 1
             out = real(self)
-            if calls["n"] == on_call:
-                out["usage"] = {
-                    **out["usage"],
-                    "billing": {
-                        "state": "mixed",
-                        "breakdown": {"subscription": 1, "metered_api": 1},
-                    },
-                }
+            out["usage"] = {
+                **out["usage"],
+                "billing": {"state": "mixed", "breakdown": {"subscription": 1, "metered_api": 1}},
+            }
             return out
 
         stack.monkeypatch.setattr(WorkflowEngine, "get_execution_summary", summary)
         return calls
 
-    def test_l2_aggregate_billing_mismatch_fails_l2_while_l1_is_healthy(self, stack: Stack) -> None:
-        stack.script(sdk_frames())  # L1
-        stack.script(sdk_frames())  # L2
-        calls = self._mixed_aggregate(stack, on_call=2)
-        result = stack.run_cases((S.L1, S.L2))
-        assert calls["n"] == 2  # one summary per case, so the second is L2's
-        assert [r.outcome for r in result.results] == [O.OK, O.BILLING_AGGREGATE_MISMATCH]
-        assert record_for(stack.records, "L1")["billing_state"] == "subscription"
-        assert record_for(stack.records, "L2")["outcome"] == "billing_aggregate_mismatch"
-        assert "billing_state" not in record_for(stack.records, "L2")
+    def test_l1_aggregate_billing_mismatch_fails_l1(self, stack: Stack) -> None:
+        stack.script(sdk_frames())
+        calls = self._mixed_aggregate(stack)
+        result = stack.run_cases((S.L1,))
+        assert calls["n"] == 1
+        assert [r.outcome for r in result.results] == [O.BILLING_AGGREGATE_MISMATCH]
+        assert record_for(stack.records, "L1")["outcome"] == "billing_aggregate_mismatch"
+        assert "billing_state" not in record_for(stack.records, "L1")
         assert stack.hits == []
 
-    def test_l1_aggregate_billing_mismatch_fails_l1_while_l2_is_healthy(self, stack: Stack) -> None:
-        stack.script(sdk_frames())  # L1
-        stack.script(sdk_frames())  # L2 (never reached: L1 failed)
-        self._mixed_aggregate(stack, on_call=1)
-        result = stack.run_cases((S.L1, S.L2))
-        assert [r.outcome for r in result.results] == [
-            O.BILLING_AGGREGATE_MISMATCH,
-            O.NOT_EXECUTED_AFTER_L1_FAILURE,
-        ]
-        assert stack.consumed == 1
-        assert stack.hits == []
+    def test_a_healthy_aggregate_is_the_control_that_makes_the_mismatch_row_non_vacuous(
+        self, stack: Stack
+    ) -> None:
+        stack.script(sdk_frames())
+        result = stack.run_cases((S.L1,))
+        assert [r.outcome for r in result.results] == [O.OK]
+        assert record_for(stack.records, "L1")["billing_state"] == "subscription"
 
     # -- H18 through the real adapter: the original interrupt, everything restored ---------
     @pytest.mark.parametrize(("factory", "kind"), INTERRUPTS)
-    @pytest.mark.parametrize(("canary_in", "descendant", "secondary"), FINDING_ROWS)
+    @pytest.mark.parametrize(("descendant", "secondary"), FINDING_ROWS)
     def test_an_interrupt_at_the_engine_is_reraised_unchanged_and_everything_is_restored(
         self,
         stack: Stack,
         factory: type[BaseException],
         kind: str,
-        canary_in: str | None,
         descendant: bool,
         secondary: list[str],
     ) -> None:
-        import claude_agent_sdk
-
         from conductor.engine.workflow import WorkflowEngine
 
         original = factory()
@@ -7756,8 +6886,7 @@ class TestRealInferenceAdapters:
 
         async def interrupted(self: Any, inputs: Any) -> Any:
             runs.append("run")
-            if canary_in is not None:
-                canary_logger()
+            warning_logger()
             raise original
 
         stack.monkeypatch.setattr(WorkflowEngine, "run", interrupted)
@@ -7768,35 +6897,55 @@ class TestRealInferenceAdapters:
             return {os.getpid() + 1: (os.getpid(), "leaky")} if descendant and runs else {}
 
         with pytest.raises(type(original)) as info:
-            stack.run_cases((S.L1, S.L3, S.L2), read_table=read)
+            stack.run_cases((S.L0, S.L1), read_table=read)
         assert info.value is original  # the very object, never converted
         assert not isinstance(info.value, (lm.HarnessFailure, pytest.fail.Exception))
+        assert record_for(stack.records, "L0")["outcome"] == "ok"  # earlier case untouched
         record = record_for(stack.records, "L1")
         assert record["outcome"] == "interrupted" and record["interrupted"] == kind
         assert record["secondary_findings"] == secondary
-        assert ("logs:leak" in scan_of(record)) == (canary_in is not None)
-        assert len(scan_of(record)) == 8
-        assert CANARY not in json.dumps(stack.records)
-        # nothing later ran, and the state machine says so
+        assert SECRET not in json.dumps(stack.records)
         assert runs == ["run"] and stack.consumed == 0
         run_level = next(r for r in stack.records if "case" not in r)
-        assert run_level["not_executed"] == (
-            "L3:not_executed_after_interrupt,L2:not_executed_after_interrupt"
-        )
-        # restoration: environment, observer and logging
+        assert "not_executed" not in run_level  # L1 is the last case
+        assert run_level["quota_attempts_total"] == 1  # the one designed attempt
+        # restoration: environment and logging
         assert dict(os.environ) == env_before
-        assert claude_agent_sdk.ClaudeSDKClient.receive_response is stack.receive_original
         assert private_logger_state() == loggers_before
         assert stack.hits == []
 
-    def test_a_real_task_cancellation_with_a_leak_is_recorded_then_reraised(
+    @pytest.mark.parametrize(("factory", "kind"), INTERRUPTS)
+    def test_an_interrupt_in_l0_leaves_l1_unexecuted_and_no_attempt_consumed(
+        self, stack: Stack, factory: type[BaseException], kind: str
+    ) -> None:
+        original = factory()
+
+        async def interrupted(*args: object, **kwargs: object) -> tuple[bytes, bytes, int]:
+            raise original
+
+        stack.monkeypatch.setattr(sdk, "_run_auth_status_subprocess", interrupted)
+        env_before = dict(os.environ)
+        loggers_before = private_logger_state()
+        with pytest.raises(type(original)) as info:
+            stack.run_cases((S.L0, S.L1))
+        assert info.value is original
+        l0 = record_for(stack.records, "L0")
+        assert l0["outcome"] == "interrupted" and l0["interrupted"] == kind
+        run_level = next(r for r in stack.records if "case" not in r)
+        assert run_level["not_executed"] == "L1:not_executed_after_interrupt"
+        assert run_level["quota_attempts_total"] == 0
+        assert stack.consumed == 0  # the workflow adapter was never entered
+        assert dict(os.environ) == env_before and private_logger_state() == loggers_before
+        assert stack.hits == []
+
+    def test_a_real_task_cancellation_is_reraised_unchanged_and_the_sink_detached(
         self, stack: Stack
     ) -> None:
         adapters = stack.adapters()
-        stack.script(None, on_connect=canary_logger)
+        stack.script(None, on_connect=warning_logger)
 
         async def go() -> None:
-            task = asyncio.ensure_future(adapters.workflow.execute(stack.variants()[S.L2]))
+            task = asyncio.ensure_future(adapters.workflow.execute(stack.l1_config()))
             for _ in range(20):
                 await asyncio.sleep(0)
             task.cancel()
@@ -7805,252 +6954,81 @@ class TestRealInferenceAdapters:
         loggers_before = private_logger_state()
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(go())
-        findings = adapters.board.for_case(S.L2)
-        assert findings.canary_leak and "logs:leak" in findings.entries
         assert "ANTHROPIC_API_KEY" not in os.environ
         assert private_logger_state() == loggers_before
         assert stack.hits == []
 
-    def test_a_real_task_cancellation_without_a_leak_propagates_unchanged(
-        self, stack: Stack
-    ) -> None:
-        adapters = stack.adapters()
-        stack.script(None)
-
-        async def go() -> None:
-            task = asyncio.ensure_future(adapters.workflow.execute(stack.variants()[S.L2]))
-            for _ in range(20):
-                await asyncio.sleep(0)
-            task.cancel()
-            await task
-
-        with pytest.raises(asyncio.CancelledError):
-            asyncio.run(go())
-        assert not adapters.board.for_case(S.L2).canary_leak
-        assert "ANTHROPIC_API_KEY" not in os.environ
-
-    def test_a_keyboard_interrupt_escapes_asyncio_run_and_no_later_case_runs(
-        self, stack: Stack
-    ) -> None:
+    def test_a_keyboard_interrupt_escapes_asyncio_run(self, stack: Stack) -> None:
         original = KeyboardInterrupt()
         stack.script(sdk_frames(), on_connect=raising(original))
-        stack.script(sdk_frames())
         with pytest.raises(KeyboardInterrupt) as info:
-            stack.run_cases((S.L1, S.L2))
+            stack.run_cases((S.L1,))
         assert not isinstance(info.value, lm.HarnessFailure)
-        assert stack.consumed == 1  # L2's session was never opened
         assert record_for(stack.records, "L1")["outcome"] == "interrupted"
 
     # -- H25: authentication probes are reproduced, not avoided ------------------------------
     def test_probe_counts_per_case(self, stack: Stack) -> None:
-        expected = {S.L1: 2, S.L3: 0, S.L2: 2}
-        for case, count in expected.items():
-            stack.probe.envs.clear()
-            stack.probe.sites.clear()
-            frames = (
-                sdk_frames(error="authentication_failed", is_error=True, status=401)
-                if case is S.L3
-                else sdk_frames()
-            )
-            stack.script(frames)
-            stack.run_case(case)
-            assert len(stack.probe.envs) == count, case
+        stack.script(sdk_frames())
+        stack.run_case(S.L1)
+        assert len(stack.probe.envs) == 2  # provider validation, then execution
         stack.probe.envs.clear()
         stack.probe.sites.clear()
         probe_l0(stack)
         assert len(stack.probe.envs) == 1  # L0, and therefore the readiness-only check
         assert stack.probe.sites == ["direct"]
 
-    def test_official_total_is_five_in_a_fixed_order_and_probes_are_not_quota(
+    def test_official_total_is_three_in_a_fixed_order_and_probes_are_not_quota(
         self, stack: Stack
     ) -> None:
         stack.script(sdk_frames())
-        stack.script(sdk_frames(error="authentication_failed", is_error=True, status=401))
-        stack.script(sdk_frames())
         result = stack.session()
         assert result.succeeded
-        assert len(stack.probe.envs) == 5
-        assert stack.probe.sites == ["direct", "validation", "execution", "validation", "execution"]
-        assert result.quota_attempts == 3 <= lm.DEFAULT_QUOTA_CEILING  # probes are not counted
-
-
-def leak_streams(stack: Stack, variant_case: lm.Case = S.L2) -> list[str]:
-    """Run the real workflow adapter once and return the names of the streams holding the canary."""
-    adapters = stack.adapters()
-    observed = asyncio.run(adapters.workflow.execute(stack.variants()[variant_case]))
-    assert set(observed.streams) == set(lm.REQUIRED_STREAMS)  # every category is supplied
-    return lm.scan_streams(CANARY, observed.streams)
-
-
-@pytest.mark.claude_auth_readiness_mocked
-class TestEveryRequiredStreamIsScanned:
-    """H22: a canary planted in exactly one stream is found in exactly that stream."""
-
-    def test_stream_names_are_the_honest_ones_in_order(self) -> None:
-        assert lm.REQUIRED_STREAMS == (
-            "stdout_stderr",
-            "console",
-            "logs",
-            "exceptions",
-            "events",
-            "workflow_result",
-            "evidence",
-            "tmp_files",
-        )
-        retired = {"capfd", "capsys", "caplog", "raw_response"}
-        assert not retired & set(lm.REQUIRED_STREAMS)
-        assert not retired & lm.EVIDENCE_KEYS
-        constants = {
-            node.value
-            for node in ast.walk(module_ast())
-            if isinstance(node, ast.Constant) and isinstance(node.value, str)
-        }
-        assert not retired & constants  # nor in any message or fixed string of the module
-
-    def test_clean_run_has_no_hit_in_any_stream(self, stack: Stack) -> None:
-        stack.script(sdk_frames())
-        assert leak_streams(stack) == []
-
-    def test_file_descriptor_writes_reach_stdout_stderr(self, stack: Stack) -> None:
-        """Text written straight to fd 1 and fd 2 (below ``sys.stdout``) is what ``capfd`` sees."""
-
-        def leak() -> None:
-            os.write(1, f"out {CANARY}\n".encode())
-            os.write(2, f"err {CANARY}\n".encode())
-
-        stack.script(sdk_frames(), on_connect=leak)
-        assert leak_streams(stack) == ["stdout_stderr"]
-
-    def test_python_level_prints_reach_stdout_stderr(self, stack: Stack) -> None:
-        def leak() -> None:
-            print(f"out {CANARY}")
-            print(f"err {CANARY}", file=sys.stderr)
-
-        stack.script(sdk_frames(), on_connect=leak)
-        assert leak_streams(stack) == ["stdout_stderr"]
-
-    def test_console_buffer_is_scanned(self, stack: Stack) -> None:
-        def loud(usage: object, console: Any = None) -> None:
-            console.print(f"total {CANARY}")
-
-        stack.monkeypatch.setattr("conductor.cli.run.display_usage_summary", loud)
-        stack.script(sdk_frames())
-        assert leak_streams(stack) == ["console"]
-
-    def test_private_log_records_are_scanned(self, stack: Stack) -> None:
-        stack.script(sdk_frames(), on_connect=canary_logger)
-        assert leak_streams(stack) == ["logs"]
-
-    def test_a_log_record_from_the_provider_logger_is_scanned(self, stack: Stack) -> None:
-        def leak() -> None:
-            logging.getLogger("conductor.providers.claude_agent_sdk").debug("k %s", CANARY)
-
-        stack.script(sdk_frames(), on_connect=leak)
-        assert leak_streams(stack) == ["logs"]
-
-    def test_files_under_tmp_path_are_scanned(self, stack: Stack) -> None:
-        def write() -> None:
-            (stack.tmp_path / "leak.txt").write_text(CANARY)
-
-        stack.script(sdk_frames(), on_connect=write)
-        assert leak_streams(stack) == ["tmp_files"]
-
-    def test_exception_chain_is_scanned(self, stack: Stack) -> None:
-        stack.script(sdk_frames(), on_connect=raising(RuntimeError(f"cannot connect {CANARY}")))
-        assert "exceptions" in leak_streams(stack)
-
-    def test_workflow_result_and_events_are_scanned(self, stack: Stack) -> None:
-        echoed = json.dumps({"answer": f"echo {CANARY}"})
-        stack.script(sdk_frames(text=echoed))
-        assert {"events", "workflow_result"} <= set(leak_streams(stack))
-
-    def test_workflow_result_is_the_value_the_engine_returned(self, stack: Stack) -> None:
-        """Derived from ``engine.run``'s return value, not from an inaccessible provider field."""
-        from conductor.engine.workflow import WorkflowEngine
-
-        real = WorkflowEngine.run
-
-        async def planted(self: Any, inputs: Any) -> Any:
-            out = await real(self, inputs)
-            return {**out, "answer": f"planted {CANARY}"}
-
-        stack.monkeypatch.setattr(WorkflowEngine, "run", planted)
-        stack.script(sdk_frames())
-        adapters = stack.adapters()
-        observed = asyncio.run(adapters.workflow.execute(stack.variants()[S.L2]))
-        assert observed.streams["workflow_result"] == observed.output
-        assert lm.scan_streams(
-            CANARY, {"workflow_result": observed.streams["workflow_result"]}
-        ) == ["workflow_result"]
-
-    def test_no_result_is_marked_not_available_and_still_complete(self, stack: Stack) -> None:
-        stack.script(sdk_frames(is_error=True, status=500))
-        adapters = stack.adapters()
-        observed = asyncio.run(adapters.workflow.execute(stack.variants()[S.L2]))
-        assert observed.streams["workflow_result"] is lm.NOT_AVAILABLE
-        findings = adapters.board.for_case(S.L2)
-        assert findings.entries[lm.REQUIRED_STREAMS.index("workflow_result")] == (
-            "workflow_result:not_available"
-        )
-        assert not findings.incomplete
+        assert len(stack.probe.envs) == 3
+        assert stack.probe.sites == ["direct", "validation", "execution"]
+        assert result.quota_attempts == 1 <= lm.DEFAULT_QUOTA_CEILING  # probes are not counted
 
 
 @pytest.mark.claude_auth_readiness_mocked
 class TestPerCaseIsolation:
-    """Nothing from L0 / L1 / L3 / L2 bleeds into another case."""
+    """Nothing from L0 bleeds into L1."""
 
-    def test_environment_and_observer_are_restored_after_a_full_session(
+    def test_environment_is_restored_after_a_full_session(
         self, stack: Stack, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "route-token-value")
         monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
         before = dict(os.environ)
-        stack.script(sdk_frames())
-        stack.script(sdk_frames(error="authentication_failed", is_error=True, status=401))
+        loggers_before = private_logger_state()
         stack.script(sdk_frames())
         result = stack.session()
         assert result.succeeded
         assert dict(os.environ) == before
-        import claude_agent_sdk
+        assert private_logger_state() == loggers_before
 
-        assert claude_agent_sdk.ClaudeSDKClient.receive_response is stack.receive_original
-
-    def test_each_case_sees_its_own_environment_and_the_route_scrub(
+    def test_each_case_sees_the_route_scrub_and_no_credential(
         self, stack: Stack, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "route-token-value")
-        seen: list[dict[str, str | None]] = [{}, {}, {}]
+        seen: dict[str, str | None] = {}
 
-        def route_probe(target: dict[str, str | None]) -> Callable[[], None]:
-            def record() -> None:
-                target["key"] = os.environ.get("ANTHROPIC_API_KEY")
-                target["token"] = os.environ.get("ANTHROPIC_AUTH_TOKEN")
-                target["home"] = os.environ.get("HOME")
+        def record() -> None:
+            seen["key"] = os.environ.get("ANTHROPIC_API_KEY")
+            seen["token"] = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+            seen["home"] = os.environ.get("HOME")
 
-            return record
-
-        stack.script(sdk_frames(), on_connect=route_probe(seen[0]))
-        stack.script(
-            sdk_frames(error="authentication_failed", is_error=True, status=401),
-            on_connect=route_probe(seen[1]),
-        )
-        stack.script(sdk_frames(), on_connect=route_probe(seen[2]))
+        stack.script(sdk_frames(), on_connect=record)
         assert stack.session().succeeded
-        assert [s["key"] for s in seen] == [None, CANARY, CANARY]
-        assert all(s["token"] is None for s in seen)
-        assert all(s["home"] == os.environ.get("HOME") for s in seen)  # real HOME kept
+        assert seen["key"] is None and seen["token"] is None
+        assert seen["home"] == os.environ.get("HOME")  # real HOME kept
 
-    def test_failure_in_one_case_still_restores_everything(self, stack: Stack) -> None:
+    def test_failure_in_the_case_still_restores_everything(self, stack: Stack) -> None:
         before = dict(os.environ)
         loggers_before = private_logger_state()
         stack.script(sdk_frames(), on_connect=raising(RuntimeError("boom")))
-        result, _ = stack.run_case(S.L3)
+        result, _ = stack.run_case(S.L1)
         assert outcome_of(result) is O.INCONCLUSIVE
         assert private_logger_state() == loggers_before
         assert dict(os.environ) == before
-        import claude_agent_sdk
-
-        assert claude_agent_sdk.ClaudeSDKClient.receive_response is stack.receive_original
 
     def test_event_log_and_run_records_stay_under_tmp_path(self, stack: Stack) -> None:
         stack.script(sdk_frames())
@@ -8179,8 +7157,6 @@ class TestAdapterStructure:
             "pytestconfig",
             "tmp_path",
             "monkeypatch",
-            "capfd",
-            "canary",
         ]
 
     def test_only_the_guarded_snapshot_reads_the_process_table(self) -> None:
@@ -8229,29 +7205,25 @@ class TestAdapterStructure:
 
     def test_adapters_patch_only_through_an_independent_context(self) -> None:
         """No ``self._monkeypatch.setenv/delenv/setattr`` outside a ``.context()`` scope."""
-        for name in ("RealReadinessAdapter", "RealWorkflowAdapter", "RealObserverInstaller"):
+        for name in ("RealReadinessAdapter", "RealWorkflowAdapter"):
             node = adapter_class_nodes()[name]
             source = ast.unparse(node)
             assert "self._monkeypatch.context()" in source, name
             for direct in ("setenv", "delenv", "setattr", "setitem", "delitem", "chdir"):
                 assert f"self._monkeypatch.{direct}(" not in source, (name, direct)
 
-    def test_both_capturing_adapters_scan_on_every_exit_path(self) -> None:
-        """The scan sits in a ``finally`` that also runs when a non-``Exception`` propagates."""
+    def test_both_real_adapters_enter_the_private_sink_around_their_whole_body(self) -> None:
+        """The exact ``with`` of the pinned chain (H59 (vi) (h) is the full static proof)."""
         for name in ("RealReadinessAdapter", "RealWorkflowAdapter"):
             source = ast.unparse(adapter_class_nodes()[name])
-            assert "except BaseException" in source and "finally:" in source, name
-            assert "record_case_scan(" in source and "PrivateLogCapture(" in source, name
-            after_handler = source.split("except BaseException")[1]
-            assert "raise" in after_handler.split("finally:")[0], name  # bare re-raise
+            assert source.count("with self._monkeypatch.context() as mp, PrivateLogSink():") == 1
+            assert "PrivateLogCapture" not in source and "_BufferHandler" not in source
 
-    def test_live_tests_request_capfd_but_never_capsys_too(self) -> None:
-        """pytest refuses ``capfd`` and ``capsys`` together ("cannot use ... at the same time")."""
+    def test_live_tests_request_no_capture_fixture(self) -> None:
         for name in ("test_official_live_evidence", "test_readiness_probe_only"):
             params = list(inspect.signature(getattr(lm, name)).parameters)
-            assert params == ["pytestconfig", "tmp_path", "monkeypatch", "capfd"], name
-            assert not {"capfd", "capsys"} <= set(params)
-            assert "caplog" not in params  # the live tests never use pytest's log capture
+            assert params == ["pytestconfig", "tmp_path", "monkeypatch"], name
+            assert not {"capfd", "capsys", "caplog"} & set(params)
 
     # -- the tests below construct or call real adapters: tripwires are armed first (H24) ----
     def test_configured_adapters_construction_failure_is_adapters_not_wired(
@@ -8266,7 +7238,7 @@ class TestAdapterStructure:
 
         monkeypatch.setattr(lm, "RealCliEvidenceAdapter", broken)
         with raises_outcome(O.ADAPTERS_NOT_WIRED):
-            lm.configured_adapters(make_config(), tmp_path, monkeypatch, None, canary=CANARY)
+            lm.configured_adapters(make_config(), tmp_path, monkeypatch)
         assert boundary_hits == []
 
     def test_configured_adapters_requires_the_gates(
@@ -8274,36 +7246,23 @@ class TestAdapterStructure:
     ) -> None:
         monkeypatch.delenv(lm.GATE_ENV, raising=False)
         with pytest.raises(lm.LiveOptInError):
-            lm.configured_adapters(make_config(), tmp_path, monkeypatch, None, canary=CANARY)
+            lm.configured_adapters(make_config(), tmp_path, monkeypatch)
         assert boundary_hits == []
 
-    def test_configured_adapters_rejects_a_malformed_canary(
+    def test_configured_adapters_returns_the_four_real_adapters(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         gates_on: None,
         boundary_hits: list[str],
     ) -> None:
-        with raises_outcome(O.CANARY_SCAN_INCOMPLETE):
-            lm.configured_adapters(
-                make_config(), tmp_path, monkeypatch, None, canary="not-a-canary"
-            )
-        assert boundary_hits == []
-
-    def test_configured_adapters_returns_the_five_real_adapters(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        gates_on: None,
-        boundary_hits: list[str],
-    ) -> None:
-        adapters = lm.configured_adapters(make_config(), tmp_path, monkeypatch, None, canary=CANARY)
+        adapters = lm.configured_adapters(make_config(), tmp_path, monkeypatch)
         assert isinstance(adapters.readiness, lm.RealReadinessAdapter)
         assert isinstance(adapters.workflow, lm.RealWorkflowAdapter)
         assert isinstance(adapters.cli, lm.RealCliEvidenceAdapter)
         assert isinstance(adapters.descendants, lm.RealDescendantAdapter)
-        assert isinstance(adapters.observer, lm.RealObserverInstaller)
-        assert adapters.board.canary == CANARY  # one ledger, shared with the case wrapper
+        assert isinstance(adapters.board, lm.FindingsBoard)  # one ledger, shared with the wrapper
+        assert not hasattr(adapters, "observer")  # the passive observer is retired
         assert boundary_hits == []
 
     def test_constructing_the_adapter_set_enters_no_boundary_and_records_nothing(
@@ -8313,39 +7272,28 @@ class TestAdapterStructure:
         gates_on: None,
         boundary_hits: list[str],
     ) -> None:
-        adapters = lm.configured_adapters(make_config(), tmp_path, monkeypatch, None, canary=CANARY)
+        adapters = lm.configured_adapters(make_config(), tmp_path, monkeypatch)
         assert boundary_hits == []
         assert list(tmp_path.glob("workflow-*.yaml")) == []  # nothing written before a case runs
-        assert all(not adapters.board.for_case(case).scan for case in lm.ORDER)
+        assert all(adapters.board.for_case(case).descendants is None for case in lm.ORDER)
 
     def test_each_real_adapter_refuses_to_run_without_the_gates(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary_hits: list[str]
     ) -> None:
         monkeypatch.delenv(lm.GATE_ENV, raising=False)
         config = make_config()
-        board = lm.FindingsBoard(CANARY)
-        readiness = lm.RealReadinessAdapter(
-            config, tmp_path, monkeypatch, capfd=None, canary=CANARY, board=board
-        )
+        readiness = lm.RealReadinessAdapter(config, tmp_path, monkeypatch)
         with pytest.raises(lm.LiveOptInError):
             asyncio.run(readiness.probe())
-        workflow = lm.RealWorkflowAdapter(
-            config, tmp_path, monkeypatch, capfd=None, canary=CANARY, board=board
-        )
-        variant = lm.CaseVariant(S.L1, "subscription", {}, lm.EnvPlan((), ()))
+        workflow = lm.RealWorkflowAdapter(config, tmp_path, monkeypatch)
         with pytest.raises(lm.LiveOptInError):
-            asyncio.run(workflow.execute(variant))
+            asyncio.run(workflow.execute({}))
         with pytest.raises(lm.LiveOptInError):
             lm.RealDescendantAdapter(config, tmp_path).snapshot()
         with pytest.raises(lm.LiveOptInError):
             lm.RealCliEvidenceAdapter(config, tmp_path).resolve()
-        with (
-            pytest.raises(lm.LiveOptInError),
-            lm.RealObserverInstaller(config, tmp_path, monkeypatch).observing(),
-        ):
-            pass
         assert boundary_hits == []
-        assert not any(board.for_case(case).scan for case in lm.ORDER)  # refused before any scan
+        assert list(tmp_path.glob("workflow-*.yaml")) == []  # refused before anything was written
 
 
 class RecordingHandler(logging.Handler):
@@ -8357,37 +7305,53 @@ class RecordingHandler(logging.Handler):
         self.records.append(record)
 
 
-class TestPrivateLogCapture:
-    """H21 (iii)-(v): a private handler, a fixed logger set, no propagation, exact restoration."""
+def sink_state(names: Sequence[str]) -> dict[str, tuple[int, list[Any], bool, bool]]:
+    return {
+        n: (lg.level, list(lg.handlers), lg.propagate, lg.disabled)
+        for n in names
+        for lg in [logging.getLogger(n)]
+    }
 
-    def test_records_of_the_sdk_and_its_children_and_the_provider_are_captured(self) -> None:
-        with lm.PrivateLogCapture(CANARY) as logs:
-            logging.getLogger("claude_agent_sdk").debug("sdk %s", SECRET)
-            logging.getLogger("claude_agent_sdk._internal.query").debug("child %s", SECRET)
-            logging.getLogger("conductor.providers.claude_agent_sdk").info("provider %s", SECRET)
-            logging.getLogger("other.library").debug("not-ours %s", SECRET)
-        assert logs.text.count(SECRET) == 3 and "not-ours" not in logs.text
-        assert not logs.leaked
 
-    def test_nothing_reaches_the_root_logger_or_pytest_report_handlers(
-        self, caplog: pytest.LogCaptureFixture
+class TestPrivateLogSink:
+    """H21 (iii)-(v): a private discarding sink, a fixed logger set, no propagation, no level."""
+
+    def test_records_of_the_sdk_and_its_children_and_the_provider_are_counted(self) -> None:
+        with lm.PrivateLogSink() as sink:
+            logging.getLogger("claude_agent_sdk").warning("sdk %s", SECRET)
+            logging.getLogger("claude_agent_sdk._internal.query").warning("child %s", SECRET)
+            logging.getLogger("conductor.providers.claude_agent_sdk").error("provider %s", SECRET)
+            logging.getLogger("other.library").warning("not-ours %s", SECRET)
+            assert sink.arrivals == 3
+        assert sink.arrivals == 3 and type(sink.arrivals) is int
+
+    def test_nothing_reaches_the_root_logger_pytest_handlers_or_the_last_resort(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         probe = RecordingHandler()
         root = logging.getLogger()
         root.addHandler(probe)
         level = root.level
+        resort: list[object] = []
+
+        class CountingResort:
+            def handle(self, record: logging.LogRecord) -> None:
+                resort.append(record)
+
+        monkeypatch.setattr(logging, "lastResort", CountingResort())
         try:
-            with lm.PrivateLogCapture(CANARY):
+            with lm.PrivateLogSink() as sink:
                 assert root.level == level  # never raised, not even temporarily
-                logging.getLogger("claude_agent_sdk").debug("dbg %s", SECRET)
+                logging.getLogger("claude_agent_sdk").warning("wrn %s", SECRET)
                 logging.getLogger("claude_agent_sdk").error("err %s", SECRET)  # not propagated
                 logging.getLogger("conductor.providers.claude_agent_sdk").warning("w %s", SECRET)
-                logging.getLogger("hermetic.other").debug("other %s", SECRET)  # root level filters
+                assert sink.arrivals == 3
             assert root.level == level
         finally:
             root.removeHandler(probe)
         assert [r for r in probe.records if SECRET in r.getMessage()] == []
         assert SECRET not in caplog.text  # pytest's captured-log section
+        assert resort == []  # Python's last-resort handler is never reached
 
     @pytest.mark.parametrize(
         "exit_with",
@@ -8397,88 +7361,126 @@ class TestPrivateLogCapture:
     def test_level_handlers_propagation_and_disabled_are_restored_exactly(
         self, exit_with: BaseException | None
     ) -> None:
-        odd_a = logging.getLogger("hermetic.priv.a")
-        odd_b = logging.getLogger("hermetic.priv.b")
+        names = lm.PRIVATE_LOGGERS
+        first, second = (logging.getLogger(n) for n in names)
         keep = RecordingHandler()
-        odd_a.setLevel(logging.ERROR)
-        odd_a.propagate = True
-        odd_a.addHandler(keep)
-        odd_b.setLevel(logging.NOTSET)
-        odd_b.propagate = False
-        odd_b.disabled = True
-        names = ("hermetic.priv.a", "hermetic.priv.b", *lm.PRIVATE_LOGGERS)
-        before = {
-            n: (lg.level, list(lg.handlers), lg.propagate, lg.disabled)
-            for n in names
-            for lg in [logging.getLogger(n)]
-        }
+        first.setLevel(logging.ERROR)
+        first.propagate = True
+        first.addHandler(keep)
+        second.setLevel(logging.NOTSET)
+        second.propagate = False
+        second.disabled = True
+        before = sink_state(names)
         root_before = private_logger_state()["<root>"]
         try:
             try:
-                with lm.PrivateLogCapture(CANARY, loggers=names) as logs:
-                    assert all(logging.getLogger(n).level == logging.DEBUG for n in names)
-                    assert all(logging.getLogger(n).propagate is False for n in names)
-                    assert all(logging.getLogger(n).disabled is False for n in names)
-                    odd_a.debug("captured %s", SECRET)
-                    assert SECRET in logs.text
+                with lm.PrivateLogSink():
+                    for name in names:
+                        level, handlers, propagate, _disabled = sink_state((name,))[name]
+                        assert level == before[name][0]  # no level is ever changed
+                        assert propagate is False
+                        extra = [h for h in handlers if h not in before[name][1]]
+                        assert [type(h) for h in extra] == [lm._CountingDiscardHandler]
+                    for name in names:  # code in the scope may flip the flag; exit restores it
+                        logging.getLogger(name).disabled = not before[name][3]
                     if exit_with is not None:
                         raise exit_with
             except BaseException as raised:
                 assert raised is exit_with  # never swallowed, never replaced
-            after = {
-                n: (lg.level, list(lg.handlers), lg.propagate, lg.disabled)
-                for n in names
-                for lg in [logging.getLogger(n)]
-            }
-            assert after == before
+            assert sink_state(names) == before
             assert private_logger_state()["<root>"] == root_before
         finally:
-            odd_a.removeHandler(keep)
-            odd_a.setLevel(logging.NOTSET)
-            odd_a.propagate = True
-            odd_b.disabled = False
-            odd_b.propagate = True
+            first.removeHandler(keep)
+            first.setLevel(logging.NOTSET)
+            first.propagate = True
+            first.disabled = False
+            second.disabled = False
+            second.propagate = True
 
-    def test_a_failure_while_entering_restores_what_was_already_changed(self) -> None:
-        logger = logging.getLogger("hermetic.priv.enter")
-        before = (logger.level, list(logger.handlers), logger.propagate, logger.disabled)
-        bad_names = cast("Sequence[str]", ("hermetic.priv.enter", 123))
-        with pytest.raises(TypeError), lm.PrivateLogCapture(CANARY, loggers=bad_names):
-            pytest.fail("entered")
-        assert (logger.level, list(logger.handlers), logger.propagate, logger.disabled) == before
+    def test_a_failure_while_entering_restores_what_was_already_changed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        first, second = lm.PRIVATE_LOGGERS
+        before = sink_state(lm.PRIVATE_LOGGERS)
+        real = logging.getLogger
 
-    def test_the_canary_is_checked_when_the_record_is_emitted(self) -> None:
-        handler = lm._BufferHandler(CANARY, max_records=1)
-        handler.handle(logging.makeLogRecord({"msg": f"key {CANARY}", "levelno": 10}))
-        handler.handle(logging.makeLogRecord({"msg": "innocent", "levelno": 10}))
-        assert handler.leaked  # remembered although the bounded buffer has evicted the record
-        assert CANARY not in "\n".join(handler.records)
-        fragment = logging.makeLogRecord({"msg": f"part {CANARY[20:34]}", "levelno": 10})
-        other = lm._BufferHandler(CANARY)
-        other.handle(fragment)
-        assert other.leaked
+        def broken(name: str | None = None) -> logging.Logger:
+            if name == second:
+                raise TypeError("cannot get the second logger")
+            return real(name)
 
-    def test_a_leak_in_a_log_record_is_a_leak_of_the_logs_stream_only(self) -> None:
-        with lm.PrivateLogCapture(CANARY) as logs:
-            logging.getLogger("claude_agent_sdk").debug("k %s", CANARY)
-        assert logs.leaked
-        streams = clean_streams()
-        streams["logs"] = logs.text
-        report = lm.scan_report(CANARY, streams, case="L1")
-        assert report.leaks == ("logs",)
+        sink = lm.PrivateLogSink()
+        monkeypatch.setattr(lm.logging, "getLogger", broken)
+        with pytest.raises(TypeError):
+            sink.__enter__()
+        monkeypatch.setattr(lm.logging, "getLogger", real)
+        assert sink_state((first, second)) == before
 
-    def test_record_text_is_bounded(self) -> None:
-        with lm.PrivateLogCapture(CANARY) as logs:
-            logging.getLogger("claude_agent_sdk").debug("x" * 50_000)
-        assert len(logs.text) <= 2000
-
-    def test_a_record_that_cannot_be_formatted_never_raises_into_the_sdk(self) -> None:
+    def test_the_sink_retains_no_text_and_survives_an_unformattable_record(self) -> None:
         class Broken:
             def __str__(self) -> str:
                 raise RuntimeError("no str")
 
-        with lm.PrivateLogCapture(CANARY):
-            logging.getLogger("claude_agent_sdk").debug("value %s", Broken())
+        with lm.PrivateLogSink() as sink:
+            logging.getLogger("claude_agent_sdk").warning("value %s", Broken())  # never raises
+            logging.getLogger("claude_agent_sdk").warning("%s", SECRET)
+            handler = sink._handler
+            assert sink.arrivals == 2
+            held = [*vars(sink).values(), *vars(handler).values()]
+            assert not any(
+                isinstance(v, str | bytes | list | dict | logging.LogRecord) and SECRET in repr(v)
+                for v in held
+            )
+            # the only own attribute of the handler is the integer counter; the rest is the
+            # inherited ``logging.Handler`` state, which holds no record text
+            own = set(vars(handler)) - set(vars(logging.Handler()))
+            assert own == {"arrivals"}
+
+    def test_the_handler_defines_exactly_init_and_emit_with_the_pinned_bodies(self) -> None:
+        tree = module_ast()
+        (cls,) = [
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "_CountingDiscardHandler"
+        ]
+        methods = {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
+        assert [getattr(n, "name", None) for n in cls.body if not isinstance(n, ast.Expr)] == [
+            "__init__",
+            "emit",
+        ]
+
+        def body(fn: ast.FunctionDef) -> list[str]:
+            return [
+                ast.unparse(st)
+                for st in fn.body
+                if not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant))
+            ]
+
+        assert body(methods["__init__"]) == ["super().__init__()", "self.arrivals = 0"]
+        assert body(methods["emit"]) == ["self.arrivals += 1"]
+        assert ast.unparse(methods["emit"].args) == "self, record: logging.LogRecord"
+        assert ast.unparse(methods["__init__"].args) == "self"
+        for node in ast.walk(cls):  # the emit never reads the record
+            assert not (
+                isinstance(node, ast.Attribute) and node.attr in {"msg", "args", "getMessage"}
+            )
+
+    def test_the_sink_has_the_pinned_surface(self) -> None:
+        tree = module_ast()
+        (cls,) = [
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "PrivateLogSink"
+        ]
+        assert [n.name for n in cls.body if isinstance(n, ast.FunctionDef)] == [
+            "__init__",
+            "arrivals",
+            "__enter__",
+            "__exit__",
+        ]
+        assert (
+            ast.unparse(next(n for n in cls.body if getattr(n, "name", "") == "__init__").args)
+            == "self"
+        )
+        assert lm.PRIVATE_LOGGERS == ("claude_agent_sdk", "conductor.providers.claude_agent_sdk")
 
 
 class TestAuthorizedCommands:
@@ -8557,7 +7559,6 @@ class TestStructuralTripwires:
         {
             "RealReadinessAdapter",
             "RealWorkflowAdapter",
-            "RealObserverInstaller",
             "RealDescendantAdapter",
             "RealCliEvidenceAdapter",
             "configured_adapters",
@@ -8569,8 +7570,7 @@ class TestStructuralTripwires:
     EXPECTED = {
         "test_configured_adapters_construction_failure_is_adapters_not_wired",
         "test_configured_adapters_requires_the_gates",
-        "test_configured_adapters_rejects_a_malformed_canary",
-        "test_configured_adapters_returns_the_five_real_adapters",
+        "test_configured_adapters_returns_the_four_real_adapters",
         "test_constructing_the_adapter_set_enters_no_boundary_and_records_nothing",
         "test_each_real_adapter_refuses_to_run_without_the_gates",
     }
@@ -8730,7 +7730,6 @@ class TestStaleStatusGuard:
 # Fabricated captures for the classifier tests (H40, H47, H48, H51)
 # ============================================================================
 
-CLEAN_SCAN = [f"{name}:clean" for name in lm.REQUIRED_STREAMS]
 HEADING = "=" * 20 + " claude subscription live evidence " + "=" * 20
 COUNT_OK = "1 passed, 1 deselected in 2.00s"
 TRIO = (
@@ -8770,7 +7769,6 @@ def case_fields(case: str, outcome: str = "ok", **over: Any) -> dict[str, Any]:
         "secondary_findings": [],
         "interrupted": "none",
         "descendants": "no_descendants_remaining",
-        "canary_scan": list(CLEAN_SCAN),
         "attempted_quota_execution": False,
     }
     base.update(over)
@@ -8779,8 +7777,8 @@ def case_fields(case: str, outcome: str = "ok", **over: Any) -> dict[str, Any]:
 
 def run_fields(**over: Any) -> dict[str, Any]:
     base: dict[str, Any] = {
-        "quota_attempts_total": 3,
-        "quota_ceiling": 3,
+        "quota_attempts_total": 1,
+        "quota_ceiling": 1,
         "pytest_version": "9.0.3",
         "plugins": ["anyio==4.12.1"],
     }
@@ -8788,32 +7786,14 @@ def run_fields(**over: Any) -> dict[str, Any]:
     return {k: v for k, v in base.items() if v is not None}
 
 
-OFFICIAL_OUTCOMES = (("L0", "ok"), ("L1", "ok"), ("L3", "invalid_key"), ("L2", "ok"))
-
-# The one shared builder of the L3 diagnostic triple (design 8.3.1, 5.8 item 9): every fabricated
-# official capture carries the qualifying triple of a correctly working harness.
-QUALIFYING_TRIPLE: dict[str, str] = {
-    "diag_provider_retryability": "non_retryable",
-    "diag_assistant_error": "authentication_failed",
-    "diag_api_status": "401",
-}
-
-
-def diag_triple(
-    retryability: str = "non_retryable",
-    assistant: str = "authentication_failed",
-    status: str = "401",
-) -> dict[str, str]:
-    return {
-        "diag_provider_retryability": retryability,
-        "diag_assistant_error": assistant,
-        "diag_api_status": status,
-    }
+OFFICIAL_OUTCOMES = (("L0", "ok"), ("L1", "ok"))
 
 
 def official_cases() -> list[dict[str, Any]]:
+    """The one shared builder of the official cases: L0 not attempted, L1 the one attempt."""
     return [
-        case_fields(c, o, **(QUALIFYING_TRIPLE if c == "L3" else {})) for c, o in OFFICIAL_OUTCOMES
+        case_fields("L0", "ok", attempted_quota_execution=False),
+        case_fields("L1", "ok", attempted_quota_execution=True),
     ]
 
 
@@ -9075,7 +8055,7 @@ class TestClassifierGrammar:
             cases=[case_fields("L0")],
             run=run_fields(
                 primary_failure="L1:case_failed:HarnessFailure",
-                not_executed="L1:not_executed_after_l0_failure,L3:not_executed_after_l0_failure,L2:not_executed_after_l0_failure",
+                not_executed="L1:not_executed_after_l0_failure",
             ),
             g4=(0, "pass", "false"),
         )
@@ -9098,7 +8078,7 @@ class TestClassifierGrammar:
             cases=[case_fields("L0"), case_fields("L1", "case_failed")],
             run=run_fields(
                 primary_failure="L1:case_failed:HarnessFailure",
-                not_executed="L0:not_executed_after_l0_failure,L3:not_executed_after_l1_failure,L2:not_executed_after_l1_failure",
+                not_executed="L0:not_executed_after_l0_failure",
             ),
             g4=(0, "pass", "false"),
         )
@@ -9253,32 +8233,29 @@ class TestFourOutcomes:
                 ("discard", "evidence_inconsistent"),
             ),
             (
+                "one case",
+                {"cases": [case_fields("L0", "ok")]},
+                0,
+                ("discard", "evidence_inconsistent"),
+            ),
+            (
                 "three cases",
-                {"cases": [case_fields(c, o) for c, o in OFFICIAL_OUTCOMES[:3]]},
+                {"cases": [*official_cases(), case_fields("L1", "ok")]},
                 0,
                 ("discard", "evidence_inconsistent"),
             ),
             (
                 "wrong order",
-                {
-                    "cases": [
-                        case_fields(c, o)
-                        for c, o in (
-                            OFFICIAL_OUTCOMES[1],
-                            OFFICIAL_OUTCOMES[0],
-                            *OFFICIAL_OUTCOMES[2:],
-                        )
-                    ]
-                },
+                {"cases": list(reversed(official_cases()))},
                 0,
                 ("discard", "evidence_inconsistent"),
             ),
             (
-                "L3 fell back",
+                "L1 inconclusive",
                 {
                     "cases": [
-                        case_fields(c, "fell_back_to_login" if c == "L3" else o)
-                        for c, o in OFFICIAL_OUTCOMES
+                        case_fields("L0", "ok"),
+                        case_fields("L1", "inconclusive", attempted_quota_execution=True),
                     ]
                 },
                 0,
@@ -9286,7 +8263,7 @@ class TestFourOutcomes:
             ),
             (
                 "run primary failure",
-                {"run": run_fields(primary_failure="L3:fell_back_to_login:none")},
+                {"run": run_fields(primary_failure="L1:inconclusive:none")},
                 0,
                 ("discard", "evidence_inconsistent"),
             ),
@@ -9294,26 +8271,75 @@ class TestFourOutcomes:
                 "quota 4",
                 {"run": run_fields(quota_attempts_total=4)},
                 0,
-                ("discard", "evidence_inconsistent"),
+                ("discard", "evidence_record_invalid"),
             ),
-            ("quota 3", {"run": run_fields(quota_attempts_total=3)}, 0, ("official", "ok")),
-            ("quota 0", {"run": run_fields(quota_attempts_total=0)}, 0, ("official", "ok")),
-            ("quota 2", {"run": run_fields(quota_attempts_total=2)}, 0, ("official", "ok")),
+            (
+                "quota 3",
+                {"run": run_fields(quota_attempts_total=3)},
+                0,
+                ("discard", "evidence_record_invalid"),
+            ),
+            (
+                "quota 2",
+                {"run": run_fields(quota_attempts_total=2)},
+                0,
+                ("discard", "evidence_record_invalid"),
+            ),
             (
                 "quota -1",
                 {"run": run_fields(quota_attempts_total=-1)},
                 0,
-                ("discard", "evidence_inconsistent"),
+                ("discard", "evidence_record_invalid"),
             ),
             (
-                "quota -3",
-                {"run": run_fields(quota_attempts_total=-3)},
+                "quota 0",
+                {"run": run_fields(quota_attempts_total=0)},
                 0,
                 ("discard", "evidence_inconsistent"),
             ),
             (
                 "no quota",
                 {"run": run_fields(quota_attempts_total=None)},
+                0,
+                ("discard", "evidence_inconsistent"),
+            ),
+            (
+                "ceiling 0",
+                {"run": run_fields(quota_ceiling=0)},
+                0,
+                ("discard", "evidence_record_invalid"),
+            ),
+            (
+                "ceiling 2",
+                {"run": run_fields(quota_ceiling=2)},
+                0,
+                ("discard", "evidence_record_invalid"),
+            ),
+            (
+                "ceiling 3",
+                {"run": run_fields(quota_ceiling=3)},
+                0,
+                ("discard", "evidence_record_invalid"),
+            ),
+            (
+                "L0 attempted",
+                {
+                    "cases": [
+                        case_fields("L0", "ok", attempted_quota_execution=True),
+                        official_cases()[1],
+                    ]
+                },
+                0,
+                ("discard", "evidence_inconsistent"),
+            ),
+            (
+                "L1 not attempted",
+                {
+                    "cases": [
+                        official_cases()[0],
+                        case_fields("L1", "ok", attempted_quota_execution=False),
+                    ]
+                },
                 0,
                 ("discard", "evidence_inconsistent"),
             ),
@@ -9378,14 +8404,14 @@ class TestFourOutcomes:
         ("field", "value"),
         [
             ("outcome", "inconclusive"),
-            ("secondary_findings", ["canary_leak"]),
+            ("secondary_findings", ["descendant_leak"]),
             ("cleanup_failed", ["evidence"]),
             ("interrupted", "cancelled"),
             ("descendants", "descendant_leak"),
         ],
     )
     def test_each_unsafe_case_field_stops_official(self, field: str, value: Any) -> None:
-        for index in range(4):
+        for index in range(2):
             parts = official_parts()
             parts["cases"][index][field] = value
             # ``official: true`` over records that break item 6: the contract does not hold
@@ -9393,26 +8419,20 @@ class TestFourOutcomes:
             parts["g4"] = (0, "pass", "false")  # and without the claim it is not official either
             assert classify(parts, 0)[0] in ("failure_record", "discard"), (field, index)
 
-    def test_every_leaking_or_incomplete_canary_scan_stops_official(self) -> None:
-        for position in range(8):
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("canary_scan", ["stdout_stderr:clean"]),
+            ("diag_provider_retryability", "non_retryable"),
+            ("diag_assistant_error", "authentication_failed"),
+            ("diag_api_status", "401"),
+        ],
+    )
+    def test_the_retired_keys_are_discarded_on_any_record(self, key: str, value: Any) -> None:
+        for index in range(2):
             parts = official_parts()
-            scan = list(CLEAN_SCAN)
-            scan[position] = scan[position].replace("clean", "leak")
-            parts["cases"][1]["canary_scan"] = scan
-            assert classify(parts, 0) == ("discard", "evidence_inconsistent"), position
-            parts["g4"] = (0, "pass", "false")
-            assert classify(parts, 0)[0] != "official"
-        for broken in (CLEAN_SCAN[:-1], [*CLEAN_SCAN, "tmp_files:clean"], CLEAN_SCAN[::-1]):
-            parts = official_parts()
-            parts["cases"][1]["canary_scan"] = broken
-            assert classify(parts, 0)[0] == "discard"  # invalid record
-        illegal = list(CLEAN_SCAN)
-        illegal[2] = "logs:not_available"  # not allowed for the logs stream
-        parts = official_parts()
-        parts["cases"][1]["canary_scan"] = illegal
-        assert classify(parts, 0) == ("discard", "evidence_inconsistent")
-        parts["g4"] = (0, "pass", "false")
-        assert classify(parts, 0)[0] != "official"
+            parts["cases"][index][key] = value
+            assert classify(parts, 0) == ("discard", "evidence_record_invalid")
 
     def test_the_readiness_only_capture(self) -> None:
         assert classify(readiness_parts(), 0) == ("readiness_only", "ok")
@@ -9424,11 +8444,11 @@ class TestFourOutcomes:
         for parts in (
             edited(readiness_parts, cases=[case_fields("L0", "not_logged_in")]),
             edited(readiness_parts, cases=[case_fields("L0"), case_fields("L1")]),
-            edited(readiness_parts, cases=[case_fields("L0", secondary_findings=["canary_leak"])]),
             edited(
-                readiness_parts,
-                cases=[case_fields("L0", canary_scan=[*CLEAN_SCAN[:-1], "tmp_files:leak"])],
+                readiness_parts, cases=[case_fields("L0", secondary_findings=["descendant_leak"])]
             ),
+            edited(readiness_parts, run=run_fields(quota_attempts_total=1)),
+            edited(readiness_parts, cases=[case_fields("L0", attempted_quota_execution=True)]),
             edited(readiness_parts, count="2 passed in 0.10s"),
             edited(readiness_parts, count="1 passed, 1 skipped in 0.10s"),
         ):
@@ -9453,36 +8473,29 @@ class TestFourOutcomes:
             count="1 failed in 0.10s",
         )
         assert classify(preflight, 1) == ("failure_record", "ok")
-        fell_back = edited(
+        inconclusive = edited(
             official_parts,
             cases=[
                 case_fields("L0"),
-                case_fields("L1"),
-                case_fields("L3", "fell_back_to_login"),
+                case_fields("L1", "inconclusive", attempted_quota_execution=True),
             ],
-            run=run_fields(
-                quota_attempts_total=2,
-                primary_failure="L3:fell_back_to_login:none",
-                not_executed="L2:not_executed_l3_fell_back_to_login",
-            ),
+            run=run_fields(primary_failure="L1:inconclusive:ProviderError"),
             g4=(0, "pass", "false"),
             count="1 failed in 5.00s",
         )
-        assert classify(fell_back, 1) == ("failure_record", "ok")
-        not_paired = edited(
-            fell_back,
+        assert classify(inconclusive, 1) == ("failure_record", "ok")
+        quota_refused = edited(
+            inconclusive,
             cases=[
                 case_fields("L0"),
-                case_fields("L1"),
-                case_fields("L3", "l2_l3_not_paired", attempted_quota_execution=False),
+                case_fields("L1", "quota_ceiling_exceeded", attempted_quota_execution=False),
             ],
             run=run_fields(
-                quota_attempts_total=1,
-                primary_failure="L3:l2_l3_not_paired:HarnessFailure",
-                not_executed="L2:not_executed_after_safety_failure",
+                quota_attempts_total=0,
+                primary_failure="L1:quota_ceiling_exceeded:HarnessFailure",
             ),
         )
-        assert classify(not_paired, 1) == ("failure_record", "ok")
+        assert classify(quota_refused, 1) == ("failure_record", "ok")
         readiness_failure = edited(
             readiness_parts,
             cases=[case_fields("L0", "not_logged_in")],
@@ -9545,23 +8558,21 @@ class TestFourOutcomes:
         [
             # shape P
             (False, [], "session:isolation_fixtures_missing:HarnessFailure", "L0", True),
-            (False, [], "session:isolation_fixtures_missing:HarnessFailure", "L0,L1,L3,L2", True),
+            (False, [], "session:isolation_fixtures_missing:HarnessFailure", "L0,L1", True),
             (False, [], "session:isolation_fixtures_missing:HarnessFailure", "L1", False),
             (False, ["L0"], "session:isolation_fixtures_missing:HarnessFailure", "L0", False),
-            (True, ["L0"], "session:isolation_fixtures_missing:HarnessFailure", "L1,L3,L2", False),
+            (True, ["L0"], "session:isolation_fixtures_missing:HarnessFailure", "L1", False),
             # a session-only enum with a case prefix; a case-level enum with the session prefix
-            (True, ["L0"], "L0:adapters_not_wired:HarnessFailure", "L1,L3,L2", False),
+            (True, ["L0"], "L0:adapters_not_wired:HarnessFailure", "L1", False),
             (False, [], "session:not_logged_in:HarnessFailure", "L0", False),
-            (False, [], "session:l2_l3_not_paired:HarnessFailure", "L0", False),
             (False, [], "session:prereq_terminalreporter_missing:HarnessFailure", "L0", False),
-            (True, ["L0"], "L0:prereq_terminalreporter_missing:HarnessFailure", "L1,L3,L2", False),
-            (True, ["L0", "L1"], "L1:l2_l3_not_paired:HarnessFailure", "L3,L2", False),
-            (True, ["L0", "L1", "L3"], "L3:l2_l3_not_paired:HarnessFailure", "L2", True),
-            (True, ["L0", "L1", "L3"], "L3:interrupted:KeyboardInterrupt", "L2", True),
+            (True, ["L0"], "L0:prereq_terminalreporter_missing:HarnessFailure", "L1", False),
+            (True, ["L0", "L1"], "L1:quota_ceiling_exceeded:HarnessFailure", "", True),
+            (True, ["L0", "L1"], "L1:interrupted:KeyboardInterrupt", "", True),
             # an ``ok`` outcome is never a primary failure, whichever case it names
-            (True, ["L0", "L1", "L3"], "L3:ok:none", "L2", False),
-            (True, ["L0"], "L0:ok:none", "L1,L3,L2", False),
-            (True, ["L0", "L1"], "L0:ok:none", "L3,L2", False),
+            (True, ["L0", "L1"], "L1:ok:none", "", False),
+            (True, ["L0"], "L0:ok:none", "L1", False),
+            (True, ["L0", "L1"], "L0:ok:none", "", False),
         ],
     )
     def test_the_record_model_shapes(
@@ -9574,12 +8585,19 @@ class TestFourOutcomes:
             for r in records:
                 if r["case"] == prefix:
                     r["outcome"] = r["adapter_outcome"] = outcome
-        not_executed = ",".join(f"{c}:not_executed_after_safety_failure" for c in listed.split(","))
+        not_executed = (
+            ",".join(f"{c}:not_executed_after_safety_failure" for c in listed.split(","))
+            if listed
+            else None
+        )
+        total = 1 if session and "L1" in cases else 0
         parts = edited(
             official_parts,
             session=session_fields() if session else None,
             cases=records,
-            run=run_fields(primary_failure=primary, not_executed=not_executed),
+            run=run_fields(
+                primary_failure=primary, not_executed=not_executed, quota_attempts_total=total
+            ),
             g4=(0, "pass", "false"),
             count="1 failed in 1.00s",
         )
@@ -9591,7 +8609,7 @@ class TestFourOutcomes:
     def test_a_primary_failure_whose_enum_is_ok_is_rejected(self) -> None:
         """A completed ``ok`` case is never the primary failure: official-looking records plus a
         ``primary_failure`` naming ``ok`` are inconsistent, not a failure record."""
-        for primary in ("L1:ok:none", "L0:ok:none", "L3:ok:HarnessFailure"):
+        for primary in ("L1:ok:none", "L0:ok:none", "L1:ok:HarnessFailure"):
             parts = official_parts()
             parts["g4"] = (0, "pass", "false")
             parts["run"] = run_fields(primary_failure=primary)
@@ -9608,7 +8626,8 @@ class TestFourOutcomes:
         contradiction."""
         parts = official_parts()
         parts["g4"] = (0, "pass", "false")
-        parts["run"] = run_fields(primary_failure="L3:invalid_key:HarnessFailure")
+        parts["cases"][1]["outcome"] = parts["cases"][1]["adapter_outcome"] = "inconclusive"
+        parts["run"] = run_fields(primary_failure="L1:inconclusive:HarnessFailure")
         assert classify(parts, 1) == ("failure_record", "ok")
         assert classify(parts, 0) == ("discard", "evidence_inconsistent")  # status 0 contradicts
         parts["g4"] = (0, "pass", "true")
@@ -9661,10 +8680,10 @@ _PCT_T = r"\[ {0,2}[0-9]{1,3}%\]"
 _CNT_T = r"[0-9]{1,9} (?:failed|passed|skipped|deselected|xfailed|xpassed|warnings?|errors?)"
 _OUT_T = r"[a-z][a-z0-9_]{0,63}"
 _CLS_T = r"[A-Za-z_][A-Za-z0-9_]{0,63}"
-_CASE_T = r"L0|L1|L3|L2"
-_LIST_T = rf"(?:{_CASE_T}):{_OUT_T}(?:,(?:{_CASE_T}):{_OUT_T}){{0,7}}"
-# The design's table with one accepted deviation (the advisory of the acceptance review): the
-# ``first_failure:`` prefix of G9d may also be the fixed ``session``.
+_CASE_T = r"L0|L1"
+_LIST_T = rf"(?:{_CASE_T}):{_OUT_T}(?:,(?:{_CASE_T}):{_OUT_T}){{0,1}}"
+# The grammar table, with one extension: the ``first_failure:`` prefix of G9d may also be the
+# fixed ``session``.
 EXPECTED_GRAMMAR = {
     "G2": rf"[.sFExX]{{1,512}}(?: {{1,512}}{_PCT_T})?",
     "G3": r"={1,200} claude subscription live evidence ={1,200}",
@@ -9672,7 +8691,7 @@ EXPECTED_GRAMMAR = {
     "G4b": r"zero_skip_verdict: (?:pass|fail)",
     "G4c": r"official: (?:true|false)",
     "G5": r"EVIDENCE \{[\x20-\x7e]{0,16000}\}",
-    "G6": r"evidence_fallback_failed: (?:L0|L1|L3|L2)",
+    "G6": r"evidence_fallback_failed: (?:L0|L1)",
     "G7a": r"!{1,200} KeyboardInterrupt !{1,200}",
     "G7b": r"interrupted: details withheld",
     "G7c": r"\(to show a full traceback on KeyboardInterrupt use --full-trace\)",
@@ -9701,7 +8720,7 @@ POSITIVE_LINES = [
     ("G4c", "official: true"),
     ("G4c", "official: false"),
     ("G5", 'EVIDENCE {"outcome": "ok"}'),
-    *(("G6", f"evidence_fallback_failed: {c}") for c in ("L0", "L1", "L3", "L2")),
+    *(("G6", f"evidence_fallback_failed: {c}") for c in ("L0", "L1")),
     ("G7a", TRIO[0]),
     ("G7b", TRIO[1]),
     ("G7c", TRIO[2]),
@@ -9729,7 +8748,7 @@ POSITIVE_LINES = [
         "cases: L0:not_executed_after_safety_failure; "
         "first_failure: session:prereq_cli_missing:HarnessFailure",
     ),
-    ("G9d", "cases: L0:ok,L1:ok,L3:fell_back_to_login; first_failure: L3:fell_back_to_login:none"),
+    ("G9d", "cases: L0:ok,L1:inconclusive; first_failure: L1:inconclusive:none"),
 ]
 NEGATIVE_LINES = [
     "=========== FAILURES ===========",
@@ -9781,8 +8800,8 @@ BOUNDARY = [
     ("G9c", "a" * 64 + ":HarnessFailure", "a" * 65 + ":HarnessFailure"),
     (
         "G9d",
-        "cases: " + ",".join(["L0:ok"] * 8) + "; first_failure: none:ok:none",
-        "cases: " + ",".join(["L0:ok"] * 9) + "; first_failure: none:ok:none",
+        "cases: " + ",".join(["L0:ok"] * 2) + "; first_failure: none:ok:none",
+        "cases: " + ",".join(["L0:ok"] * 3) + "; first_failure: none:ok:none",
     ),
     ("G5", "EVIDENCE {" + "x" * 16000 + "}", "EVIDENCE {" + "x" * 16001 + "}"),
     (
@@ -9930,7 +8949,7 @@ def head_problems(source: str) -> list[str]:
         for t in ([n.target] if isinstance(n, ast.AnnAssign) else n.targets)
         if isinstance(t, ast.Name)
     }
-    for name in ("classify_capture", "scan_is_clean_and_complete", "evidence", "Outcome"):
+    for name in ("classify_capture", "evidence", "Outcome"):
         if name not in defined:
             problems.append(f"{name} is not defined in the head")
     for name in ("GRAMMAR", "EVIDENCE_KEYS", "_EVIDENCE_SPECS"):
@@ -11408,7 +10427,7 @@ class TestInheritedPythonColourAndEntryPoints:
         extra = [ln for ln in control.saved.splitlines() if lm._form_of(ln) is None]
         assert extra, f"the control must show extra lines: {variable}"
         if variable in ("PYTHONVERBOSE", "PYTEST_DEBUG"):
-            assert any("/" in ln for ln in extra)  # an absolute path where the review saw one
+            assert any("/" in ln for ln in extra)  # an absolute path appears in the extra lines
 
     @pytest.mark.parametrize("variable", ["FORCE_COLOR", "PY_COLORS"])
     def test_color_no_wins_over_the_colour_variables(self, replay: Exact, variable: str) -> None:
@@ -11449,7 +10468,6 @@ class TestInheritedPythonColourAndEntryPoints:
 FAKE_WORLD = """
 
 import asyncio
-import contextlib
 import dataclasses
 import functools
 import json
@@ -11458,10 +10476,8 @@ import sys
 from pathlib import Path
 
 from conductor.billing import SUBSCRIPTION_LABEL
-from conductor.exceptions import ProviderError
 
 SCRIPT = json.loads(os.environ.get("SANDBOX_FAKE_SCRIPT", "{}"))
-CLEAN = dict.fromkeys(lm.REQUIRED_STREAMS, "")
 CALLS = []
 
 
@@ -11487,7 +10503,6 @@ def ok_run(cost=0.001):
             }
         ],
         exception=None,
-        streams=dict(CLEAN),
         total_cost_usd=cost,
         effective_model="claude-haiku-4-5-20251001",
         fields={},
@@ -11505,55 +10520,33 @@ def ok_run(cost=0.001):
 class Readiness:
     async def probe(self):
         CALLS.append("readiness")
+        if SCRIPT.get("L0") == "keyboard_interrupt":
+            raise KeyboardInterrupt("PLANTED-l0-interrupt-4417")
         ready = SCRIPT.get("L0") != "not_logged_in"
         return lm.ReadinessObservation(ready, l0_fields())
 
 
 class Workflow:
-    def __init__(self, observer):
-        self.observer = observer
-
-    async def execute(self, variant):
-        case = variant.case.value
-        CALLS.append("execute:" + case)
-        mode = SCRIPT.get(case, "default")
+    async def execute(self, config):
+        CALLS.append("execute:L1")
+        mode = SCRIPT.get("L1", "default")
         if mode == "keyboard_interrupt":
             raise KeyboardInterrupt("PLANTED-interrupt-4417")
         if mode == "cancelled":
             raise asyncio.CancelledError()
         if mode == "boom":
             raise RuntimeError("PLANTED-case-boom-4417")
-        if case == "L3":
-            if mode == "fell_back":
-                return ok_run()
-            forged = dict(SCRIPT.get("forge_l3", {}))
-            if mode == "retryable":
-                self.observer.sink.append(lm.Observation("ResultMessage", "rate_limit", 429, True))
-                return lm.RunObservation(
-                    events=[],
-                    exception=ProviderError("retry", is_retryable=True),
-                    streams=dict(CLEAN),
-                    fields=forged,
-                )
-            if mode == "nr_untyped":
-                self.observer.sink.append(lm.Observation("ResultMessage", None, None, True))
-                return lm.RunObservation(
-                    events=[],
-                    exception=ProviderError("rejected", is_retryable=False),
-                    streams=dict(CLEAN),
-                    fields=forged,
-                )
-            status = 404 if mode == "model_unavailable" else 401
-            error = None if mode == "model_unavailable" else "authentication_failed"
-            self.observer.sink.append(lm.Observation("ResultMessage", error, status, True))
+        if mode == "label_missing":
+            return dataclasses.replace(ok_run(), console_text="")
+        if mode == "timeout":
             return lm.RunObservation(
                 events=[],
-                exception=ProviderError("rejected", is_retryable=False),
-                streams=dict(CLEAN),
-                fields=forged,
+                exception=TimeoutError("PLANTED-timeout-4417"),
+                total_cost_usd=None,
+                effective_model=None,
             )
         run = ok_run(cost=0 if mode == "unpriced" else 0.001)
-        if case == "L1" and SCRIPT.get("forge_l1"):
+        if SCRIPT.get("forge_l1"):
             return dataclasses.replace(run, fields=dict(SCRIPT["forge_l1"]))
         return run
 
@@ -11565,23 +10558,15 @@ class Cli:
 
 class Descendants:
     def snapshot(self):
+        if SCRIPT.get("leak") and "execute:L1" in CALLS:
+            return {os.getpid() + 777777: (os.getpid(), "leaky")}
         return {}
 
 
-class Observer:
-    def __init__(self):
-        self.sink = []
-
-    def observing(self):
-        @contextlib.contextmanager
-        def cm():
-            self.sink = []
-            yield self.sink
-
-        return cm()
-
-
-def fake_configured_adapters(pytestconfig, tmp_path, monkeypatch, capfd, *, canary):
+def fake_configured_adapters(pytestconfig, tmp_path, monkeypatch):
+    if SCRIPT.get("skip"):
+        plugin = pytestconfig.pluginmanager.get_plugin(lm.ZERO_SKIP_PLUGIN_NAME)
+        plugin.skipped_reports += 1  # a skip elsewhere in the session
     pathb = SCRIPT.get("pathb")
     if pathb == "live_opt_in_error":
         raise lm.LiveOptInError()
@@ -11595,42 +10580,27 @@ def fake_configured_adapters(pytestconfig, tmp_path, monkeypatch, capfd, *, cana
             raise RuntimeError("PLANTED-cause-4417")
         except RuntimeError as cause:
             raise cls(lm.Outcome(pathb), detail, extra=extra) from cause
-    observer = Observer()
     return lm.AdapterSet(
         readiness=Readiness(),
-        workflow=Workflow(observer),
+        workflow=Workflow(),
         cli=Cli(),
         descendants=Descendants(),
-        observer=observer,
-        board=lm.FindingsBoard(canary),
+        board=lm.FindingsBoard(),
     )
 
 
 lm.configured_adapters = fake_configured_adapters
 
 
-def _raise_pairing(outcome):
-    def raiser(*args, **kwargs):
-        raise lm.HarnessFailure(outcome, "pairing")
-
-    return raiser
-
-
-if SCRIPT.get("diag") == "raises":
-
-    def _diag_raiser(*args):
-        raise Exception("PLANTED-diag-4417")
-
-    lm.l3_diagnostics = _diag_raiser
-if SCRIPT.get("diag") == "omit":
-    lm.guarded_diagnostics = lambda *args: {}  # the pre-amendment shape: no triple at all
-if SCRIPT.get("pair") == "L3":
-    lm.assert_config_paired = _raise_pairing(lm.Outcome.L2_L3_NOT_PAIRED)
-if SCRIPT.get("pair") == "L2":
-    lm.assert_env_paired = _raise_pairing(lm.Outcome.L2_L3_NOT_PAIRED)
-if SCRIPT.get("quota"):
+if SCRIPT.get("quota") == "spent":
     _Real = lm.QuotaCounter
-    lm.QuotaCounter = lambda: _Real(ceiling=SCRIPT["quota"])
+
+    def _spent():
+        counter = _Real()
+        counter.attempts = 1  # the one attempt is already spent
+        return counter
+
+    lm.QuotaCounter = _spent
 if SCRIPT.get("source_tree"):
     sys.modules["conductor"].__file__ = "/nonexistent/elsewhere/conductor/__init__.py"
 if SCRIPT.get("not_bundled"):
@@ -11759,23 +10729,22 @@ class TestRunLevelEvidence:
         ("mode", "cls", "returncode"),
         [("keyboard_interrupt", "KeyboardInterrupt", 2), ("cancelled", "CancelledError", 1)],
     )
-    def test_an_interrupt_after_completed_cases_leaves_them_intact(
+    def test_an_interrupt_after_a_completed_case_leaves_it_intact(
         self, exact: Exact, mode: str, cls: str, returncode: int
     ) -> None:
-        """Real fixture and case wrapper over fake adapters: L0, L1 ok, then L3 is interrupted."""
+        """Real fixture and case wrapper over fake adapters: L0 ok, then L1 is interrupted."""
         pytest.importorskip("claude_agent_sdk")
-        out = real_run(exact, OFFICIAL_NODE, script={"L3": mode})
+        out = real_run(exact, OFFICIAL_NODE, script={"L1": mode})
         assert out.ran.returncode == returncode, out.ran.saved
         assert [(r["case"], r["outcome"]) for r in out.cases] == [
             ("L0", "ok"),
-            ("L1", "ok"),
-            ("L3", "interrupted"),
+            ("L1", "interrupted"),
         ]
         assert len(out.session) == 1 and len(out.run_level) == 1
         run = out.run_level[0]
-        assert run["primary_failure"] == f"L3:interrupted:{cls}"
-        assert run["not_executed"] == "L2:not_executed_after_interrupt"
-        assert run["quota_attempts_total"] == 2
+        assert run["primary_failure"] == f"L1:interrupted:{cls}"
+        assert "not_executed" not in run  # L1 is the last case
+        assert run["quota_attempts_total"] == 1
         assert out.ran.verdict == ("failure_record", "ok"), out.ran.saved
 
     CASE_LEVEL = [
@@ -11783,7 +10752,7 @@ class TestRunLevelEvidence:
             "not_logged_in",
             {"L0": "not_logged_in"},
             "L0:not_logged_in:HarnessFailure",
-            "L1:not_executed_after_l0_failure,L3:not_executed_after_l0_failure,L2:not_executed_after_l0_failure",
+            "L1:not_executed_after_l0_failure",
             ["L0"],
             0,
         ),
@@ -11791,40 +10760,16 @@ class TestRunLevelEvidence:
             "unpriced_model_label_unexercised",
             {"L1": "unpriced"},
             "L1:unpriced_model_label_unexercised:HarnessFailure",
-            "L3:not_executed_after_l1_failure,L2:not_executed_after_l1_failure",
+            None,
             ["L0", "L1"],
             1,
         ),
         (
-            "model_unavailable",
-            {"L3": "model_unavailable"},
-            "L3:model_unavailable:ProviderError",
-            "L2:not_executed_l3_model_unavailable",
-            ["L0", "L1", "L3"],
-            2,
-        ),
-        (
-            "l2_l3_not_paired",
-            {"pair": "L3"},
-            "L3:l2_l3_not_paired:HarnessFailure",
-            "L2:not_executed_after_safety_failure",
-            ["L0", "L1", "L3"],
-            1,
-        ),
-        (
-            "l2_l3_not_paired",
-            {"pair": "L2"},
-            "L2:l2_l3_not_paired:HarnessFailure",
-            None,
-            ["L0", "L1", "L3", "L2"],
-            2,
-        ),
-        (
             "quota_ceiling_exceeded",
-            {"quota": 1},
-            "L3:quota_ceiling_exceeded:HarnessFailure",
-            "L2:not_executed_after_safety_failure",
-            ["L0", "L1", "L3"],
+            {"quota": "spent"},
+            "L1:quota_ceiling_exceeded:HarnessFailure",
+            None,
+            ["L0", "L1"],
             1,
         ),
     ]
@@ -11852,7 +10797,7 @@ class TestRunLevelEvidence:
         assert run["quota_attempts_total"] == quota  # no attempt for the pairing or the ceiling
         failed = next(r for r in out.cases if r["case"] == primary.split(":")[0])
         assert failed["outcome"] == enum
-        if enum in ("l2_l3_not_paired", "quota_ceiling_exceeded"):
+        if enum == "quota_ceiling_exceeded":
             assert failed["attempted_quota_execution"] is False
         assert out.ran.verdict == ("failure_record", "ok"), out.ran.saved
 
@@ -11864,12 +10809,9 @@ class TestRunLevelEvidence:
         def strip(record: dict[str, Any]) -> dict[str, Any]:
             return {k: v for k, v in record.items() if k != "elapsed_s"}
 
-        l2 = real_run(exact, OFFICIAL_NODE, script={"pair": "L2"})
-        assert [strip(r) for r in l2.cases[:3]] == [strip(r) for r in baseline.cases[:3]]
-        assert "not_executed" not in l2.run_level[0]  # nothing is listed: L2 has its record
-        l3 = real_run(exact, OFFICIAL_NODE, script={"pair": "L3"})
-        assert [strip(r) for r in l3.cases[:2]] == [strip(r) for r in baseline.cases[:2]]
-        assert l3.run_level[0]["not_executed"] == "L2:not_executed_after_safety_failure"
+        refused = real_run(exact, OFFICIAL_NODE, script={"quota": "spent"})
+        assert [strip(r) for r in refused.cases[:1]] == [strip(r) for r in baseline.cases[:1]]
+        assert "not_executed" not in refused.run_level[0]  # nothing is listed: L1 has its record
 
     def test_no_dynamic_text_reaches_the_record_or_the_output(self, exact: Exact) -> None:
         out = real_run(exact, OFFICIAL_NODE, script={"pathb": "adapters_not_wired", "plant": True})
@@ -11890,7 +10832,7 @@ class TestRunLevelEvidence:
         )
         assert "ø" not in weird.ran.saved
 
-    def test_every_one_of_the_nineteen_enums_is_in_exactly_one_row(self) -> None:
+    def test_every_one_of_the_seventeen_enums_is_in_exactly_one_row(self) -> None:
         rows = {
             "fixture": {"prereq_report_sanitizer_unavailable"},
             "before_run_session": {
@@ -11912,14 +10854,12 @@ class TestRunLevelEvidence:
             "inside_case": {
                 "not_logged_in",
                 "unpriced_model_label_unexercised",
-                "model_unavailable",
-                "l2_l3_not_paired",
                 "quota_ceiling_exceeded",
             },
             "no_channel": {"prereq_terminalreporter_missing"},
         }
         flat = [e for group in rows.values() for e in group]
-        assert len(flat) == len(set(flat)) == 19
+        assert len(flat) == len(set(flat)) == 17
         tested = (
             {e for e, _ in self.PATH_B}
             | {e for e, _, _ in self.PATH_A}
@@ -11998,15 +10938,15 @@ class TestTwoPathInvariant:
     def test_path_a_first_then_fail_closed_emits_nothing_more(self) -> None:
         config, plugin = self.config_with_plugin()
         emit = lm._default_emit(config)
-        emit(lm.evidence(quota_attempts_total=1, quota_ceiling=3))  # Path A hands its record over
+        emit(lm.evidence(quota_attempts_total=1, quota_ceiling=1))  # Path A hands its record over
         assert plugin.run_record_emitted and len(plugin.evidence_lines) == 1
         first = plugin.evidence_lines[0]
         with pytest.raises(pytest.fail.Exception):
             lm.fail_closed(lm.HarnessFailure(lm.Outcome.CASE_FAILED), config)
         assert plugin.evidence_lines == [first]  # the first record stays, none is appended
-        emit(lm.evidence(quota_attempts_total=2, quota_ceiling=3))  # nor does a second Path A
+        emit(lm.evidence(quota_attempts_total=0, quota_ceiling=1))  # nor does a second Path A
         assert plugin.evidence_lines == [first]
-        assert not plugin.hand_over(lm.evidence(quota_attempts_total=0, quota_ceiling=3))
+        assert not plugin.hand_over(lm.evidence(quota_attempts_total=0, quota_ceiling=1))
 
     def test_the_emitted_flag_is_per_run_not_per_call(self) -> None:
         config, plugin = self.config_with_plugin()
@@ -12017,7 +10957,7 @@ class TestTwoPathInvariant:
 
     def test_the_diagnostics_are_on_every_run_level_record_and_both_paths(self) -> None:
         config, plugin = self.config_with_plugin()
-        lm._default_emit(config)(lm.evidence(quota_attempts_total=0, quota_ceiling=3))
+        lm._default_emit(config)(lm.evidence(quota_attempts_total=0, quota_ceiling=1))
         record = json.loads(plugin.evidence_lines[0][len("EVIDENCE ") :])
         assert record["pytest_version"] == lm.pytest_version_text()
         assert isinstance(record["plugins"], list)
@@ -12060,18 +11000,17 @@ class TestTwoPathInvariant:
                         isinstance(a, ast.Constant) and a.value is None for a in call.args
                     ), fn.name
         # offline, the defensive branch yields a case-prefixed record that the classifier rejects
-        records: list[dict[str, object]] = []
         monkeypatch.setenv(lm.GATE_ENV, "1")
         monkeypatch.setattr(lm, "assert_live_isolation", lambda tmp: None)
         monkeypatch.setattr(lm, "assert_session_console_ready", lambda: None)
+        records: list[dict[str, object]] = []
         result = asyncio.run(
-            lm.probe_readiness(
-                make_config(),
-                tmp_path,
-                None,
-                readiness_check=lambda: None,
-                prereq_check=lambda: "bundled",
+            lm.run_session(
+                preflight=lambda: None,
+                runners=lm.build_case_runners(None, l1_config={}, requested_model=""),
+                quota=lm.QuotaCounter(),
                 emit=records.append,
+                cases=(S.L0,),
             )
         )
         assert result.primary_failure == "L0:adapters_not_wired:HarnessFailure"
@@ -12390,9 +11329,9 @@ class TestEndToEnd:
         out = real_run(exact, OFFICIAL_NODE)
         assert out.ran.returncode == 0 and out.ran.verdict == ("official", "ok"), out.ran.saved
         assert "official: true" in out.ran.saved
-        assert [r["case"] for r in out.cases] == ["L0", "L1", "L3", "L2"] and len(out.session) == 1
+        assert [r["case"] for r in out.cases] == ["L0", "L1"] and len(out.session) == 1
         assert out.session[0]["git_sha"] == "0" * 40 and out.session[0]["git_dirty"] is False
-        assert out.run_level[0]["quota_attempts_total"] == 3
+        assert out.run_level[0]["quota_attempts_total"] == 1
 
     def test_the_same_run_on_a_dirty_tree_is_a_failure_record_with_status_zero(
         self, exact: Exact
@@ -12834,6 +11773,8 @@ SCRATCH_SOURCES = {
 
 # The class every sandbox-using test class belongs to (design section 10).
 SANDBOX_CLASS = {
+    "TestNoRetroactiveAcceptance": "R",
+    "TestFailClosedConditions": "R",
     "TestSandboxGates": "R",
     "TestSandboxIsolation": "R",
     "TestSandboxPrerequisites": "R",
@@ -12848,7 +11789,6 @@ SANDBOX_CLASS = {
     "TestRunLevelEvidence": "R",
     "TestRegistrationBoundaries": "R",
     "TestEndToEnd": "R",
-    "TestDiagnosticEndToEnd": "R",
     "TestCollectionMatrix": "S",
     "TestPreReporterFailures": "S",
     "TestInheritedConfiguration": "S",
@@ -12857,7 +11797,6 @@ SANDBOX_CLASS = {
     "TestIsolationControls": "S",
     "TestBuilderAudit": "S",
     "TestClassifierEntryPoint": "C",
-    "TestDiagnosticClassifierEntry": "C",
     "TestClassifierStartup": "C",
     "TestShellGate": "C",
 }
@@ -13011,7 +11950,8 @@ class TestRunbookStatements:
     def test_the_changelog_describes_a_harness_not_a_validation_that_ran(self) -> None:
         fragment = REPO_ROOT / "changelog.d" / "+claude-agent-sdk-subscription-validation.added.md"
         text = fragment.read_text()
-        assert len(text.strip().splitlines()) == 1  # one concise entry
+        assert len(text.strip().split("\n\n")) == 1  # one concise entry, wrapped
+        assert max(len(line) for line in text.splitlines()) <= 80
         assert text.startswith("Opt-in live-validation harness and operator runbook")
         assert "Opt-in live validation" not in text
 
@@ -13023,2627 +11963,5335 @@ class TestRunbookStatements:
 
 
 # ============================================================================
-# H52-H58: the L3 diagnostic fields (design 8.3.1, 8.3.2, 9.4, 5.8 items 7 and 9)
+# H59 (vi): the structural execution allowlist (design 5.9) -- static analysis helpers
+# ============================================================================
+
+
+class ResolutionUnsupported(Exception):
+    """A construct the lexical resolver deliberately does not support (it fails closed)."""
+
+
+FuncNode = ast.FunctionDef | ast.AsyncFunctionDef
+ScopeNode = ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef
+COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _target_names(target: ast.AST) -> list[str]:
+    """Names bound by an assignment-like target (tuples, lists and ``*`` included)."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Tuple | ast.List):
+        return [n for elt in target.elts for n in _target_names(elt)]
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
+    return []  # attribute and subscript targets bind no name
+
+
+def _own_nodes(root: ast.AST) -> Iterator[ast.AST]:
+    """Every node of ``root``'s own scope: nested scopes are yielded but not entered.
+
+    Nested ``def``/``class``/``lambda`` nodes and comprehensions appear (so the caller can see the
+    name they bind or the walrus targets inside a comprehension) but their bodies are not walked.
+    """
+    stack = list(ast.iter_child_nodes(root))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.Lambda):
+            continue
+        if isinstance(node, COMPREHENSIONS):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _walrus_in_comprehensions(node: ast.AST) -> Iterator[str]:
+    """Walrus targets inside ``node``'s comprehensions: they bind in the enclosing scope."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.NamedExpr):
+            yield from _target_names(sub.target)
+
+
+def scope_bindings(scope: ScopeNode) -> dict[str, str]:
+    """``name -> kind`` of every binding of ``scope`` itself (``param``, ``def``, ``import``, ...).
+
+    A walrus target inside a comprehension binds here (PEP 572); a lambda or comprehension scope
+    owns only its parameters and targets.  ``global``/``nonlocal`` fail closed.
+    """
+    bound: dict[str, str] = {}
+    if isinstance(scope, ast.Lambda | ast.FunctionDef | ast.AsyncFunctionDef):
+        args = scope.args
+        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg):
+            if arg is not None:
+                bound[arg.arg] = "param"
+    if isinstance(scope, ast.Lambda):
+        for name in _walrus_in_comprehensions(scope.body):
+            bound.setdefault(name, "walrus")
+        return bound
+    imported: set[str] = set()
+    for node in _own_nodes(scope):
+        if isinstance(node, ast.Global | ast.Nonlocal):
+            raise ResolutionUnsupported("global/nonlocal")
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            bound[node.name] = "def" if not isinstance(node, ast.ClassDef) else "class"
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                for name in _target_names(target):
+                    bound[name] = "assign"
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and node.value is not None
+            or isinstance(node, ast.AugAssign)
+        ):
+            for name in _target_names(node.target):
+                bound[name] = "assign"
+        elif isinstance(node, ast.For | ast.AsyncFor):
+            for name in _target_names(node.target):
+                bound[name] = "for"
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            for name in _target_names(node.optional_vars):
+                bound[name] = "with"
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound[node.name] = "except"
+        elif isinstance(node, ast.NamedExpr):
+            for name in _target_names(node.target):
+                bound[name] = "walrus"
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                imported.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                imported.add(alias.asname or alias.name)
+        elif isinstance(node, ast.MatchAs | ast.MatchStar) and node.name:
+            bound[node.name] = "match"
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound[node.rest] = "match"
+        if isinstance(node, COMPREHENSIONS):
+            for name in _walrus_in_comprehensions(node):
+                bound.setdefault(name, "walrus")
+    for name in imported:  # an import binding is classified before a parameter or a local
+        bound[name] = "import"
+    return bound
+
+
+def comprehension_bindings(node: ast.AST) -> dict[str, str]:
+    bound: dict[str, str] = {}
+    for generator in node.generators:  # type: ignore[attr-defined]
+        for name in _target_names(generator.target):
+            bound[name] = "comprehension"
+    return bound
+
+
+@dataclasses.dataclass(frozen=True)
+class CallFact:
+    """One ``Name`` or ``Subscript`` call of the live module with its resolution."""
+
+    node: ast.Call
+    function: str  # the qualified name of the nearest enclosing ``def`` ('' at module level)
+    callee: str  # the name, or ``<subscript>``
+    kind: str  # import | module | module-assign | builtin | local | subscript
+
+
+def qualified_calls(tree: ast.Module) -> list[CallFact]:
+    """Resolve every ``Name``/``Subscript`` call lexically, without executing anything.
+
+    Order of classification (design 5.9): the innermost scope binding the name is found; a binding
+    made by an import statement is an *import call* (parameters and locals never shadow it); a
+    module-level ``def``/``class`` is a module call; any other function, lambda or comprehension
+    binding (a nested ``def`` included) is *local*; a module-level assignment is reported as
+    ``module-assign``; no binding at all is a builtin.  A call in a class body whose target is a
+    class-local name fails closed (a class body is never an enclosing scope of a method).
+    """
+    module_scope = scope_bindings(tree)
+    facts: list[CallFact] = []
+
+    def resolve(name: str, scopes: Sequence[tuple[ast.AST, dict[str, str]]]) -> str:
+        for scope, bindings in reversed(scopes):
+            if isinstance(scope, ast.ClassDef):
+                continue  # class bodies are skipped by name resolution, as in Python
+            if name in bindings:
+                kind = bindings[name]
+                if scope is tree:
+                    return {"def": "module", "class": "module", "import": "import"}.get(
+                        kind, "module-assign"
+                    )
+                return "import" if kind == "import" else "local"
+        return "builtin"
+
+    def visit_expr(
+        node: ast.AST,
+        scopes: Sequence[tuple[ast.AST, dict[str, str]]],
+        qualified: str,
+    ) -> None:
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                top_scope, top_bindings = scopes[-1]
+                if isinstance(top_scope, ast.ClassDef) and func.id in top_bindings:
+                    raise ResolutionUnsupported("a call to a class-local name in a class body")
+                facts.append(CallFact(node, qualified, func.id, resolve(func.id, scopes)))
+            elif isinstance(func, ast.Subscript):
+                facts.append(CallFact(node, qualified, "<subscript>", "subscript"))
+        if isinstance(node, ast.Lambda):
+            _visit_defaults(node.args, scopes, qualified)
+            inner = [*scopes, (node, scope_bindings(node))]
+            visit_expr(node.body, inner, qualified)
+            return
+        if isinstance(node, COMPREHENSIONS):
+            generators = node.generators
+            visit_expr(generators[0].iter, scopes, qualified)  # evaluated in the enclosing scope
+            inner = [*scopes, (node, comprehension_bindings(node))]
+            for index, generator in enumerate(generators):
+                if index:
+                    visit_expr(generator.iter, inner, qualified)
+                for condition in generator.ifs:
+                    visit_expr(condition, inner, qualified)
+            if isinstance(node, ast.DictComp):
+                visit_expr(node.key, inner, qualified)
+                visit_expr(node.value, inner, qualified)
+            else:
+                visit_expr(node.elt, inner, qualified)
+            return
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                visit_definition(child, scopes, qualified)
+            elif isinstance(
+                child,
+                ast.stmt
+                | ast.expr
+                | ast.keyword
+                | ast.comprehension
+                | ast.excepthandler
+                | ast.withitem
+                | ast.match_case,
+            ):
+                visit_expr(child, scopes, qualified)
+            elif isinstance(child, ast.arguments | ast.arg):
+                continue
+
+    def _visit_defaults(
+        args: ast.arguments, scopes: Sequence[tuple[ast.AST, dict[str, str]]], qualified: str
+    ) -> None:
+        for default in (*args.defaults, *[d for d in args.kw_defaults if d is not None]):
+            visit_expr(default, scopes, qualified)  # evaluated in the enclosing scope
+
+    def visit_definition(
+        node: FuncNode | ast.ClassDef,
+        scopes: Sequence[tuple[ast.AST, dict[str, str]]],
+        qualified: str,
+    ) -> None:
+        for decorator in node.decorator_list:
+            visit_expr(decorator, scopes, qualified)
+        name = f"{qualified}.{node.name}" if qualified else node.name
+        if isinstance(node, ast.ClassDef):
+            for base in (*node.bases, *[k.value for k in node.keywords]):
+                visit_expr(base, scopes, qualified)
+            inner = [*scopes, (node, scope_bindings(node))]
+            for statement in node.body:
+                if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                    visit_definition(statement, inner, name)
+                else:
+                    visit_expr(statement, inner, name)
+            return
+        _visit_defaults(node.args, scopes, qualified)  # enclosing scope, not the function's own
+        inner = [*scopes, (node, scope_bindings(node))]
+        for statement in node.body:
+            if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                visit_definition(statement, inner, name)
+            else:
+                visit_expr(statement, inner, name)
+
+    top = [(tree, module_scope)]
+    for statement in tree.body:
+        if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            visit_definition(statement, top, "")
+        else:
+            visit_expr(statement, top, "")
+    return facts
+
+
+# ============================================================================
+# H59 (vi), tables A-D: the structural execution allowlist (design 5.9)
 # ============================================================================
 #
-# H52 ``TestDiagnosticReducers``, H53 ``TestDiagnosticEmission``, H54 ``TestDiagnosticClassifier``
-# (and ``TestDiagnosticClassifierEntry``), H55 ``TestDiagnosticSafety``, H56
-# ``TestClassificationUnchanged``, H57 ``TestDiagnosticSpoofing`` (and
-# ``TestDiagnosticSpoofingEndToEnd``), H58 ``TestDecisionTableOracle``.  Nothing here uses a real
-# provider, the CLI, credentials, the network or inference.
+# The tables below are hand-written literals, never derived from the live module.  Each check is
+# a function of a *source text*, so it runs on the live module (no problem expected) and on
+# scratch sources (each defect must be seen).  Threat model (D41): ordinary source edits are
+# covered; exotic runtime metaprogramming is left to the independent review and is not claimed.
 
-NR_ERROR = "non_retryable"
-DIAG_ASSISTANT_VALUES = (*sorted(lm.ASSISTANT_ERRORS), "other")
-DIAG_STATUS_SAMPLES = (None, 401, 403, 404, 429, 400, 500, 200)
-DIAG_STATUS_BUCKET = {
-    None: "absent",
-    401: "401",
-    403: "403",
-    404: "404",
-    429: "429",
-    400: "other_4xx",
-    500: "5xx",
-    200: "other",
-}
-ASSISTANT_PRECEDENCE = (
-    "authentication_failed",
-    "billing_error",
-    "invalid_request",
-    "rate_limit",
-    "server_error",
-    "unknown",
-    "other",
+# Table A: every ``conductor.*`` binding: (kind, module, name, bound name, enclosing function).
+LIVE_IMPORT_ALLOWLIST = frozenset(
+    {
+        ("dynamic", "conductor.rundir", "runs_dir", "runs_dir_fn", "assert_live_isolation"),
+        ("dynamic", "conductor.cli.pid", "pid_dir", "pid_dir_fn", "assert_live_isolation"),
+        (
+            "dynamic",
+            "conductor.fleet.records",
+            "run_records_dir",
+            "records_dir_fn",
+            "assert_live_isolation",
+        ),
+        (
+            "dynamic",
+            "conductor.fleet.retention",
+            "event_log_root",
+            "event_root_fn",
+            "assert_live_isolation",
+        ),
+        (
+            "from",
+            "conductor.providers.claude_agent_sdk",
+            "ClaudeAgentSdkProvider",
+            "ClaudeAgentSdkProvider",
+            "assert_real_readiness",
+        ),
+        (
+            "from",
+            "conductor.providers.claude_agent_sdk",
+            "_find_claude_cli",
+            "_find_claude_cli",
+            "check_prerequisites",
+        ),
+        (
+            "from",
+            "conductor.providers.claude_agent_sdk",
+            "_find_claude_cli",
+            "_find_claude_cli",
+            "resolve_cli_evidence",
+        ),
+        ("dynamic", "conductor.cli.run", None, "run_module", "assert_session_console_ready"),
+        ("dynamic", "conductor.cli.app", None, "app_module", "assert_session_console_ready"),
+        ("dynamic", "conductor", None, "conductor", "common_preflight"),
+        (
+            "from",
+            "conductor.config.loader",
+            "load_config",
+            "load_config",
+            "RealReadinessAdapter.probe",
+        ),
+        (
+            "from",
+            "conductor.config.loader",
+            "load_config",
+            "load_config",
+            "RealWorkflowAdapter.execute",
+        ),
+        ("from", "conductor.providers", "claude_agent_sdk", "sdk", "RealReadinessAdapter.probe"),
+        (
+            "from",
+            "conductor.providers.factory",
+            "create_provider",
+            "create_provider",
+            "RealReadinessAdapter.probe",
+        ),
+        (
+            "from",
+            "conductor.cli.run",
+            "display_usage_summary",
+            "display_usage_summary",
+            "RealWorkflowAdapter.execute",
+        ),
+        (
+            "from",
+            "conductor.engine.workflow",
+            "WorkflowEngine",
+            "WorkflowEngine",
+            "RealWorkflowAdapter.execute",
+        ),
+        (
+            "from",
+            "conductor.events",
+            "WorkflowEventEmitter",
+            "WorkflowEventEmitter",
+            "RealWorkflowAdapter.execute",
+        ),
+        (
+            "from",
+            "conductor.providers.registry",
+            "ProviderRegistry",
+            "ProviderRegistry",
+            "RealWorkflowAdapter.execute",
+        ),
+        (
+            "from",
+            "conductor.billing",
+            "SUBSCRIPTION_LABEL",
+            "SUBSCRIPTION_LABEL",
+            "assert_inference_success",
+        ),
+        (
+            "from",
+            "conductor.billing",
+            "AggregateBilling",
+            "AggregateBilling",
+            "assert_inference_success",
+        ),
+    }
 )
-STATUS_PRECEDENCE = ("401", "404", "403", "429", "other_4xx", "5xx", "other")
+
+# Every permitted load of a Table-A name: (bound name, function) -> the exact enclosing use.
+TABLE_A_USES = {
+    ("runs_dir_fn", "assert_live_isolation"): {
+        "_co_file(runs_dir_fn)",
+        "runs_dir_fn()",
+        "runs_dir_fn is None",
+    },
+    ("pid_dir_fn", "assert_live_isolation"): {
+        "_co_file(pid_dir_fn)",
+        "pid_dir_fn()",
+        "pid_dir_fn is None",
+    },
+    ("records_dir_fn", "assert_live_isolation"): {"records_dir_fn()", "records_dir_fn is None"},
+    ("event_root_fn", "assert_live_isolation"): {"event_root_fn()", "event_root_fn is None"},
+    ("ClaudeAgentSdkProvider", "assert_real_readiness"): {
+        "getattr(ClaudeAgentSdkProvider._check_auth_readiness, '__qualname__', '')"
+    },
+    ("_find_claude_cli", "check_prerequisites"): {"find_cli = _find_claude_cli"},
+    ("_find_claude_cli", "resolve_cli_evidence"): {"find_cli = _find_claude_cli"},
+    ("run_module", "assert_session_console_ready"): {"getattr(run_module, '_file_console', None)"},
+    ("app_module", "assert_session_console_ready"): {"app_module.is_verbose()"},
+    ("conductor", "common_preflight"): {"conductor.__file__"},
+    ("load_config", "RealReadinessAdapter.probe"): {"load_config(self._example_path)"},
+    ("load_config", "RealWorkflowAdapter.execute"): {"load_config(path)"},
+    ("sdk", "RealReadinessAdapter.probe"): {
+        "sdk._derive_billing(context, status)",
+        "sdk._FIRST_PARTY_API_PROVIDER",
+    },
+    ("create_provider", "RealReadinessAdapter.probe"): {
+        "create_provider(provider_type='claude-agent-sdk', validate=False, "
+        "default_model=runtime.default_model, max_session_seconds=runtime.max_session_seconds, "
+        "provider_settings=runtime.provider)"
+    },
+    ("display_usage_summary", "RealWorkflowAdapter.execute"): {
+        "display_usage_summary(dict(usage), console=Console(file=console_buffer, "
+        "force_terminal=False, width=120))"
+    },
+    ("WorkflowEngine", "RealWorkflowAdapter.execute"): {
+        "WorkflowEngine(cfg, registry=registry, event_emitter=emitter, workflow_path=path)"
+    },
+    ("WorkflowEventEmitter", "RealWorkflowAdapter.execute"): {"WorkflowEventEmitter()"},
+    ("ProviderRegistry", "RealWorkflowAdapter.execute"): {"ProviderRegistry(cfg)"},
+    ("SUBSCRIPTION_LABEL", "assert_inference_success"): {
+        "SUBSCRIPTION_LABEL not in observed.console_text"
+    },
+    ("AggregateBilling", "assert_inference_success"): {
+        "AggregateBilling.from_wire((observed.usage or {}).get('billing'))"
+    },
+}
+
+# Table B: the one permitted use of each of the three provider methods (each exactly once).
+L0_PROVIDER_USES = (
+    "provider._capture_auth_context(str(self._tmp_path))",
+    "await provider._check_auth_readiness(context=context)",
+    "await provider.close()",
+)
+L0_CREATE_PROVIDER_KEYWORDS = frozenset(
+    {"provider_type", "validate", "default_model", "max_session_seconds", "provider_settings"}
+)
+
+# Table C: the execution sites (name, count) inside ``RealWorkflowAdapter.execute``.
+EXECUTION_SITES = {
+    "ProviderRegistry(cfg)": 1,
+    "WorkflowEngine(cfg, registry=registry, event_emitter=emitter, workflow_path=path)": 1,
+    "engine.run({'question': self._question})": 1,
+    "engine.get_execution_summary()": 1,
+}
+ENGINE_RUN_CALLS = (
+    ("RealWorkflowAdapter.execute", "engine.run({'question': self._question})"),
+    (
+        "test_official_live_evidence",
+        "asyncio.run(run_official_session(pytestconfig, tmp_path, adapters))",
+    ),
+    ("test_readiness_probe_only", "asyncio.run(probe_readiness(pytestconfig, tmp_path, adapters))"),
+)
+
+# Table D: the argv of every owned subprocess, by the function that holds the call.
+OWNED_SUBPROCESS_ARGV = {
+    "read_git_state": [["git", "rev-parse", "HEAD"], ["git", "status", "--porcelain"]],
+    "read_ps_table": [["ps", "-A", "-o", "pid=,ppid=,comm="]],
+    "read_cli_version": [["str(cli)", "--version"]],
+}
+OWNED_SUBPROCESS_CALLERS = ("read_cli_version._default", "read_git_state._default", "read_ps_table")
 
 
-def provider_error(retryable: object) -> ProviderError:
-    """A ``ProviderError`` whose ``is_retryable`` is exactly ``retryable`` (any object)."""
-    error = ProviderError("x")
-    error._is_retryable = retryable  # the property reads this
-    return error
+class LiveSource:
+    """The parsed live module (or a scratch source) with parent, scope and name indexes."""
+
+    def __init__(self, source: str) -> None:
+        self.tree = ast.parse(source)
+        self.parents: dict[ast.AST, Any] = {}
+        for node in ast.walk(self.tree):
+            for child in ast.iter_child_nodes(node):
+                self.parents[child] = node
+        self.functions: dict[str, FuncNode] = {}
+        self._index(self.tree, [])
+
+    def _index(self, node: ast.AST, path: list[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                inner = [*path, child.name]
+                if not isinstance(child, ast.ClassDef):
+                    self.functions[".".join(inner)] = child
+                self._index(child, inner)
+            else:
+                self._index(child, path)
+
+    def qualname(self, node: ast.AST) -> str:
+        """The qualified name of the nearest enclosing ``def`` ('' at module level)."""
+        names: list[str] = []
+        cur = self.parents.get(node)
+        while cur is not None:
+            if isinstance(cur, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                names.append(cur.name)
+            cur = self.parents.get(cur)
+        return ".".join(reversed(names))
+
+    def innermost_scope(self, node: ast.AST) -> ast.AST:
+        cur = self.parents.get(node)
+        while (
+            cur is not None
+            and not isinstance(
+                cur, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef | ast.Module
+            )
+            and not isinstance(cur, COMPREHENSIONS)
+        ):
+            cur = self.parents.get(cur)
+        return cur if cur is not None else self.tree
+
+    def in_annotation(self, node: ast.AST) -> bool:
+        child, cur = node, self.parents.get(node)
+        while cur is not None:
+            if isinstance(cur, ast.arg) and cur.annotation is child:
+                return True
+            if isinstance(cur, ast.FunctionDef | ast.AsyncFunctionDef) and cur.returns is child:
+                return True
+            if isinstance(cur, ast.AnnAssign) and cur.annotation is child:
+                return True
+            child, cur = cur, self.parents.get(cur)
+        return False
+
+    def nodes(self, kind: Any) -> list[Any]:
+        return [n for n in ast.walk(self.tree) if isinstance(n, kind)]
+
+    def calls_named(self, dotted: str) -> list[ast.Call]:
+        return [c for c in self.nodes(ast.Call) if ast.unparse(c.func) == dotted]
 
 
-def message_obs(error: object = None, status: object = None) -> lm.Observation:
-    """An observation built through the real ``record_observation`` reducer."""
-    return lm.record_observation(SimpleNamespace(error=error, api_error_status=status))
+def live_source_text() -> str:
+    return LIVE_MODULE.read_text()
 
 
-def diag_of(chain: Sequence[object], observations: Sequence[lm.Observation] = ()) -> dict[str, str]:
-    return lm.l3_diagnostics(list(observations), chain)  # type: ignore[arg-type]
+def conductor_imports(source: str) -> set[tuple[Any, ...]]:
+    """Every ``conductor`` binding: static ``from``/``import`` and literal ``import_module``."""
+    live = LiveSource(source)
+    found: set[tuple[Any, ...]] = set()
+    for node in live.nodes(ast.ImportFrom):
+        if (node.module or "").split(".")[0] == "conductor":
+            for alias in node.names:
+                found.add(
+                    (
+                        "from",
+                        node.module,
+                        alias.name,
+                        alias.asname or alias.name,
+                        live.qualname(node),
+                    )
+                )
+    for node in live.nodes(ast.Import):
+        for alias in node.names:
+            if alias.name.split(".")[0] == "conductor":
+                found.add(
+                    ("import", alias.name, None, alias.asname or alias.name, live.qualname(node))
+                )
+    for call in live.calls_named("importlib.import_module"):
+        argument = call.args[0] if call.args else None
+        if not (isinstance(argument, ast.Constant) and isinstance(argument.value, str)):
+            found.add(("dynamic", "<computed>", None, "?", live.qualname(call)))
+            continue
+        if argument.value.split(".")[0] != "conductor":
+            continue
+        parent = live.parents[call]
+        attribute = None
+        if isinstance(parent, ast.Attribute):
+            attribute, parent = parent.attr, live.parents[parent]
+        target = (
+            parent.targets[0].id
+            if isinstance(parent, ast.Assign) and isinstance(parent.targets[0], ast.Name)
+            else "?"
+        )
+        found.add(("dynamic", argument.value, attribute, target, live.qualname(call)))
+    return found
 
 
-class Hostile:
-    """An object every foreign operation on which is recorded and then raises."""
+def conductor_import_problems(source: str) -> list[str]:
+    live = LiveSource(source)
+    problems: list[str] = []
+    found = conductor_imports(source)
+    problems += [f"not in Table A: {row}" for row in sorted(found - LIVE_IMPORT_ALLOWLIST, key=str)]
+    problems += [
+        f"missing from the source: {row}" for row in sorted(LIVE_IMPORT_ALLOWLIST - found, key=str)
+    ]
+    for node in live.nodes(ast.ImportFrom):
+        if any(alias.name == "*" for alias in node.names):
+            problems.append("a star import")
+        if (node.module or "").split(".")[0] == "claude_agent_sdk":
+            problems.append("an import of claude_agent_sdk")
+        for alias in node.names:
+            if (
+                alias.asname
+                and (node.module, alias.name, alias.asname)
+                != ("conductor.providers", "claude_agent_sdk", "sdk")
+                and (node.module or "").split(".")[0] == "conductor"
+            ):
+                problems.append(f"an alias: {alias.asname}")
+    for node in live.nodes(ast.Import):
+        if any(alias.name.split(".")[0] == "claude_agent_sdk" for alias in node.names):
+            problems.append("an import of claude_agent_sdk")
+    for call in live.calls_named("importlib.import_module"):
+        if (
+            call.args
+            and isinstance(call.args[0], ast.Constant)
+            and "claude_agent_sdk" in str(call.args[0].value)
+        ):
+            problems.append("a dynamic import of claude_agent_sdk")
+    return problems
+
+
+def table_a_names() -> dict[str, set[str]]:
+    names: dict[str, set[str]] = {}
+    for _kind, _module, _name, bound, function in LIVE_IMPORT_ALLOWLIST:
+        names.setdefault(bound, set()).add(function)
+    return names
+
+
+def table_a_use_problems(source: str) -> list[str]:
+    """Every load of a Table-A name is in its function's own body and has its listed form."""
+    live = LiveSource(source)
+    names = table_a_names()
+    problems: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for node in live.nodes(ast.Name):
+        if node.id not in names or not isinstance(node.ctx, ast.Load) or live.in_annotation(node):
+            continue
+        function = live.qualname(node)
+        scope = live.innermost_scope(node)
+        if function not in names[node.id] or not isinstance(
+            scope, ast.FunctionDef | ast.AsyncFunctionDef
+        ):
+            problems.append(f"{node.id} is loaded in {function or '<module>'}")
+            continue
+        if (
+            live.qualname(scope) != ".".join(function.split(".")[:-1])
+            and scope.name != function.split(".")[-1]
+        ):
+            problems.append(f"{node.id} is loaded in a nested scope of {function}")
+            continue
+        parent = live.parents[node]
+        if isinstance(parent, ast.Attribute):  # a chain: the use is the whole call or attribute
+            top: ast.AST = parent
+            while isinstance(live.parents.get(top), ast.Attribute):
+                top = live.parents[top]
+            if isinstance(live.parents.get(top), ast.Call) and live.parents[top].func is top:
+                top = live.parents[top]
+                parent = top
+            outer = live.parents.get(parent)
+            if (
+                isinstance(outer, ast.Call)
+                and isinstance(outer.func, ast.Name)
+                and outer.func.id == "getattr"
+                and outer.args[0] is parent
+            ):
+                parent = outer  # the one literal ``getattr`` form of A5
+        form = ast.unparse(parent)
+        if isinstance(parent, ast.Assign):
+            form = ast.unparse(parent)
+        allowed = TABLE_A_USES.get((node.id, function), set())
+        if form not in allowed:
+            problems.append(f"{node.id} in {function}: unlisted use {form}")
+        seen.add((node.id, function))
+    problems += [f"listed use never loaded: {key}" for key in sorted(set(TABLE_A_USES) - seen)]
+    return problems
+
+
+def dynamic_lookup_problems(source: str) -> list[str]:
+    """No computed import, ``__import__``, reload, ``exec`` family, ``globals``, ``sys.modules``."""
+    live = LiveSource(source)
+    problems: list[str] = []
+    bound = set(table_a_names())
+    for call in live.nodes(ast.Call):
+        name = ast.unparse(call.func)
+        if name in {
+            "__import__",
+            "importlib.reload",
+            "importlib.util.module_from_spec",
+        } or name.startswith(("importlib.util.spec_from_", "runpy.")):
+            problems.append(f"dynamic lookup: {name}")
+        if name in {"exec", "eval", "compile", "globals", "locals", "vars", "setattr", "delattr"}:
+            problems.append(f"forbidden builtin: {name}")
+        if name == "importlib.import_module" and not (
+            call.args and isinstance(call.args[0], ast.Constant)
+        ):
+            problems.append("a computed import_module argument")
+        if name in {"getattr", "setattr", "hasattr", "delattr"} and call.args:
+            first = call.args[0]
+            root = first
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name) and (root.id in bound or root.id in TABLE_E_MODULES):
+                form = ast.unparse(call)
+                if form not in ALLOWED_GETATTR_FORMS:
+                    problems.append(f"{name} on a pinned binding: {form}")
+                elif "pytest" in form and live.qualname(call) != "pytest_version_text":
+                    problems.append("the E10 getattr outside pytest_version_text")
+    for node in live.nodes(ast.Attribute):
+        if node.attr == "__dict__":
+            problems.append("__dict__")
+        if ast.unparse(node) == "sys.modules":
+            problems.append("sys.modules")
+    return problems
+
+
+ALLOWED_GETATTR_FORMS = frozenset(
+    {
+        "getattr(run_module, '_file_console', None)",
+        "getattr(ClaudeAgentSdkProvider._check_auth_readiness, '__qualname__', '')",
+        "getattr(pytest, '__version__', None)",
+    }
+)
+TABLE_E_MODULES = frozenset(
+    {
+        "enum",
+        "json",
+        "re",
+        "sys",
+        "asyncio",
+        "contextlib",
+        "dataclasses",
+        "importlib",
+        "logging",
+        "math",
+        "os",
+        "shutil",
+        "signal",
+        "subprocess",
+        "tempfile",
+        "time",
+        "pytest",
+        "yaml",
+        "io",
+        "datetime",
+        "platform",
+    }
+)
+
+
+def l0_provider_problems(source: str) -> list[str]:
+    """Table B: the L0 provider object in ``RealReadinessAdapter.probe``."""
+    live = LiveSource(source)
+    probe = live.functions.get("RealReadinessAdapter.probe")
+    if probe is None:
+        return ["no RealReadinessAdapter.probe"]
+    problems: list[str] = []
+    created = [
+        c
+        for c in ast.walk(probe)
+        if isinstance(c, ast.Call) and ast.unparse(c.func) == "create_provider"
+    ]
+    if len(created) != 1:
+        problems.append(f"create_provider is called {len(created)} times")
+    else:
+        call = created[0]
+        if {kw.arg for kw in call.keywords} != L0_CREATE_PROVIDER_KEYWORDS or call.args:
+            problems.append("create_provider has other arguments")
+        validate = next((kw for kw in call.keywords if kw.arg == "validate"), None)
+        if validate is None or not (
+            isinstance(validate.value, ast.Constant) and validate.value.value is False
+        ):
+            problems.append("validate is not False")
+        if not isinstance(live.parents[call], ast.Await):
+            problems.append("create_provider is not awaited")
+        wrapper = live.parents.get(live.parents[call])
+        if not (isinstance(wrapper, ast.Call) and ast.unparse(wrapper.func) == "cast"):
+            problems.append("create_provider is not wrapped only in cast")
+        bound = live.parents.get(cast(ast.AST, wrapper))
+        if not (isinstance(bound, ast.Assign) and ast.unparse(bound.targets[0]) == "provider"):
+            problems.append("create_provider is not bound once to provider")
+    loads = [
+        n
+        for n in ast.walk(probe)
+        if isinstance(n, ast.Name) and n.id == "provider" and isinstance(n.ctx, ast.Load)
+    ]
+    uses: list[str] = []
+    for node in loads:
+        parent = live.parents[node]
+        call = live.parents.get(parent)
+        if not (
+            isinstance(parent, ast.Attribute) and isinstance(call, ast.Call) and call.func is parent
+        ):
+            problems.append(
+                f"provider escapes or is a loose reference: {ast.unparse(live.parents[node])}"
+            )
+            continue
+        top: ast.AST = call
+        if isinstance(live.parents.get(call), ast.Await):
+            top = live.parents[call]
+        uses.append(ast.unparse(top))
+    if sorted(uses) != sorted(L0_PROVIDER_USES):
+        problems.append(f"the provider uses are {sorted(uses)}")
+    derive = [c for c in live.nodes(ast.Call) if "_derive_billing" in ast.unparse(c.func)]
+    if [ast.unparse(c) for c in derive] != ["sdk._derive_billing(context, status)"]:
+        problems.append("_derive_billing is not exactly sdk._derive_billing(context, status)")
+    return problems
+
+
+ESCAPE_NAMES = ("registry", "engine", "provider")
+
+
+def execution_object_escape_problems(source: str) -> list[str]:
+    """``registry`` is only the ``registry=`` argument of C2; ``engine`` only the C3/C4 receiver."""
+    live = LiveSource(source)
+    problems: list[str] = []
+    for name in ESCAPE_NAMES:
+        for node in live.nodes(ast.Name):
+            if node.id != name or not isinstance(node.ctx, ast.Load):
+                continue
+            parent = live.parents[node]
+            ok = False
+            if name == "registry":
+                ok = isinstance(parent, ast.keyword) and parent.arg == "registry"
+            elif name == "engine":
+                ok = (
+                    isinstance(parent, ast.Attribute)
+                    and parent.attr in {"run", "get_execution_summary"}
+                    and isinstance(live.parents[parent], ast.Call)
+                    and live.parents[parent].func is parent
+                )
+            else:
+                ok = isinstance(parent, ast.Attribute) and isinstance(
+                    live.parents[parent], ast.Call
+                )
+            if not ok:
+                problems.append(f"{name} escapes in {live.qualname(node)}: {ast.unparse(parent)}")
+    for node in live.nodes(ast.Attribute):
+        if (
+            isinstance(node.ctx, ast.Store)
+            and ast.unparse(node.value) == "self"
+            and isinstance(live.parents[node], ast.Assign)
+            and any(
+                isinstance(v, ast.Name) and v.id in ESCAPE_NAMES
+                for v in ast.walk(live.parents[node].value)
+            )
+        ):
+            problems.append("an execution object is stored on self")
+    for node in live.nodes(ast.Return | ast.Yield | ast.YieldFrom):
+        value = getattr(node, "value", None)
+        if value is not None and any(
+            isinstance(v, ast.Name) and v.id in ESCAPE_NAMES for v in ast.walk(value)
+        ):
+            problems.append("an execution object is returned or yielded")
+    return problems
+
+
+def execution_site_problems(source: str) -> list[str]:
+    live = LiveSource(source)
+    problems: list[str] = []
+    for site, count in EXECUTION_SITES.items():
+        holders = [live.qualname(c) for c in live.nodes(ast.Call) if ast.unparse(c) == site]
+        if holders != ["RealWorkflowAdapter.execute"] * count:
+            problems.append(f"{site}: {holders}")
+    for cls in ("ProviderRegistry", "WorkflowEngine"):
+        stray = [live.qualname(c) for c in live.nodes(ast.Call) if ast.unparse(c.func) == cls]
+        if len(stray) != 1:
+            problems.append(f"{cls} is constructed {len(stray)} times")
+    run_calls = [
+        (live.qualname(c), ast.unparse(c))
+        for c in live.nodes(ast.Call)
+        if isinstance(c.func, ast.Attribute) and c.func.attr == "run"
+    ]
+    if sorted(run_calls) != sorted(ENGINE_RUN_CALLS):
+        problems.append(f".run( calls: {run_calls}")
+    waits = list(live.calls_named("asyncio.wait_for"))
+    if (
+        len(waits) != 1
+        or ast.unparse(waits[0].args[0]) != "engine.run({'question': self._question})"
+        or ast.unparse(waits[0].args[1]) != "CASE_TIMEOUTS_S[Case.L1]"
+    ):
+        problems.append("C3 is not args[0] of the one wait_for bounded by the L1 timeout")
+    return problems
+
+
+def function_references(live: LiveSource, name: str) -> list[str]:
+    return [
+        live.qualname(n)
+        for n in live.nodes(ast.Name)
+        if n.id == name and isinstance(n.ctx, ast.Load)
+    ]
+
+
+def call_graph(live: LiveSource) -> dict[str, set[str]]:
+    """Static intra-module graph: references to module-level callables, ``self.`` methods and the
+    two adapter attributes resolved to the real adapter classes."""
+    module_names = {
+        n.name
+        for n in live.tree.body
+        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+    }
+    graph: dict[str, set[str]] = {q: set() for q in live.functions}
+    for qualified, fn in live.functions.items():
+        cls = qualified.split(".")[0] if "." in qualified else ""
+        for node in ast.walk(fn):
+            if (
+                isinstance(node, ast.Name)
+                and node.id in module_names
+                and isinstance(node.ctx, ast.Load)
+            ):
+                graph[qualified].add(node.id)
+                is_class = any(
+                    isinstance(n, ast.ClassDef) and n.name == node.id for n in live.tree.body
+                )
+                graph[qualified].update(
+                    q
+                    for q in live.functions
+                    if q.startswith(node.id + ".")
+                    and q.count(".") == 1
+                    and (not is_class or q.endswith(".__init__"))  # constructing runs ``__init__``
+                )
+            if isinstance(node, ast.Attribute):
+                text = ast.unparse(node)
+                if text == "adapters.workflow.execute":
+                    graph[qualified].add("RealWorkflowAdapter.execute")
+                if text == "adapters.readiness.probe":
+                    graph[qualified].add("RealReadinessAdapter.probe")
+                if cls and isinstance(node.value, ast.Name) and node.value.id == "self":
+                    graph[qualified].add(f"{cls}.{node.attr}")
+    return graph
+
+
+def reachable(graph: dict[str, set[str]], start: str) -> set[str]:
+    seen: set[str] = set()
+    stack = [start]
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        stack.extend(graph.get(current, ()))
+    return seen
+
+
+NON_L1_ENTRIES = (
+    "test_readiness_probe_only",
+    "probe_readiness",
+    "common_preflight",
+    "_l0_runner",
+    "RealReadinessAdapter.probe",
+    "fail_closed",
+    "run_level_record",
+    "_case_record",
+    "_fallback_record",
+    "with_descendant_check",
+    "classify_capture",
+    "emit_evidence",
+    "classifier_main",
+)
+
+
+def adapter_call_problems(source: str) -> list[str]:
+    """C5, C6, C7 and the reachability of ``RealWorkflowAdapter.execute``."""
+    live = LiveSource(source)
+    problems: list[str] = []
+    executes = [
+        live.qualname(c)
+        for c in live.nodes(ast.Call)
+        if isinstance(c.func, ast.Attribute) and c.func.attr == "execute"
+    ]
+    if executes != ["_inference_runner.run"]:
+        problems.append(f".execute( calls: {executes}")
+    probes = [
+        live.qualname(c)
+        for c in live.nodes(ast.Call)
+        if isinstance(c.func, ast.Attribute) and c.func.attr == "probe"
+    ]
+    if probes != ["_l0_runner.run"]:
+        problems.append(f".probe( calls: {probes}")
+    if sorted(set(function_references(live, "_inference_runner"))) != ["build_case_runners"]:
+        problems.append("_inference_runner is referenced outside build_case_runners")
+    if sorted(set(function_references(live, "build_case_runners"))) != ["run_official_session"]:
+        problems.append("build_case_runners is referenced outside run_official_session")
+    if function_references(live, "_l0_runner").count("probe_readiness") != 1:
+        problems.append("probe_readiness does not reference _l0_runner once")
+    for name in ("probe_readiness",):
+        for banned in ("build_case_runners", "_inference_runner"):
+            if banned in function_references(live, banned) and name in function_references(
+                live, banned
+            ):
+                problems.append(f"{name} references {banned}")
+    graph = call_graph(live)
+    for entry in NON_L1_ENTRIES:
+        if entry in graph and "RealWorkflowAdapter.execute" in reachable(graph, entry):
+            problems.append(f"RealWorkflowAdapter.execute is reachable from {entry}")
+    path = reachable(graph, "test_official_live_evidence")
+    if "RealWorkflowAdapter.execute" not in path:
+        problems.append("execute is not reachable from the official test")
+    return problems
+
+
+def owned_subprocess_problems(source: str) -> list[str]:
+    live = LiveSource(source)
+    problems: list[str] = []
+    callers = sorted(live.qualname(c) for c in live.calls_named("_run_owned_subprocess"))
+    if callers != sorted(OWNED_SUBPROCESS_CALLERS):
+        problems.append(f"_run_owned_subprocess callers: {callers}")
+    for function, expected in OWNED_SUBPROCESS_ARGV.items():
+        node = live.functions.get(function)
+        if node is None:
+            problems.append(f"no {function}")
+            continue
+        lists = [
+            [
+                ast.unparse(e).strip("'\"") if not isinstance(e, ast.Constant) else e.value
+                for e in lst.elts
+            ]
+            for lst in ast.walk(node)
+            if isinstance(lst, ast.List)
+            and lst.elts
+            and isinstance(live.parents.get(lst), ast.Call | ast.Starred)
+        ]
+        for argv in expected:
+            if argv not in lists:
+                problems.append(f"{function}: missing argv {argv}")
+    for node in live.nodes(ast.Call):
+        dotted = ast.unparse(node.func)
+        if dotted in {
+            "subprocess.run",
+            "subprocess.call",
+            "subprocess.check_call",
+            "subprocess.check_output",
+            "subprocess.getoutput",
+            "subprocess.getstatusoutput",
+            "os.system",
+            "os.popen",
+            "asyncio.create_subprocess_exec",
+            "asyncio.create_subprocess_shell",
+        } or dotted.startswith(("os.exec", "os.spawn", "os.posix_spawn", "pty.")):
+            problems.append(f"forbidden process call: {dotted}")
+    for node in live.nodes(ast.Attribute):
+        if ast.unparse(node) == "subprocess.Popen":
+            holder = live.qualname(node)
+            if holder not in {"_run_owned_subprocess", "read_ps_table", "descendant_snapshot"}:
+                problems.append(f"subprocess.Popen referenced in {holder}")
+            parent = live.parents[node]
+            if not isinstance(
+                parent, ast.arguments | ast.arg | ast.FunctionDef | ast.AsyncFunctionDef
+            ):
+                problems.append("subprocess.Popen is not a default argument")
+    return problems
+
+
+class TestStructuralAllowlist:
+    """H59 (vi) (a)-(g): imports, the L0 provider object, execution sites, owned subprocesses."""
+
+    def test_conductor_imports_match_allowlist(self) -> None:
+        assert conductor_import_problems(live_source_text()) == []
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            "def f():\n    import conductor.cli.run\n",
+            "def f():\n    from conductor.cli.run import run_workflow_async\n",
+            "def f():\n    from conductor.providers.factory import create_provider as make\n",
+            "from conductor.config.loader import load_config\n",
+            "def f():\n    from claude_agent_sdk import query\n",
+            "def f():\n    from conductor.cli.run import *\n",
+        ],
+    )
+    def test_conductor_import_controls(self, extra: str) -> None:
+        assert conductor_import_problems(live_source_text() + "\n" + extra) != []
+
+    def test_allowed_names_stay_in_their_function(self) -> None:
+        assert table_a_use_problems(live_source_text()) == []
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            (
+                "        from conductor.providers.factory import create_provider\n",
+                "        from conductor.providers.factory import create_provider\n"
+                "        _make = create_provider\n",
+            ),
+            (
+                "                    emitter = WorkflowEventEmitter()\n",
+                "                    emitter = WorkflowEventEmitter()\n"
+                "                    self._e = WorkflowEventEmitter\n",
+            ),
+            (
+                "        runtime = load_config(self._example_path).workflow.runtime\n",
+                "        runtime = load_config(self._example_path).workflow.runtime\n"
+                "        keep = [load_config]\n",
+            ),
+        ],
+    )
+    def test_allowed_name_controls(self, mutation: tuple[str, str]) -> None:
+        source = live_source_text()
+        assert mutation[0] in source
+        assert table_a_use_problems(source.replace(*mutation, 1)) != []
+
+    def test_no_dynamic_lookup_of_conductor_objects(self) -> None:
+        assert dynamic_lookup_problems(live_source_text()) == []
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            "x = __import__('os')\n",
+            "import importlib\ny = importlib.import_module(name)\n",
+            "z = globals()\n",
+            "def f(sdk):\n    return getattr(sdk, name)\n",
+            "def f(os):\n    return getattr(os, 'fork')\n",
+            "import sys\nq = sys.modules\n",
+            "r = eval('1')\n",
+        ],
+    )
+    def test_dynamic_lookup_controls(self, extra: str) -> None:
+        assert dynamic_lookup_problems(live_source_text() + "\n" + extra) != []
+
+    def test_l0_provider_object_uses(self) -> None:
+        assert l0_provider_problems(live_source_text()) == []
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            (
+                "                await provider.close()\n",
+                "                await provider.close()\n"
+                "                await provider.execute()\n",
+            ),
+            ("validate=False", "validate=True"),
+            (
+                "            fields = readiness_fields(",
+                "            self._p = provider\n            fields = readiness_fields(",
+            ),
+            (
+                "                    max_session_seconds=runtime.max_session_seconds,\n",
+                "                    max_session_seconds=runtime.max_session_seconds,\n"
+                "                    extra=1,\n",
+            ),
+        ],
+    )
+    def test_l0_provider_controls(self, mutation: tuple[str, str]) -> None:
+        source = live_source_text()
+        assert mutation[0] in source
+        assert l0_provider_problems(source.replace(*mutation, 1)) != []
+
+    def test_execution_objects_do_not_escape(self) -> None:
+        assert execution_object_escape_problems(live_source_text()) == []
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            (
+                "                    emitter = WorkflowEventEmitter()\n",
+                "                    emitter = WorkflowEventEmitter()\n"
+                "                    self._engine = registry\n",
+            ),
+            (
+                "        return RunObservation(\n            events=events,",
+                "        keep = (yield_it := engine)\n        return RunObservation(\n"
+                "            events=events,",
+            ),
+        ],
+    )
+    def test_escape_controls(self, mutation: tuple[str, str]) -> None:
+        source = live_source_text()
+        assert mutation[0] in source
+        assert execution_object_escape_problems(source.replace(*mutation, 1)) != []
+
+    def test_execution_sites_match_allowlist(self) -> None:
+        assert execution_site_problems(live_source_text()) == []
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            (
+                "                    emitter = WorkflowEventEmitter()\n",
+                "                    emitter = WorkflowEventEmitter()\n"
+                "                    again = WorkflowEngine(cfg, registry=registry, "
+                "event_emitter=emitter, workflow_path=path)\n"
+                "",
+            ),
+            (
+                '                usage = engine.get_execution_summary()["usage"]\n',
+                '                usage = engine.get_execution_summary()["usage"]\n'
+                '                usage = engine.get_execution_summary()["usage"]\n',
+            ),
+        ],
+    )
+    def test_execution_site_controls(self, mutation: tuple[str, str]) -> None:
+        source = live_source_text()
+        assert mutation[0] in source
+        assert execution_site_problems(source.replace(*mutation, 1)) != []
+
+    def test_single_adapter_execution_call_and_reachability(self) -> None:
+        assert adapter_call_problems(live_source_text()) == []
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            "async def _extra(adapters, l1_config):\n"
+            "    return await adapters.workflow.execute(l1_config)\n",
+        ],
+    )
+    def test_adapter_call_controls(self, extra: str) -> None:
+        assert adapter_call_problems(live_source_text() + "\n" + extra) != []
+
+    def test_owned_subprocess_argv_allowlist(self) -> None:
+        assert owned_subprocess_problems(live_source_text()) == []
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            "import subprocess\ndef f(cli):\n"
+            "    return subprocess.run([str(cli), '-p', 'question'])\n",
+            "import os\ndef f():\n    os.system('x')\n",
+            "def f(cli):\n    return _run_owned_subprocess([str(cli), '-p', 'q'])\n",
+            "import asyncio\nasync def f():\n    await asyncio.create_subprocess_exec('x')\n",
+        ],
+    )
+    def test_owned_subprocess_controls(self, extra: str) -> None:
+        assert owned_subprocess_problems(live_source_text() + "\n" + extra) != []
+
+
+# ============================================================================
+# H59 (vi), tables C', E and F: single execution, imports, capabilities and the dispatch path
+# ============================================================================
+
+# Table C': the exact ancestor chain of every pinned site (outermost -> site's parent).
+SITE_ANCESTRY = {
+    "S-B0": (
+        "RealReadinessAdapter.probe",
+        ("With.body", "Assign:provider", "Call:cast.args[1]", "Await"),
+    ),
+    "S-B1": ("RealReadinessAdapter.probe", ("With.body", "Try.body", "Assign:context")),
+    "S-B2": ("RealReadinessAdapter.probe", ("With.body", "Try.body", "Assign:status", "Await")),
+    "S-B3": ("RealReadinessAdapter.probe", ("With.body", "Try.finalbody", "Expr", "Await")),
+    "S-C1": (
+        "RealWorkflowAdapter.execute",
+        ("With.body", "Try.body", "AsyncWith.items[0]", "withitem.context_expr"),
+    ),
+    "S-C2": (
+        "RealWorkflowAdapter.execute",
+        ("With.body", "Try.body", "AsyncWith.body", "Assign:engine"),
+    ),
+    "S-C3": (
+        "RealWorkflowAdapter.execute",
+        ("With.body", "Try.body", "AsyncWith.body", "Assign:result", "Await"),
+    ),
+    "S-C4": ("RealWorkflowAdapter.execute", ("With.body", "Try.body", "Assign:usage", "Subscript")),
+    "S-A13": ("RealWorkflowAdapter.execute", ("With.body", "Try.body", "Expr")),
+    "S-C5": ("_inference_runner.run", ("Assign:observed", "Await")),
+    "S-C6": ("_l0_runner.run", ("Assign:observation", "Await")),
+}
+# the unparsed site expression of each row (a prefix test for the sites that carry long arguments)
+SITE_TEXT = {
+    "S-B0": "create_provider(",
+    "S-B1": "provider._capture_auth_context(",
+    "S-B2": "provider._check_auth_readiness(",
+    "S-B3": "provider.close()",
+    "S-C1": "ProviderRegistry(cfg)",
+    "S-C2": "WorkflowEngine(",
+    "S-C3": "asyncio.wait_for(",
+    "S-C4": "engine.get_execution_summary()",
+    "S-A13": "display_usage_summary(",
+    "S-C5": "adapters.workflow.execute(l1_config)",
+    "S-C6": "adapters.readiness.probe()",
+}
+
+EXECUTION_PATH_FUNCTIONS = (
+    "test_official_live_evidence",
+    "test_readiness_probe_only",
+    "run_official_session",
+    "probe_readiness",
+    "run_session",
+    "run_ordered_cases",
+    "_protected_runners",
+    "_guarded",
+    "_guarded.guarded",
+    "run_case",
+    "with_descendant_check",
+    "with_descendant_check.wrapped",
+    "build_case_runners",
+    "_l0_runner",
+    "_l0_runner.run",
+    "_inference_runner",
+    "_inference_runner.run",
+    "configured_adapters",
+    "build_l1_config",
+    "scrub_routes",
+    "RealReadinessAdapter.__init__",
+    "RealReadinessAdapter.probe",
+    "RealWorkflowAdapter.__init__",
+    "RealWorkflowAdapter._fields",
+    "RealWorkflowAdapter.execute",
+)
+REAL_ADAPTER_METHODS = {
+    "RealReadinessAdapter": ["__init__", "probe"],
+    "RealWorkflowAdapter": ["__init__", "_fields", "execute"],
+}
+LOOSE_REFERENCE_ATTRIBUTES = frozenset(
+    {
+        "execute",
+        "probe",
+        "_capture_auth_context",
+        "_check_auth_readiness",
+        "close",
+        "run",
+        "get_execution_summary",
+        "subscribe",
+    }
+)
+LOOSE_REFERENCE_NAMES = frozenset(
+    {
+        "create_provider",
+        "ProviderRegistry",
+        "WorkflowEngine",
+        "WorkflowEventEmitter",
+        "load_config",
+        "display_usage_summary",
+        "RealReadinessAdapter",
+        "RealWorkflowAdapter",
+        "_l0_runner",
+        "_inference_runner",
+        "build_case_runners",
+        "run_session",
+        "run_ordered_cases",
+        "run_official_session",
+        "probe_readiness",
+    }
+)
+
+
+def _describe(live: LiveSource, ancestor: ast.AST, child: ast.AST) -> str:
+    kind = type(ancestor).__name__
+    if isinstance(ancestor, ast.Assign):
+        return f"Assign:{ast.unparse(ancestor.targets[0])}"
+    for field, value in ast.iter_fields(ancestor):
+        if value is child:
+            if isinstance(ancestor, ast.Call) and field == "func":
+                return f"Call:{ast.unparse(ancestor.func)}.func"
+            return f"{kind}.{field}" if field not in {"value"} else kind
+        if isinstance(value, list) and child in value:
+            index = value.index(child)
+            if isinstance(ancestor, ast.Call) and field == "args":
+                return f"Call:{ast.unparse(ancestor.func)}.args[{index}]"
+            if field in {"items", "args"}:
+                return f"{kind}.{field}[{index}]"
+            return f"{kind}.{field}"
+    return kind
+
+
+def ancestry(live: LiveSource, function: str, site: ast.AST) -> tuple[str, ...]:
+    """The chain of ancestors from the function's body down to ``site``'s parent."""
+    node = live.functions[function]
+    chain: list[str] = []
+    child = site
+    cur = live.parents[site]
+    while cur is not node:
+        chain.append(_describe(live, cur, child))
+        child, cur = cur, live.parents[cur]
+    return tuple(reversed(chain))
+
+
+def find_site(live: LiveSource, function: str, text: str) -> list[ast.Call]:
+    node = live.functions.get(function)
+    if node is None:
+        return []
+    return [
+        c
+        for c in ast.walk(node)
+        if isinstance(c, ast.Call)
+        and ast.unparse(c).startswith(text)
+        and not (isinstance(live.parents.get(c), ast.Attribute))
+    ]
+
+
+def site_chain_problems(source: str) -> list[str]:
+    live = LiveSource(source)
+    problems: list[str] = []
+    for site, (function, expected) in SITE_ANCESTRY.items():
+        found = find_site(live, function, SITE_TEXT[site])
+        if len(found) != 1:
+            problems.append(f"{site}: {len(found)} sites in {function}")
+            continue
+        chain = ancestry(live, function, found[0])
+        if chain != expected:
+            problems.append(f"{site}: chain {chain}")
+    # the exact ``With`` of probe and execute (note (1))
+    for function in ("RealReadinessAdapter.probe", "RealWorkflowAdapter.execute"):
+        node = live.functions.get(function)
+        withs = [n for n in ast.walk(node) if isinstance(n, ast.With)] if node else []
+        if len(withs) != 1 or len(withs[0].items) != 2:
+            problems.append(f"{function}: the With is not a single two-item statement")
+            continue
+        first, second = withs[0].items
+        ok = (
+            ast.unparse(first.context_expr) == "self._monkeypatch.context()"
+            and isinstance(first.optional_vars, ast.Name)
+            and first.optional_vars.id == "mp"
+            and ast.unparse(second.context_expr) == "PrivateLogSink()"
+            and second.optional_vars is None
+            and ast.unparse(withs[0].body[0]) == "removed = scrub_routes(mp, os.environ)"
+        )
+        if not ok:
+            problems.append(f"{function}: the With differs from note (1)")
+        if live.parents[withs[0]] is not node:
+            problems.append(f"{function}: the With is not a direct statement of the function")
+        asyncs = [
+            n
+            for n in ast.walk(cast(ast.AST, node))
+            if isinstance(n, ast.For | ast.AsyncFor | ast.While | ast.Lambda)
+        ]
+        loops = [n for n in asyncs if not isinstance(n, ast.Lambda)]
+        if loops or any(
+            isinstance(n, COMPREHENSIONS)
+            for n in ast.walk(cast(ast.AST, node))
+            if live.in_annotation(n) is False
+            and isinstance(live.parents.get(n), ast.Assign)
+            and False
+        ):
+            problems.append(f"{function}: a loop")
+    # the sink is entered only by those two statements
+    entries = [
+        live.qualname(w)
+        for w in live.nodes(ast.With | ast.AsyncWith)
+        for item in w.items
+        if "PrivateLogSink" in ast.unparse(item.context_expr)
+    ]
+    if sorted(entries) != ["RealReadinessAdapter.probe", "RealWorkflowAdapter.execute"]:
+        problems.append(f"PrivateLogSink is entered in {entries}")
+    loads = [
+        live.qualname(n)
+        for n in live.nodes(ast.Name)
+        if n.id in {"PrivateLogSink", "_CountingDiscardHandler"}
+        and isinstance(n.ctx, ast.Load)
+        and not live.in_annotation(n)
+    ]
+    if sorted(loads) != [
+        "PrivateLogSink.__init__",
+        "RealReadinessAdapter.probe",
+        "RealWorkflowAdapter.execute",
+    ]:
+        problems.append(f"the sink names are loaded in {loads}")
+    # each runner factory: the inner ``run`` first, ``return run`` second, nothing else
+    for factory in ("_inference_runner", "_l0_runner"):
+        node = live.functions.get(factory)
+        body = node.body if node else []
+        shape = (
+            len(body) == 2
+            and isinstance(body[0], ast.AsyncFunctionDef)
+            and body[0].name == "run"
+            and not body[0].decorator_list
+            and isinstance(body[1], ast.Return)
+            and ast.unparse(body[1]) == "return run"
+        )
+        if not shape:
+            problems.append(f"{factory} is not 'async def run' then 'return run'")
+    return problems
+
+
+def decorator_problems(source: str) -> list[str]:
+    live = LiveSource(source)
+    problems = [
+        f"{name} is decorated"
+        for name in EXECUTION_PATH_FUNCTIONS
+        if name in live.functions and live.functions[name].decorator_list
+    ]
+    problems += [
+        f"{name} is missing" for name in EXECUTION_PATH_FUNCTIONS if name not in live.functions
+    ]
+    for cls_name, methods in REAL_ADAPTER_METHODS.items():
+        cls = next(
+            (n for n in live.tree.body if isinstance(n, ast.ClassDef) and n.name == cls_name), None
+        )
+        if cls is None:
+            problems.append(f"no class {cls_name}")
+            continue
+        if cls.decorator_list or cls.bases or cls.keywords:
+            problems.append(f"{cls_name} has a decorator, a base or a class keyword")
+        found = [n.name for n in cls.body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)]
+        if found != methods:
+            problems.append(f"{cls_name} methods: {found}")
+        extra = [
+            n
+            for n in cls.body
+            if not isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef | ast.Expr)
+        ]
+        if extra:
+            problems.append(f"{cls_name} has class-level statements")
+    return problems
+
+
+def loose_reference_problems(source: str) -> list[str]:
+    """Every load of an execution-capable name is the direct function expression of its call."""
+    live = LiveSource(source)
+    problems: list[str] = []
+    for node in live.nodes(ast.Attribute):
+        if not isinstance(node.ctx, ast.Load):
+            continue
+        parent = live.parents[node]
+        text = ast.unparse(node)
+        if node.attr in LOOSE_REFERENCE_ATTRIBUTES and not (
+            isinstance(parent, ast.Call) and parent.func is node
+        ):
+            if text == "ClaudeAgentSdkProvider._check_auth_readiness":
+                continue  # the one literal ``getattr`` of A5
+            if live.qualname(node).startswith(("Test", "_spawn")):
+                continue
+            problems.append(f"loose {text} in {live.qualname(node)}")
+        if text in {"adapters.workflow", "adapters.readiness"} and not (
+            isinstance(parent, ast.Attribute) and parent.attr in {"execute", "probe"}
+        ):
+            problems.append(f"loose {text}")
+    for node in live.nodes(ast.Name):
+        if (
+            node.id in LOOSE_REFERENCE_NAMES
+            and isinstance(node.ctx, ast.Load)
+            and not live.in_annotation(node)
+        ):
+            parent = live.parents[node]
+            if not (isinstance(parent, ast.Call) and parent.func is node):
+                problems.append(f"loose {node.id} in {live.qualname(node)}")
+    return problems
+
+
+# Table E: every other import of the live module: (kind, module, names, enclosing function)
+LIVE_STDLIB_ALLOWLIST = frozenset(
+    {
+        ("from", "__future__", ("annotations",), ""),
+        ("import", "enum", (), ""),
+        ("import", "json", (), ""),
+        ("import", "re", (), ""),
+        ("import", "sys", (), ""),
+        ("from", "collections.abc", ("Callable", "Iterable", "Mapping", "Sequence"), ""),
+        ("from", "typing", ("Any", "Final", "cast"), ""),
+        ("import", "asyncio", (), ""),
+        ("import", "contextlib", (), ""),
+        ("import", "dataclasses", (), ""),
+        ("import", "importlib", (), ""),
+        ("import", "importlib.util", (), ""),
+        ("import", "logging", (), ""),
+        ("import", "math", (), ""),
+        ("import", "os", (), ""),
+        ("import", "shutil", (), ""),
+        ("import", "signal", (), ""),
+        ("import", "subprocess", (), ""),
+        ("import", "tempfile", (), ""),
+        ("import", "time", (), ""),
+        ("from", "collections.abc", ("Awaitable", "Iterator"), ""),
+        ("from", "pathlib", ("Path",), ""),
+        ("from", "typing", ("NoReturn", "Protocol"), ""),
+        ("import", "pytest", (), ""),
+        ("import", "yaml", (), "build_l1_config"),
+        ("import", "yaml", (), "RealWorkflowAdapter.execute"),
+        ("import", "datetime", (), "environment_facts"),
+        ("import", "importlib.metadata", (), "environment_facts"),
+        ("import", "platform", (), "environment_facts"),
+        ("from", "_pytest.mark.expression", ("Expression",), "markexpr_selects_real_api"),
+        ("import", "io", (), "RealWorkflowAdapter.execute"),
+        ("from", "rich.console", ("Console",), "RealWorkflowAdapter.execute"),
+    }
+)
+FORBIDDEN_MODULES = frozenset(
+    {
+        "multiprocessing",
+        "concurrent",
+        "concurrent.futures",
+        "threading",
+        "_thread",
+        "ctypes",
+        "cffi",
+        "pty",
+        "posix",
+        "nt",
+        "socket",
+        "ssl",
+        "http",
+        "urllib",
+        "asyncio.subprocess",
+        "functools",
+        "operator",
+        "types",
+        "code",
+        "codeop",
+        "runpy",
+        "marshal",
+        "pickle",
+        "inspect",
+        "builtins",
+        "gc",
+        "claude_agent_sdk",
+    }
+)
+
+# Table E, maximal chains: chain -> the enclosing functions that may hold it ('' = module level).
+TABLE_E_CHAINS = {
+    "asyncio.CancelledError": {"interrupt_kind"},
+    "asyncio.run": {"test_official_live_evidence", "test_readiness_probe_only"},
+    "asyncio.sleep": {
+        "observe_descendants",
+        "probe_readiness",
+        "run_official_session",
+        "with_descendant_check",
+    },
+    "asyncio.wait_for": {"RealWorkflowAdapter.execute"},
+    "contextlib.suppress": {
+        "ReportSanitizer.pytest_keyboard_interrupt",
+        "ReportSanitizer.pytest_runtest_makereport",
+        "fail_closed",
+        "run_ordered_cases",
+    },
+    "dataclasses.dataclass": {
+        "AdapterSet",
+        "CaseFindings",
+        "CaseOutcome",
+        "CaseResult",
+        "CliEvidence",
+        "DescendantReport",
+        "PreflightResult",
+        "ReadinessObservation",
+        "Resolution",
+        "RunObservation",
+        "SessionResult",
+    },
+    "dataclasses.field": {
+        "AdapterSet",
+        "CaseFindings",
+        "CaseOutcome",
+        "ReadinessObservation",
+        "RunObservation",
+    },
+    "dataclasses.replace": {"_inference_runner.run"},
+    "datetime.UTC": {"environment_facts"},
+    "datetime.datetime.now": {"environment_facts"},
+    "enum.StrEnum": {"Case", "Outcome"},
+    "importlib.import_module": {
+        "assert_live_isolation",
+        "assert_session_console_ready",
+        "common_preflight",
+    },
+    "importlib.metadata.PackageNotFoundError": {"environment_facts"},
+    "importlib.metadata.version": {"environment_facts"},
+    "importlib.util.find_spec": {"check_prerequisites"},
+    "io.StringIO": {"RealWorkflowAdapter.execute"},
+    "json.dumps": {"emit_evidence"},
+    "json.loads": {"_parse_record_line"},
+    "logging.Handler": {"_CountingDiscardHandler"},
+    "logging.LogRecord": {"_CountingDiscardHandler.emit"},
+    "logging.Logger": {"PrivateLogSink.__init__"},
+    "logging.getLogger": {"PrivateLogSink.__enter__"},
+    "math.isfinite": {"check_priced"},
+    "os.environ": {
+        "RealReadinessAdapter.probe",
+        "RealWorkflowAdapter.execute",
+        "assert_live_isolation",
+    },
+    "os.environ.get": {"", "common_preflight", "require_live_optin", "run_official_session"},
+    "os.getpid": {"_protected_runners"},
+    "os.killpg": {"_run_owned_subprocess"},
+    "platform.python_version": {"environment_facts"},
+    "platform.system": {"environment_facts"},
+    "pytest.Config": {"test_official_live_evidence", "test_readiness_probe_only"},
+    "pytest.ExitCode.TESTS_FAILED": {"ZeroSkipPlugin.pytest_sessionfinish"},
+    "pytest.FixtureRequest": {"_register_zero_skip_reporter"},
+    "pytest.MonkeyPatch": {
+        "RealReadinessAdapter.__init__",
+        "RealWorkflowAdapter.__init__",
+        "configured_adapters",
+        "scrub_routes",
+        "test_official_live_evidence",
+        "test_readiness_probe_only",
+    },
+    "pytest.fail": {"fail_fixed"},
+    "pytest.fail.Exception": {"fail_fixed", "render_failure"},
+    "pytest.fixture": {"_register_zero_skip_reporter", "_stub_claude_auth_readiness"},
+    "pytest.hookimpl": {
+        "ReportSanitizer.pytest_keyboard_interrupt",
+        "ReportSanitizer.pytest_runtest_makereport",
+    },
+    "pytest.mark.real_api": {""},
+    "pytest.mark.skipif": {""},
+    "re.ASCII": {""},
+    "re.Pattern": {"_matcher"},
+    "re.compile": {""},
+    "re.fullmatch": {"_default_marker.mark"},
+    "re.match": {"parse_ps"},
+    "re.sub": {"short_name"},
+    "shutil.which": {"check_prerequisites"},
+    "signal.SIGKILL": {"_run_owned_subprocess"},
+    "subprocess.DEVNULL": {"_run_owned_subprocess"},
+    "subprocess.PIPE": {"_run_owned_subprocess"},
+    "subprocess.Popen": {"_run_owned_subprocess", "descendant_snapshot", "read_ps_table"},
+    "subprocess.SubprocessError": {"read_cli_version", "read_git_state", "read_ps_table"},
+    "subprocess.TimeoutExpired": {"_run_owned_subprocess"},
+    "sys.argv": {""},
+    "sys.exit": {""},
+    "sys.platform": {"check_prerequisites"},
+    "sys.stdout.write": {"classifier_main"},
+    "tempfile.gettempdir": {"assert_live_isolation"},
+    "time.monotonic": {
+        "RealWorkflowAdapter._fields",
+        "RealWorkflowAdapter.execute",
+        "observe_descendants",
+        "run_ordered_cases",
+        "with_descendant_check",
+    },
+    "yaml.safe_dump": {"RealWorkflowAdapter.execute"},
+    "yaml.safe_load": {"build_l1_config"},
+}
+
+
+def stdlib_import_problems(source: str) -> list[str]:
+    live = LiveSource(source)
+    found: set[tuple[Any, ...]] = set()
+    problems: list[str] = []
+    for node in live.nodes(ast.ImportFrom):
+        if (node.module or "").split(".")[0] == "conductor":
+            continue
+        names = tuple(alias.name for alias in node.names)
+        if any(alias.asname or alias.name == "*" for alias in node.names):
+            problems.append(f"an alias or star import: {node.module}")
+        found.add(("from", node.module, names, live.qualname(node)))
+    for node in live.nodes(ast.Import):
+        for alias in node.names:
+            if alias.name.split(".")[0] == "conductor":
+                continue
+            if alias.asname:
+                problems.append(f"an alias: {alias.name} as {alias.asname}")
+            found.add(("import", alias.name, (), live.qualname(node)))
+    problems += [f"not in Table E: {row}" for row in sorted(found - LIVE_STDLIB_ALLOWLIST, key=str)]
+    problems += [
+        f"missing from the source: {row}" for row in sorted(LIVE_STDLIB_ALLOWLIST - found, key=str)
+    ]
+    for module in {row[1] for row in found}:
+        if module in FORBIDDEN_MODULES or module.split(".")[0] in {
+            "multiprocessing",
+            "threading",
+            "ctypes",
+        }:
+            problems.append(f"forbidden module {module}")
+    for call in live.nodes(ast.Call):
+        name = ast.unparse(call.func)
+        if (
+            name in {"importlib.import_module", "importlib.util.find_spec", "__import__"}
+            and call.args
+        ):
+            argument = call.args[0]
+            if (
+                isinstance(argument, ast.Constant)
+                and str(argument.value).split(".")[0]
+                in {m.split(".")[0] for m in FORBIDDEN_MODULES}
+                and not (
+                    argument.value == "claude_agent_sdk"
+                    and live.qualname(call) == "check_prerequisites"
+                )
+            ):
+                problems.append(f"a literal forbidden module: {argument.value}")
+    return problems
+
+
+def chain_problems(source: str) -> list[str]:
+    """Every maximal chain rooted at a Table-E module binding, by location and position."""
+    live = LiveSource(source)
+    problems: list[str] = []
+    seen: dict[str, set[str]] = {}
+    for node in live.nodes(ast.Attribute):
+        if isinstance(live.parents.get(node), ast.Attribute):
+            continue
+        root: ast.AST = node
+        while isinstance(root, ast.Attribute):
+            root = root.value
+        if not (isinstance(root, ast.Name) and root.id in TABLE_E_MODULES):
+            continue
+        chain = ast.unparse(node)
+        function = live.qualname(node)
+        seen.setdefault(chain, set()).add(function)
+        allowed = TABLE_E_CHAINS.get(chain)
+        if allowed is None or function not in allowed:
+            problems.append(f"chain {chain} in {function or '<module>'}")
+        if chain in {"logging.Logger", "logging.LogRecord"} and not live.in_annotation(node):
+            problems.append(f"{chain} is used at runtime in {function}")
+        if chain == "logging.Handler" and not (
+            isinstance(live.parents[node], ast.ClassDef) and node in live.parents[node].bases
+        ):
+            problems.append("logging.Handler is not the one class base")
+    for chain, functions in TABLE_E_CHAINS.items():
+        if chain not in seen:
+            problems.append(f"listed chain {chain} never used")
+        elif seen[chain] != functions:
+            problems.append(f"chain {chain}: {sorted(seen[chain])} != {sorted(functions)}")
+    for node in live.nodes(ast.Name):
+        if node.id in TABLE_E_MODULES and isinstance(node.ctx, ast.Load):
+            parent = live.parents[node]
+            if isinstance(parent, ast.Attribute):
+                continue
+            form = ast.unparse(live.parents[node])
+            if form != "getattr(pytest, '__version__', None)":
+                problems.append(f"a module binding escapes: {form}")
+    return problems
+
+
+INJECTED_CALLABLE_CALLS = frozenset(
+    {
+        ("validate_record", "spec"),
+        ("assert_live_isolation", "runs_dir_fn"),
+        ("assert_live_isolation", "pid_dir_fn"),
+        ("assert_live_isolation", "records_dir_fn"),
+        ("assert_live_isolation", "event_root_fn"),
+        ("assert_live_isolation", "gettempdir_fn"),
+        ("check_prerequisites", "find_cli"),
+        ("check_prerequisites", "find_spec"),
+        ("check_prerequisites", "which"),
+        ("resolve_cli_evidence", "find_cli"),
+        ("common_preflight", "readiness_check"),
+        ("common_preflight", "prereq_check"),
+        ("observe_descendants", "clock"),
+        ("observe_descendants", "read_table"),
+        ("observe_descendants", "sleep"),
+        ("_run_owned_subprocess", "popen"),
+        ("read_git_state", "runner"),
+        ("_case_record", "clock"),
+        ("run_ordered_cases", "clock"),
+        ("run_ordered_cases", "mark"),
+        ("run_ordered_cases", "_emit"),
+        ("run_ordered_cases._emit", "emit"),
+        ("run_session", "preflight"),
+        ("with_descendant_check.wrapped", "read_table"),
+        ("run_official_session.preflight", "facts"),
+        ("run_official_session.preflight", "sink"),
+        ("run_official_session", "sink"),
+        ("probe_readiness", "sink"),
+        ("assert_l0_success", "fail"),
+        ("assert_inference_success", "fail"),
+    }
+)
+ALLOWED_CALL_BUILTINS = frozenset(
+    {
+        "AttributeError",
+        "ValueError",
+        "all",
+        "any",
+        "bool",
+        "dict",
+        "enumerate",
+        "float",
+        "frozenset",
+        "getattr",
+        "hasattr",
+        "int",
+        "isinstance",
+        "len",
+        "list",
+        "next",
+        "open",
+        "round",
+        "set",
+        "sorted",
+        "str",
+        "sum",
+        "super",
+        "tuple",
+        "type",
+        "zip",
+    }
+)
+FORBIDDEN_CALL_BUILTINS = frozenset(
+    {
+        "exec",
+        "eval",
+        "compile",
+        "__import__",
+        "globals",
+        "locals",
+        "vars",
+        "breakpoint",
+        "input",
+        "setattr",
+        "delattr",
+        "print",
+        "map",
+        "iter",
+        "callable",
+        "bytes",
+        "id",
+        "range",
+        "repr",
+    }
+)
+# F7 and F9: the only runner-valued ``Name`` calls (``runner(case)``); F5 is the one subscript call
+RUNNER_CALL_PAIRS = frozenset({("with_descendant_check.wrapped", "runner"), ("run_case", "runner")})
+
+
+def call_surface_facts(source: str) -> list[CallFact]:
+    return qualified_calls(ast.parse(source))
+
+
+def call_surface_problems(source: str) -> list[str]:
+    try:
+        facts = call_surface_facts(source)
+    except ResolutionUnsupported as exc:
+        return [f"unsupported construct: {exc}"]
+    local = {(f.function, f.callee) for f in facts if f.kind == "local"}
+    problems = [
+        f"runner-valued call not listed: {pair}"
+        for pair in sorted(local - RUNNER_CALL_PAIRS - INJECTED_CALLABLE_CALLS)
+    ]
+    problems += [
+        f"listed pair has no call: {pair}" for pair in sorted(INJECTED_CALLABLE_CALLS - local)
+    ]
+    problems += [
+        f"listed runner call missing: {pair}" for pair in sorted(RUNNER_CALL_PAIRS - local)
+    ]
+    subscripts = [f.function for f in facts if f.kind == "subscript"]
+    if subscripts != ["run_ordered_cases"]:
+        problems.append(f"subscript calls: {subscripts}")
+    problems += [
+        f"module-level assignment called: {f.callee}" for f in facts if f.kind == "module-assign"
+    ]
+    problems += [
+        f"builtin outside the allowed set: {f.callee}"
+        for f in facts
+        if f.kind == "builtin" and f.callee not in ALLOWED_CALL_BUILTINS
+    ]
+    return problems
+
+
+def _loops_around(live: LiveSource, node: ast.AST, function: FuncNode) -> bool:
+    cur = live.parents.get(node)
+    while cur is not None and cur is not function:
+        if isinstance(cur, (ast.For, ast.AsyncFor, ast.While, ast.Lambda, *COMPREHENSIONS)):
+            return True
+        cur = live.parents.get(cur)
+    return False
+
+
+def _only_calls(node: FuncNode, text: str) -> list[ast.Call]:
+    return [
+        c for c in ast.walk(node) if isinstance(c, ast.Call) and ast.unparse(c).startswith(text)
+    ]
+
+
+def dispatch_problems(source: str) -> list[str]:
+    live = LiveSource(source)
+    problems: list[str] = []
+
+    def func(name: str) -> FuncNode | None:
+        found = live.functions.get(name)
+        if found is None:
+            problems.append(f"no function {name}")
+        return found
+
+    for test, expected in (
+        ("test_official_live_evidence", "run_official_session(pytestconfig, tmp_path, adapters)"),
+        ("test_readiness_probe_only", "probe_readiness(pytestconfig, tmp_path, adapters)"),
+    ):
+        node = func(test)
+        if node is not None:
+            runs = _only_calls(node, "asyncio.run(")
+            if len(runs) != 1 or ast.unparse(runs[0].args[0]) != expected:
+                problems.append(f"F1: {test}")
+    official = func("run_official_session")
+    if official is not None:
+        for text in ("build_case_runners(", "_protected_runners(", "run_session("):
+            hits = _only_calls(official, text)
+            if len(hits) != 1 or _loops_around(live, hits[0], official):
+                problems.append(f"F2: {text} in run_official_session")
+        session = _only_calls(official, "run_session(")
+        if session and "cases" in {kw.arg for kw in session[0].keywords}:
+            problems.append("F2: run_official_session passes cases=")
+        built = _only_calls(official, "build_case_runners(")
+        if built and not (
+            isinstance(live.parents[built[0]], ast.Call)
+            and ast.unparse(live.parents[built[0]].func) == "_protected_runners"
+            and live.parents[built[0]].args[3] is built[0]
+        ):
+            problems.append(
+                "F2: build_case_runners is not the runners argument of _protected_runners"
+            )
+    probe = func("probe_readiness")
+    if probe is not None:
+        for text in ("_l0_runner(", "_protected_runners(", "run_session("):
+            hits = _only_calls(probe, text)
+            if len(hits) != 1 or _loops_around(live, hits[0], probe):
+                problems.append(f"F3: {text} in probe_readiness")
+        session = _only_calls(probe, "run_session(")
+        if session:
+            cases = {kw.arg: ast.unparse(kw.value) for kw in session[0].keywords}
+            if cases.get("cases") != "(Case.L0,)":
+                problems.append("F3: probe_readiness does not pass exactly (Case.L0,)")
+        mapping = [d for d in ast.walk(probe) if isinstance(d, ast.Dict)]
+        if [ast.unparse(d) for d in mapping] != ["{Case.L0: _l0_runner(adapters)}"]:
+            problems.append("F3: the literal {Case.L0: _l0_runner(adapters)} is missing")
+    run_session_fn = func("run_session")
+    if run_session_fn is not None:
+        returns = [
+            n for n in ast.walk(run_session_fn) if isinstance(n, ast.Return) and n.value is not None
+        ]
+        texts = [ast.unparse(r) for r in returns if "run_ordered_cases(" in ast.unparse(r)]
+        if (
+            len(texts) != 1
+            or "cases=cases" not in texts[0]
+            or len(_only_calls(run_session_fn, "run_ordered_cases(")) != 1
+        ):
+            problems.append("F4: run_session")
+    ordered = func("run_ordered_cases")
+    if ordered is not None:
+        subs = [
+            c
+            for c in ast.walk(ordered)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Subscript)
+        ]
+        loops = [
+            n
+            for n in ast.walk(ordered)
+            if isinstance(n, ast.For | ast.AsyncFor | ast.While)
+            and any(sub_call in set(ast.walk(n)) for sub_call in subs)
+        ]  # the loops that dispatch a runner
+        if (
+            len(loops) != 1
+            or not isinstance(loops[0], ast.For)
+            or ast.unparse(loops[0].iter) != "cases"
+        ):
+            problems.append("F5: the one dispatching loop is not 'for case in cases'")
+        if len(subs) != 1 or ast.unparse(subs[0]) != "runners[case](case)":
+            problems.append("F5: runners[case](case)")
+        elif ancestry(live, "run_ordered_cases", subs[0]) != (
+            "For.body",
+            "Try.body",
+            "Assign:raw",
+            "Await",
+        ):
+            problems.append(f"F5: chain {ancestry(live, 'run_ordered_cases', subs[0])}")
+    protected = func("_protected_runners")
+    if protected is not None:
+        calls = [c for c in ast.walk(protected) if isinstance(c, ast.Call)]
+        comps = [n for n in ast.walk(protected) if isinstance(n, ast.DictComp)]
+        if not comps:
+            problems.append("F6: no dict comprehension")
+        for call in calls:
+            name = ast.unparse(call.func)
+            if isinstance(call.func, ast.Name) and name == "runner":
+                problems.append("F6: a runner is called in _protected_runners")
+    wrapped = func("with_descendant_check.wrapped")
+    if wrapped is not None:
+        hits = [
+            c
+            for c in ast.walk(wrapped)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id == "runner"
+        ]
+        if len(hits) != 1:
+            problems.append("F7: not exactly one runner(case) in wrapped")
+        elif ancestry(live, "with_descendant_check.wrapped", hits[0]) != (
+            "Try.body",
+            "Assign:outcome",
+            "Await",
+        ):
+            problems.append(
+                "F7: the runner call is not the Try.body 'outcome = await runner(case)'"
+            )
+    guarded = func("_guarded.guarded")
+    if guarded is not None and [ast.unparse(s) for s in guarded.body] != [
+        "return await run_case(config, tmp_path, case, runner)"
+    ]:
+        problems.append("F8: guarded")
+    run_case_fn = func("run_case")
+    if run_case_fn is not None:
+        body = [
+            s
+            for s in run_case_fn.body
+            if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))
+        ]
+        if [ast.unparse(s) for s in body][-1:] != ["return await runner(case)"] or len(
+            [
+                c
+                for c in ast.walk(run_case_fn)
+                if isinstance(c, ast.Call) and ast.unparse(c.func) == "runner"
+            ]
+        ) != 1:
+            problems.append("F9: run_case")
+    build = func("build_case_runners")
+    if build is not None:
+        dicts = [d for d in ast.walk(build) if isinstance(d, ast.Dict)]
+        pinned = [
+            d
+            for d in dicts
+            if [ast.unparse(k) for k in d.keys if k is not None] == ["Case.L0", "Case.L1"]
+        ]
+        if len(pinned) != 1 or [ast.unparse(v) for v in pinned[0].values] != [
+            "_l0_runner(adapters)",
+            "_inference_runner(adapters, l1_config, requested_model)",
+        ]:
+            problems.append("F10: build_case_runners")
+    # the keyword-only ``cases`` default of the two session functions
+    for name in ("run_session", "run_ordered_cases"):
+        node = func(name)
+        if node is None:
+            continue
+        kwonly = {
+            a.arg: d for a, d in zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True)
+        }
+        default = kwonly.get("cases")
+        if not (isinstance(default, ast.Name) and default.id == "ORDER"):
+            problems.append(f"{name}: cases is not defaulted to exactly ORDER")
+        if any(
+            isinstance(n, ast.Assign | ast.AugAssign | ast.AnnAssign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "cases"
+                for t in (n.targets if isinstance(n, ast.Assign) else [n.target])
+            )
+            for n in ast.walk(node)
+        ):
+            problems.append(f"{name} re-binds cases")
+    orders = [
+        n
+        for n in live.tree.body
+        if isinstance(n, ast.AnnAssign) and ast.unparse(n.target) == "ORDER"
+    ]
+    if len(orders) != 1:
+        problems.append("ORDER is not bound exactly once")
+    if any(
+        a.arg == "pre_hooks"
+        for n in live.nodes(ast.FunctionDef | ast.AsyncFunctionDef)
+        for a in n.args.args + n.args.kwonlyargs
+    ):
+        problems.append("a pre_hooks parameter")
+    # an acyclic static call graph over the execution-path functions
+    graph = call_graph(live)
+    scope = set(EXECUTION_PATH_FUNCTIONS)
+    edges = {q: {t for t in graph.get(q, ()) if t in scope} for q in scope if q in graph}
+    state: dict[str, int] = {}
+
+    def cyclic(node_name: str) -> bool:
+        state[node_name] = 1
+        for target in edges.get(node_name, ()):
+            if state.get(target) == 1 or (state.get(target) is None and cyclic(target)):
+                return True
+        state[node_name] = 2
+        return False
+
+    if any(state.get(q) is None and cyclic(q) for q in edges):
+        problems.append("the execution-path call graph has a cycle")
+    return problems
+
+
+class TestStructuralSingleExecution:
+    """H59 (vi) (h)-(m): ancestor chains, decorators, loose references, imports, capabilities and
+    the dispatch path of the live module (design 5.9, Tables C', E, F, F')."""
+
+    def test_pinned_sites_are_single_execution(self) -> None:
+        assert site_chain_problems(live_source_text()) == []
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            # a retry loop around the engine run, the whole C1 block and the handler
+            (
+                "                    result = await asyncio.wait_for(\n",
+                "                    for _attempt in range(2):\n"
+                "                      result = await asyncio.wait_for(\n",
+            ),
+            (
+                "with self._monkeypatch.context() as mp, PrivateLogSink():\n"
+                "            removed = scrub_routes(mp, os.environ)\n            try:\n"
+                "                cfg",
+                "with self._monkeypatch.context() as mp, PrivateLogSink() as sink:\n"
+                "            removed = scrub_routes(mp, os.environ)\n            try:\n"
+                "                cfg",
+            ),
+            (
+                "with self._monkeypatch.context() as mp, PrivateLogSink():\n"
+                "            removed = scrub_routes(mp, os.environ)\n            provider",
+                "with self._monkeypatch.context() as mp, PrivateLogSink(), PrivateLogSink():\n"
+                "            removed = scrub_routes(mp, os.environ)\n            provider",
+            ),
+            (
+                "with self._monkeypatch.context() as mp, PrivateLogSink():\n"
+                "            removed = scrub_routes(mp, os.environ)\n            provider",
+                "with self._monkeypatch.context() as mp:\n"
+                "            removed = scrub_routes(mp, os.environ)\n            provider",
+            ),
+            (
+                "        runtime = load_config(self._example_path).workflow.runtime\n"
+                "        with self",
+                "        runtime = load_config(self._example_path).workflow.runtime\n"
+                "        sink = PrivateLogSink()\n        with self",
+            ),
+            (
+                "        return ReadinessObservation(bool(status.ready), fields)\n",
+                "        with PrivateLogSink():\n            pass\n"
+                "        return ReadinessObservation(bool(status.ready), fields)\n",
+            ),
+            (
+                "    async def run(case: Case) -> CaseOutcome | Outcome:\n"
+                "        observed = await adapters.workflow.execute(l1_config)\n",
+                "    async def run(case: Case) -> CaseOutcome | Outcome:\n"
+                "        for _again in range(2):\n"
+                "            observed = await adapters.workflow.execute(l1_config)\n",
+            ),
+            (
+                "            try:\n"
+                "                context = provider._capture_auth_context(str(self._tmp_path))\n"
+                "",
+                "            try:\n"
+                "                _ = [provider._capture_auth_context(str(self._tmp_path)) for _ "
+                "in range(2)]\n"
+                "                context = provider._capture_auth_context(str(self._tmp_path))\n"
+                "",
+            ),
+        ],
+    )
+    def test_chain_controls(self, mutation: tuple[str, str]) -> None:
+        source = live_source_text()
+        assert mutation[0] in source, mutation[0]
+        mutated = source.replace(*mutation, 1)
+        try:
+            assert site_chain_problems(mutated) != []
+        except SyntaxError:
+            pytest.fail("the control must parse")
+
+    def test_no_decorators_on_execution_path(self) -> None:
+        assert decorator_problems(live_source_text()) == []
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            (
+                "    async def execute(self, config: Mapping[str, Any]) -> RunObservation:\n",
+                "    @dataclasses.dataclass\n"
+                "    async def execute(self, config: Mapping[str, Any]) -> RunObservation:\n",
+            ),
+            (
+                "class RealWorkflowAdapter:\n",
+                "@dataclasses.dataclass\nclass RealWorkflowAdapter:\n",
+            ),
+            ("class RealWorkflowAdapter:\n", "class RealWorkflowAdapter(object):\n"),
+            (
+                "    async def run(case: Case) -> CaseOutcome | Outcome:\n        observed",
+                "    @contextlib.suppress\n"
+                "    async def run(case: Case) -> CaseOutcome | Outcome:\n        observed",
+            ),
+        ],
+    )
+    def test_decorator_controls(self, mutation: tuple[str, str]) -> None:
+        source = live_source_text()
+        assert mutation[0] in source, mutation[0]
+        assert decorator_problems(source.replace(*mutation, 1)) != []
+
+    def test_no_loose_execution_references(self) -> None:
+        assert loose_reference_problems(live_source_text()) == []
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            "def f(adapters):\n    g = adapters.workflow.execute\n",
+            "def f(adapters):\n    return [adapters.readiness.probe]\n",
+            "def f():\n    h = create_provider\n",
+            "def f(x=ProviderRegistry):\n    pass\n",
+            "def f(engine):\n    return engine.run\n",
+            "def f(adapters):\n    k = adapters.workflow\n",
+            "async def f(adapters):\n    t = asyncio.create_task(adapters.workflow.execute)\n",
+        ],
+    )
+    def test_loose_reference_controls(self, extra: str) -> None:
+        assert loose_reference_problems(live_source_text() + "\n" + extra) != []
+
+    def test_live_imports_match_allowlist(self) -> None:
+        assert stdlib_import_problems(live_source_text()) == []
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            "import os.path as p\n",
+            "from os import fork\n",
+            "def f():\n    import multiprocessing\n",
+            "import threading\n",
+            "from asyncio import gather\n",
+            "def f():\n    import importlib\n"
+            "    return importlib.import_module('multiprocessing')\n",
+            "import socket\n",
+        ],
+    )
+    def test_import_controls(self, extra: str) -> None:
+        assert stdlib_import_problems(live_source_text() + "\n" + extra) != []
+
+    def test_no_process_or_thread_capability(self) -> None:
+        assert chain_problems(live_source_text()) == []
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            "def f():\n    return pytest.mark.slow\n",
+            "def f():\n    return pytest.fail.Exception.__mro__\n",
+            "def f():\n    return pytest.ExitCode.OK\n",
+            "m = pytest.mark\n",
+            "def f():\n    return logging.DEBUG\n",
+            "def f():\n    return logging.NOTSET\n",
+            "def f():\n    return logging.WARNING\n",
+            "def f():\n    return logging.Filter\n",
+            "def f(x):\n    return isinstance(x, logging.Logger)\n",
+            "def f():\n    return logging.Logger('x')\n",
+            "cls = logging.Logger\n",
+            "def f(logger=logging.Logger):\n    pass\n",
+            "x: int = logging.Logger\n",
+            "def f():\n    return os.fork()\n",
+            "x = os\n",
+            "def f():\n    return getattr(os, 'fork')\n",
+            "def f():\n    return getattr(pytest, name)\n",
+            "def f():\n    return getattr(pytest, '__version__', None)\n",
+            "def pytest_version_text():\n    return pytest.__version__\n",
+            "def f():\n    os.environ['ANTHROPIC_API_KEY'] = 'x'\n",
+        ],
+    )
+    def test_chain_and_capability_controls(self, extra: str) -> None:
+        source = live_source_text() + "\n" + extra
+        assert chain_problems(source) != [] or dynamic_lookup_problems(source) != []
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            "class PrivateLogSink2:\n"
+            "    def f(self, x: list[logging.Logger]) -> list[logging.Logger]:\n"
+            "        return x\n",
+        ],
+    )
+    def test_annotation_positions_are_not_errors_outside_the_listed_function(
+        self, extra: str
+    ) -> None:
+        # a Logger annotation in another function is still an unlisted location
+        assert chain_problems(live_source_text() + "\n" + extra) != []
+
+    def test_dispatch_path_single_invocation(self) -> None:
+        assert dispatch_problems(live_source_text()) == []
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            (
+                "            raw = await runners[case](case)\n",
+                "            raw = await runners[case](case)\n"
+                "            raw = await runners[case](case)\n",
+            ),
+            (
+                "    cases: Sequence[Case] = ORDER,\n    clock",
+                "    cases: Sequence[Case] = (Case.L0, Case.L1),\n    clock",
+            ),
+            (
+                "    cases: Sequence[Case] = ORDER,\n"
+                "    board: FindingsBoard | None = None,\n"
+                "    mark: Callable[[str], None] | None = None,\n"
+                ") -> SessionResult:\n"
+                '    """Preflight',
+                "    cases: Sequence[Case] = tuple(ORDER),\n"
+                "    board: FindingsBoard | None = None,\n"
+                "    mark: Callable[[str], None] | None = None,\n"
+                ") -> SessionResult:\n"
+                '    """Preflight',
+            ),
+            (
+                "    return await runner(case)\n",
+                "    await runner(case)\n    return await runner(case)\n",
+            ),
+            ("        cases=(Case.L0,),\n", "        cases=(Case.L0, Case.L1),\n"),
+            (
+                "        board=board,\n        mark=mark,\n    )\n    result.evidence[:0]",
+                "        board=board,\n        mark=mark,\n"
+                "        cases=(Case.L0, Case.L1, Case.L1),\n    )\n    result.evidence[:0]",
+            ),
+        ],
+    )
+    def test_dispatch_controls(self, mutation: tuple[str, str]) -> None:
+        source = live_source_text()
+        assert mutation[0] in source, mutation[0]
+        assert dispatch_problems(source.replace(*mutation, 1)) != []
+
+    def test_builtin_calls_within_allowed_set(self) -> None:
+        facts = call_surface_facts(live_source_text())
+        used = {f.callee for f in facts if f.kind == "builtin"}
+        assert used <= ALLOWED_CALL_BUILTINS
+        assert call_surface_problems(live_source_text()) == []
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            "def f(x):\n    print(x)\n",
+            "def f(r, c):\n    return map(r, c)\n",
+            "def f(c):\n    return iter(c)\n",
+            "def f(x):\n    return callable(x)\n",
+            "def f(a, f):\n    return min(a, key=f)\n",
+            "def f():\n    breakpoint()\n",
+            "run_it = make_it()\n\n\ndef g():\n    return run_it()\n",
+        ],
+    )
+    def test_builtin_and_module_call_controls(self, extra: str) -> None:
+        assert call_surface_problems(live_source_text() + "\n" + extra) != []
+
+    def test_builtin_shadow_classification(self) -> None:
+        def kinds(source: str) -> dict[str, str]:
+            return {f.callee: f.kind for f in call_surface_facts(source)}
+
+        assert (
+            kinds("def print(x):\n    pass\n\n\ndef g(y):\n    return print(y)\n")["print"]
+            == "module"
+        )
+        assert kinds("def g(f, x):\n    len = f\n    return len(x)\n")["len"] == "local"
+        assert kinds("make = object\n\n\ndef g():\n    return make()\n")["make"] == "module-assign"
+
+    def test_the_gate_constants_are_the_literal_tables(self) -> None:
+        assert len(ALLOWED_CALL_BUILTINS) == 26 and len(INJECTED_CALLABLE_CALLS) == 30
+        assert not ALLOWED_CALL_BUILTINS & FORBIDDEN_CALL_BUILTINS
+
+    def test_injected_callable_table_exact(self) -> None:
+        facts = call_surface_facts(live_source_text())
+        local = {(f.function, f.callee) for f in facts if f.kind == "local"}
+        assert local - RUNNER_CALL_PAIRS == INJECTED_CALLABLE_CALLS  # both directions
+
+    @pytest.mark.parametrize(
+        ("mutation", "table_change"),
+        [
+            ("add", ("probe_readiness.preflight", "facts")),
+            ("remove", ("run_official_session.preflight", "sink")),
+        ],
+    )
+    def test_injected_table_drift_is_detected(
+        self, mutation: str, table_change: tuple[str, str]
+    ) -> None:
+        facts = call_surface_facts(live_source_text())
+        local = {(f.function, f.callee) for f in facts if f.kind == "local"} - RUNNER_CALL_PAIRS
+        drifted = (
+            INJECTED_CALLABLE_CALLS | {table_change}
+            if mutation == "add"
+            else INJECTED_CALLABLE_CALLS - {table_change}
+        )
+        assert local != drifted
+
+    def test_probe_readiness_preflight_has_no_injected_calls(self) -> None:
+        assert not [
+            pair for pair in INJECTED_CALLABLE_CALLS if pair[0] == "probe_readiness.preflight"
+        ]
+        calls = [
+            f
+            for f in call_surface_facts(live_source_text())
+            if f.function == "probe_readiness.preflight"
+        ]
+        assert [(f.callee, f.kind) for f in calls] == [("common_preflight", "module")]
+        extra = live_source_text().replace(
+            "    def preflight() -> None:\n        common_preflight(\n"
+            "            config, tmp_path, readiness_check=readiness_check, "
+            "prereq_check=prereq_check\n"
+            "        )\n\n    protected",
+            "    def preflight() -> None:\n        check = common_preflight\n        check(\n"
+            "            config, tmp_path, readiness_check=readiness_check, "
+            "prereq_check=prereq_check\n"
+            "        )\n\n    protected",
+            1,
+        )
+        assert extra != live_source_text()
+        assert call_surface_problems(extra) != []
+
+    def test_local_import_resolution_precedence(self) -> None:
+        facts = call_surface_facts(live_source_text())
+        names = {
+            "load_config",
+            "create_provider",
+            "ProviderRegistry",
+            "WorkflowEngine",
+            "WorkflowEventEmitter",
+            "display_usage_summary",
+            "Console",
+        }
+        found = {(f.function, f.callee): f.kind for f in facts if f.callee in names}
+        assert set(found.values()) == {"import"}
+        assert {callee for _, callee in found} == names
+        assert {function for function, _ in found} == {
+            "RealReadinessAdapter.probe",
+            "RealWorkflowAdapter.execute",
+        }
+        # the import wins over a parameter and over a later assignment of the same name
+        assert {
+            f.callee: f.kind
+            for f in call_surface_facts(
+                "def g(load_config):\n    from conductor.config.loader import load_config\n"
+                "    return load_config(1)\n"
+            )
+        }["load_config"] == "import"
+        assert {
+            f.callee: f.kind
+            for f in call_surface_facts(
+                "def g():\n    from rich.console import Console\n    Console = 1\n"
+                "    return Console()\n"
+            )
+        }["Console"] == "import"
+        # control: an ordinary local callable is runner-valued and therefore not listed
+        for scratch in (
+            "def g(factory):\n    make = factory\n    return make()\n",
+            "def g(Console):\n    c = Console\n    return c()\n",
+        ):
+            assert call_surface_problems(live_source_text() + "\n" + scratch) != []
+
+    def test_lambda_and_comprehension_scopes(self) -> None:
+        def kind_of(source: str, callee: str, occurrence: int = 0) -> str:
+            hits = [f.kind for f in call_surface_facts(source) if f.callee == callee]
+            return hits[occurrence]
+
+        for scratch in (
+            "def g(fs, x):\n    return [len(x) for len in fs]\n",
+            "def g(fs, x):\n    return sum(len(x) for len in fs)\n",
+            "def g(fs, ks):\n    return {k: len(k) for len in fs for k in ks}\n",
+            "def g(x):\n    return (lambda len: len(x))\n",
+        ):
+            assert kind_of(scratch, "len") == "local", scratch
+            assert call_surface_problems(live_source_text() + "\n" + scratch) != []
+        # positive controls: the builtin, the first iterable and the walrus target
+        assert kind_of("def g(xs, x):\n    return [len(x) for x in xs]\n", "len") == "builtin"
+        assert kind_of("def g(xs):\n    return [x for len in len(xs)]\n", "len", 0) == "builtin"
+        assert (
+            kind_of("def g(xs):\n    [(h := make) for make in xs]\n    return h()\n", "h")
+            == "local"
+        )
+        # a walrus inside a lambda's comprehension binds in the lambda
+        assert (
+            kind_of("def g():\n    return lambda xs: ([(h := m) for m in xs], h())\n", "h")
+            == "local"
+        )
+
+    def test_the_resolver_fails_closed_on_unsupported_constructs(self) -> None:
+        for scratch in (
+            "class C:\n    h = make\n    v = h()\n",  # a call to a class-local name
+            "def g():\n    global x\n    x = 1\n",
+            "def g():\n    nonlocal_free = 1\n    def inner():\n"
+            "        nonlocal nonlocal_free\n        nonlocal_free = 2\n",
+        ):
+            with pytest.raises(ResolutionUnsupported):
+                call_surface_facts(scratch)
+            assert call_surface_problems(live_source_text() + "\n" + scratch)[0].startswith(
+                "unsupported"
+            )
+        # defaults are evaluated in the enclosing scope, not in the function's own
+        got = {
+            f.function: f.kind
+            for f in call_surface_facts("def outer(len):\n    def f(a=len(1)):\n        return a\n")
+            if f.callee == "len"
+        }
+        assert got == {"outer": "local"}
+        assert {
+            f.kind
+            for f in call_surface_facts("def f(len, a=len(1)):\n    return a\n")
+            if f.callee == "len"
+        } == {"builtin"}
+
+
+# ============================================================================
+# H59 (vi) (n), (o), (p): Class R counting tests over fail-fast fakes
+# ============================================================================
+
+
+class FakeSite(enum.StrEnum):
+    registry = "registry"
+    registry_enter = "registry_enter"
+    registry_exit = "registry_exit"
+    engine = "engine"
+    engine_run = "engine_run"
+    execution_summary = "execution_summary"
+    emitter = "emitter"
+    emitter_subscribe = "emitter_subscribe"
+    load_config = "load_config"
+    display_usage_summary = "display_usage_summary"
+    create_provider = "create_provider"
+    capture_auth_context = "capture_auth_context"
+    check_auth_readiness = "check_auth_readiness"
+    provider_close = "provider_close"
+    event_loop = "event_loop"
+    fork = "fork"
+    forkpty = "forkpty"
+    posix_spawn = "posix_spawn"
+    posix_spawnp = "posix_spawnp"
+    system = "system"
+    popen = "popen"
+    popen_execute_child = "popen_execute_child"
+    create_subprocess_exec = "create_subprocess_exec"
+    create_subprocess_shell = "create_subprocess_shell"
+    thread_start = "thread_start"
+    process_start = "process_start"
+    thread_pool_submit = "thread_pool_submit"
+    process_pool_submit = "process_pool_submit"
+    socket_connect = "socket_connect"
+    provider_execute = "provider_execute"
+    sdk_client = "sdk_client"
+    popen_child_backstop = "popen_child_backstop"
+
+
+class FakeViolation(enum.StrEnum):
+    second_construction = "second_construction"
+    second_call = "second_call"
+    unexpected_argument = "unexpected_argument"
+    unexpected_attribute = "unexpected_attribute"
+    unexpected_run_input = "unexpected_run_input"
+    sink_not_installed = "sink_not_installed"
+    tripwire_hit = "tripwire_hit"
+    pending_task = "pending_task"
+    pending_task_not_drained = "pending_task_not_drained"
+
+
+class CountingFakeViolation(Exception):
+    """One fixed exception, constructed with no argument: it carries no text."""
+
+
+PENDING_DRAIN_TIMEOUT_S = 1.0
+CONTROL_TIMEOUT_S = 10.0
+
+Violations = list[tuple[FakeSite, FakeViolation]]
+
+
+@contextlib.asynccontextmanager
+async def scoped_tripwires(
+    violations: Violations,
+    counts: dict[FakeSite, int] | None = None,
+    order: list[str] | None = None,
+) -> Any:
+    """Process, thread, socket and SDK raisers around the one awaited call under test.
+
+    Besides the module attribute ``subprocess.Popen`` it patches ``_execute_child`` on the
+    *original* class (a ``popen=subprocess.Popen`` default bound at definition time cannot create a
+    process unnoticed).  Before restoring anything it checks the running loop for tasks other than
+    the current one, records one pair per task, cancels each with ``task.cancel()`` and waits at
+    most ``PENDING_DRAIN_TIMEOUT_S`` for them; restoration is always in ``finally``.
+    """
+    import concurrent.futures
+    import multiprocessing.process
+    import socket
+    import threading
+
+    original_popen = subprocess.Popen
+    assert hasattr(original_popen, "_execute_child")  # a Python without it fails closed (R-AP)
+    patches: list[tuple[Any, str, Any, bool]] = []
+
+    def arm(owner: Any, attribute: str, site: FakeSite) -> None:
+        own = isinstance(owner, type) and attribute in owner.__dict__
+        original = owner.__dict__[attribute] if own else getattr(owner, attribute)
+
+        def raiser(*args: object, **kwargs: object) -> None:
+            if counts is not None:
+                counts[site] = counts.get(site, 0) + 1
+            violations.append((site, FakeViolation.tripwire_hit))
+            raise CountingFakeViolation()
+
+        patches.append((owner, attribute, original, own or not isinstance(owner, type)))
+        setattr(owner, attribute, raiser)
+
+    try:
+        arm(os, "fork", FakeSite.fork)
+        arm(os, "forkpty", FakeSite.forkpty)
+        arm(os, "posix_spawn", FakeSite.posix_spawn)
+        arm(os, "posix_spawnp", FakeSite.posix_spawnp)
+        arm(os, "system", FakeSite.system)
+        arm(subprocess, "Popen", FakeSite.popen)
+        arm(original_popen, "_execute_child", FakeSite.popen_execute_child)
+        arm(asyncio, "create_subprocess_exec", FakeSite.create_subprocess_exec)
+        arm(asyncio, "create_subprocess_shell", FakeSite.create_subprocess_shell)
+        arm(threading.Thread, "start", FakeSite.thread_start)
+        arm(multiprocessing.process.BaseProcess, "start", FakeSite.process_start)
+        arm(concurrent.futures.ThreadPoolExecutor, "submit", FakeSite.thread_pool_submit)
+        arm(concurrent.futures.ProcessPoolExecutor, "submit", FakeSite.process_pool_submit)
+        arm(socket.socket, "connect", FakeSite.socket_connect)
+        try:
+            yield
+        finally:
+            current = asyncio.current_task()
+            pending = [
+                task
+                for task in asyncio.all_tasks(asyncio.get_running_loop())
+                if task is not current and not task.done()
+            ]
+            if order is not None:
+                order.append("pending_checked")
+            for task in pending:
+                violations.append((FakeSite.event_loop, FakeViolation.pending_task))
+                task.cancel()
+            if pending:
+                done, not_done = await asyncio.wait(pending, timeout=PENDING_DRAIN_TIMEOUT_S)
+                for _task in not_done:
+                    violations.append((FakeSite.event_loop, FakeViolation.pending_task_not_drained))
+                for task in done:
+                    if not task.cancelled():
+                        task.exception()  # marks the outcome retrieved; the result is discarded
+    finally:
+        for owner, attribute, original, restore in reversed(patches):
+            if restore:
+                setattr(owner, attribute, original)
+            else:  # inherited: the class never held it, so the patch is removed, not re-set
+                delattr(owner, attribute)
+        if order is not None:
+            order.append("restored")
+
+
+class Counts:
+    """Counters and the append-only violation record shared by one test's fakes."""
 
     def __init__(self) -> None:
-        self.touched: list[str] = []
+        self.n: dict[FakeSite, int] = {}
+        self.violations: Violations = []
+        self.event_text: list[dict[str, Any]] = []
 
-    def _boom(self, name: str) -> Any:
-        self.touched.append(name)
-        raise RuntimeError(name)
+    def bump(self, site: FakeSite) -> int:
+        self.n[site] = self.n.get(site, 0) + 1
+        return self.n[site]
 
-    def __eq__(self, other: object) -> bool:
-        return self._boom("eq")
+    def fail(self, site: FakeSite, violation: FakeViolation) -> Any:
+        """Count first (done by the caller), record the closed pair, then raise the fixed error."""
+        self.violations.append((site, violation))
+        raise CountingFakeViolation()
 
-    def __hash__(self) -> int:
-        return self._boom("hash")
-
-    def __str__(self) -> str:
-        return self._boom("str")
-
-    def __repr__(self) -> str:
-        return self._boom("repr")
-
-    def __bool__(self) -> bool:
-        return self._boom("bool")
-
-    def __index__(self) -> int:
-        return self._boom("index")
-
-    def __int__(self) -> int:
-        return self._boom("int")
-
-    def __lt__(self, other: object) -> bool:
-        return self._boom("lt")
-
-    def __gt__(self, other: object) -> bool:
-        return self._boom("gt")
+    def once(self, site: FakeSite, violation: FakeViolation = FakeViolation.second_call) -> None:
+        if self.bump(site) > 1:
+            self.fail(site, violation)
 
 
-class HostileStr(str):
-    touched: list[str] = []
-
-    def __eq__(self, other: object) -> bool:
-        HostileStr.touched.append("eq")
-        raise RuntimeError("eq")
-
-    def __hash__(self) -> int:
-        HostileStr.touched.append("hash")
-        raise RuntimeError("hash")
-
-
-class HostileInt(int):
-    touched: list[str] = []
-
-    def __eq__(self, other: object) -> bool:
-        HostileInt.touched.append("eq")
-        raise RuntimeError("eq")
-
-    def __lt__(self, other: object) -> bool:
-        HostileInt.touched.append("lt")
-        raise RuntimeError("lt")
-
-    __gt__ = __le__ = __ge__ = __lt__
-
-    def __hash__(self) -> int:
-        HostileInt.touched.append("hash")
-        raise RuntimeError("hash")
-
-
-def retryability_scenarios() -> dict[str, list[BaseException]]:
-    """The chain scenarios of H52 (i): name -> exception chain."""
-    return {
-        "empty": [],
-        "no_provider_error": [ValueError("x")],
-        "retryable": [ProviderError("x", is_retryable=True)],
-        "non_retryable": [ProviderError("x", is_retryable=False)],
-        "mixed_nr_first": [
-            ProviderError("x", is_retryable=False),
-            ProviderError("x", is_retryable=True),
-        ],
-        "mixed_r_first": [
-            ProviderError("x", is_retryable=True),
-            ProviderError("x", is_retryable=False),
-        ],
-    }
-
-
-EXPECTED_RETRYABILITY = {
-    "empty": "absent",
-    "no_provider_error": "absent",
-    "retryable": "retryable",
-    "non_retryable": "non_retryable",
-    "mixed_nr_first": "mixed",
-    "mixed_r_first": "mixed",
+SDK_USAGE = {
+    "total_input_tokens": 12,
+    "total_output_tokens": 8,
+    "total_cost_usd": 0.001,
+    "billing": {"state": "subscription", "breakdown": {"subscription": 1}},
+}
+COMPLETED_EVENT = {
+    "type": "agent_completed",
+    "data": {"billing_mode": "subscription", "model": "claude-haiku-4-5-20251001"},
 }
 
 
-class TestDiagnosticReducers:
-    """H52: the total reducers and ``l3_diagnostics`` (pure, in-process)."""
+def counting_world(
+    monkeypatch: pytest.MonkeyPatch,
+    counts: Counts,
+    *,
+    engine_run: Callable[[Any, Any], Any] | None = None,
+) -> dict[str, Any]:
+    """Replace the production registry, engine and emitter by fail-fast counting fakes."""
+    import conductor.cli.run as run_module
+    import conductor.config.loader as loader_module
+    import conductor.engine.workflow as workflow_module
+    import conductor.events as events_module
+    import conductor.providers.registry as registry_module
 
-    @pytest.mark.parametrize("name", list(EXPECTED_RETRYABILITY))
-    def test_retryability_of_the_basic_chains(self, name: str) -> None:
-        chain = retryability_scenarios()[name]
-        assert lm.provider_retryability_of(chain) == EXPECTED_RETRYABILITY[name]
-        assert diag_of(chain)["diag_provider_retryability"] == EXPECTED_RETRYABILITY[name]
-
-    def test_a_non_retryable_error_is_found_through_cause_context_and_groups(self) -> None:
-        inner = ProviderError("x", is_retryable=False)
-        via_cause = RuntimeError("wrapped")
-        via_cause.__cause__ = inner
-        via_context = RuntimeError("wrapped")
-        via_context.__context__ = inner
-        group = ExceptionGroup("g", [inner])
-        for root in (via_cause, via_context, group):
-            assert lm.provider_retryability_of(lm.exception_chain(root)) == "non_retryable"
-
-    def test_a_cyclic_chain_terminates(self) -> None:
-        first, second = RuntimeError("a"), ProviderError("b", is_retryable=False)
-        first.__cause__, second.__cause__ = second, first
-        assert lm.provider_retryability_of(lm.exception_chain(first)) == "non_retryable"
-
-    def test_a_provider_error_subclass_counts_and_a_lookalike_does_not(self) -> None:
-        class Sub(ProviderError):
-            pass
-
-        class LookAlike(Exception):
-            is_retryable = False
-
-        assert lm.provider_retryability_of([Sub("x", is_retryable=False)]) == "non_retryable"
-        assert lm.provider_retryability_of([LookAlike()]) == "absent"
-
-    @pytest.mark.parametrize(
-        "value", [None, 0, "", "False", 1, True, object(), 0.0, [], "no"], ids=repr
-    )
-    def test_only_the_object_false_is_non_retryable(self, value: object) -> None:
-        assert lm.provider_retryability_of([provider_error(value)]) == "retryable"
-        assert lm.provider_retryability_of([provider_error(False)]) == "non_retryable"
-
-    def test_a_chain_that_cannot_be_iterated_or_an_attribute_that_raises_raises(self) -> None:
-        class Exploding(ProviderError):
-            @property
-            def is_retryable(self) -> bool:
-                raise RuntimeError("no attribute")
-
-            @is_retryable.setter
-            def is_retryable(self, value: object) -> None:
-                pass
-
-        with pytest.raises(TypeError):
-            lm.provider_retryability_of(5)  # type: ignore[arg-type]
-        with pytest.raises(RuntimeError):
-            lm.provider_retryability_of([Exploding("x")])
-        with pytest.raises(TypeError):
-            lm.l3_diagnostics([], 5)  # type: ignore[arg-type]
-
-    # -- status ----------------------------------------------------------------------------
-
-    STATUS_ROWS = [
-        (401, "401"),
-        (403, "403"),
-        (404, "404"),
-        (429, "429"),
-        (400, "other_4xx"),
-        (402, "other_4xx"),
-        (405, "other_4xx"),
-        (422, "other_4xx"),
-        (499, "other_4xx"),
-        (500, "5xx"),
-        (502, "5xx"),
-        (503, "5xx"),
-        (504, "5xx"),
-        (599, "5xx"),
-        (100, "other"),
-        (200, "other"),
-        (399, "other"),
-    ]
-
-    @pytest.mark.parametrize(("status", "expected"), STATUS_ROWS)
-    def test_status_buckets_through_the_real_reducer(self, status: int, expected: str) -> None:
-        observation = message_obs(status=status)
-        assert diag_of([], [observation])["diag_api_status"] == expected
-
-    @pytest.mark.parametrize(
-        "status", [None, 99, 600, True, "401", 401.0, -1, 0, 1, b"401", 10**30], ids=repr
-    )
-    def test_a_rejected_status_reads_absent_through_the_real_reducer(self, status: object) -> None:
-        observation = message_obs(status=status)
-        assert observation.api_error_status is None
-        assert diag_of([], [observation])["diag_api_status"] == "absent"
-
-    def test_each_bucket_boundary_is_its_own_row(self) -> None:
-        # 399/400, 499/500 and 599/600: an off-by-one at any of them changes exactly one answer.
-        assert lm.api_status_of(399) == "other" and lm.api_status_of(400) == "other_4xx"
-        assert lm.api_status_of(499) == "other_4xx" and lm.api_status_of(500) == "5xx"
-        assert lm.api_status_of(599) == "5xx" and lm.api_status_of(600) == "other"
-        assert lm.api_status_of(100) == "other" and lm.api_status_of(99) == "other"
-
-    @pytest.mark.parametrize(
-        "status",
-        [True, False, 401.0, "401", b"401", -1, 0, 1, 99, 600, 10**30, float("nan"), object()],
-        ids=repr,
-    )
-    def test_a_hand_built_malformed_status_is_other_never_absent(self, status: object) -> None:
-        observation = lm.Observation("ResultMessage", None, status, None)  # type: ignore[arg-type]
-        assert lm.api_status_of(status) == "other"
-        assert diag_of([], [observation])["diag_api_status"] == "other"
-
-    def test_a_hand_built_int_subclass_is_other_and_a_plain_int_is_a_bucket(self) -> None:
-        class Mine(int):
-            pass
-
-        assert lm.api_status_of(Mine(401)) == "other"
-        assert lm.api_status_of(401) == "401"
-        assert lm.api_status_of(None) is None
-
-    # -- assistant error ---------------------------------------------------------------------
-
-    @pytest.mark.parametrize("literal", sorted(lm.ASSISTANT_ERRORS))
-    def test_each_sdk_literal_maps_to_itself(self, literal: str) -> None:
-        assert lm.assistant_error_of(literal) == literal
-        assert diag_of([], [message_obs(error=literal)])["diag_assistant_error"] == literal
-
-    @pytest.mark.parametrize(
-        "value",
-        [
-            "something_new",
-            "Authentication_Failed",
-            "authentication_failed ",
-            " authentication_failed",
-            "absent",
-            "unavailable",
-            "other",
-            "",
-            0,
-            b"authentication_failed",
-            ["rate_limit"],
-            {"rate_limit": 1},
-            True,
-            object(),
-        ],
-        ids=repr,
-    )
-    def test_an_unrecognised_value_is_other_never_absent_or_a_reserved_word(
-        self, value: object
-    ) -> None:
-        assert lm.assistant_error_of(value) == "other"
-        observation = lm.Observation("AssistantMessage", value, None, None)  # type: ignore[arg-type]
-        assert diag_of([], [observation])["diag_assistant_error"] == "other"
-
-    def test_none_and_no_observation_are_absent(self) -> None:
-        assert lm.assistant_error_of(None) is None
-        assert diag_of([], [message_obs()])["diag_assistant_error"] == "absent"
-        assert diag_of([])["diag_assistant_error"] == "absent"
-        assert diag_of([], [message_obs()])["diag_api_status"] == "absent"
-
-    # -- precedence --------------------------------------------------------------------------
-
-    ASSISTANT_PRECEDENCE_ROWS = [
-        (["rate_limit", "authentication_failed"], "authentication_failed"),
-        (["other", "server_error"], "server_error"),
-        (["unknown", "other"], "unknown"),
-        (["billing_error", "invalid_request"], "billing_error"),
-        (["rate_limit", "server_error"], "rate_limit"),
-    ]
-    STATUS_PRECEDENCE_ROWS = [
-        ([500, 401], "401"),
-        ([500, 429], "429"),
-        ([403, 404], "404"),
-        ([404, 403], "404"),
-        ([503, 400], "other_4xx"),
-        ([200, 503], "5xx"),
-        ([200, None], "other"),
-        ([429, 403], "403"),
-    ]
-
-    @pytest.mark.parametrize(("values", "expected"), ASSISTANT_PRECEDENCE_ROWS)
-    def test_assistant_error_precedence_is_order_independent(
-        self, values: list[str], expected: str
-    ) -> None:
-        import itertools
-
-        for ordering in itertools.permutations(values):
-            observations = [message_obs(error=value) for value in ordering]
-            assert diag_of([], observations)["diag_assistant_error"] == expected
-
-    @pytest.mark.parametrize(("values", "expected"), STATUS_PRECEDENCE_ROWS)
-    def test_status_precedence_is_order_independent(
-        self, values: list[int | None], expected: str
-    ) -> None:
-        import itertools
-
-        for ordering in itertools.permutations(values):
-            observations = [message_obs(status=value) for value in ordering]
-            assert diag_of([], observations)["diag_api_status"] == expected
-
-    def test_a_five_observation_mixed_list_has_one_answer_in_every_order(self) -> None:
-        import itertools
-
-        base = [
-            message_obs(error="rate_limit", status=500),
-            message_obs(error="other_thing", status=403),
-            message_obs(error="server_error", status=429),
-            message_obs(error="unknown", status=200),
-            message_obs(error=None, status=None),
-        ]
-        answers = {
-            tuple(diag_of([], list(ordering)).items()) for ordering in itertools.permutations(base)
-        }
-        assert len(answers) == 1
-        got = dict(next(iter(answers)))
-        assert got["diag_assistant_error"] == "rate_limit"
-        assert got["diag_api_status"] == "403"  # "403" precedes "429"
-
-    def test_the_precedence_tuples_are_the_literal_tuples(self) -> None:
-        assert lm.DIAG_ASSISTANT_ERROR_PRECEDENCE == ASSISTANT_PRECEDENCE
-        assert lm.DIAG_API_STATUS_PRECEDENCE == STATUS_PRECEDENCE
-        assert isinstance(lm.DIAG_ASSISTANT_ERROR_PRECEDENCE, tuple)
-        assert isinstance(lm.DIAG_API_STATUS_PRECEDENCE, tuple)
-        for precedence, closed in (
-            (lm.DIAG_ASSISTANT_ERROR_PRECEDENCE, lm.DIAG_ASSISTANT_ERROR),
-            (lm.DIAG_API_STATUS_PRECEDENCE, lm.DIAG_API_STATUS),
-        ):
-            assert len(set(precedence)) == len(precedence)
-            assert set(precedence) == closed - {"absent", "unavailable"}
-
-    def test_every_pair_in_each_tuple_resolves_to_the_earlier_member(self) -> None:
-        for precedence, build in (
-            (
-                lm.DIAG_ASSISTANT_ERROR_PRECEDENCE,
-                lambda member: message_obs(error=member if member != "other" else "zzz"),
-            ),
-            (
-                lm.DIAG_API_STATUS_PRECEDENCE,
-                lambda member: message_obs(
-                    status={
-                        "401": 401,
-                        "404": 404,
-                        "403": 403,
-                        "429": 429,
-                        "other_4xx": 400,
-                        "5xx": 500,
-                        "other": 200,
-                    }[member]
-                ),
-            ),
-        ):
-            key = (
-                "diag_assistant_error"
-                if precedence is lm.DIAG_ASSISTANT_ERROR_PRECEDENCE
-                else "diag_api_status"
-            )
-            for i, earlier in enumerate(precedence):
-                for later in precedence[i + 1 :]:
-                    for pair in ((later, earlier), (earlier, later)):
-                        got = diag_of([], [build(pair[0]), build(pair[1])])[key]
-                        assert got == earlier, (pair, got)
-
-    # -- totality and closure ------------------------------------------------------------------
-
-    def test_the_exhaustive_product_stays_inside_the_closed_sets(self) -> None:
-        for chain in retryability_scenarios().values():
-            for error in (None, *DIAG_ASSISTANT_VALUES):
-                for status in DIAG_STATUS_SAMPLES:
-                    for observations in (
-                        [message_obs(error=error if error != "other" else "zz", status=status)],
-                        [
-                            message_obs(error=error if error != "other" else "zz"),
-                            message_obs(status=status),
-                        ],
-                    ):
-                        before = list(observations)
-                        got = diag_of(chain, observations)
-                        assert set(got) == set(lm.DIAG_KEYS)
-                        assert diag_of(chain, observations) == got
-                        assert observations == before
-                        for key in lm.DIAG_KEYS:
-                            assert lm.DIAG_VALIDATORS[key](got[key]), (key, got)
-                        assert lm.diag_triple_valid(got)
-                        assert "unavailable" not in got.values()
-
-    def test_hostile_single_values_give_other_and_are_never_touched(self) -> None:
-        hostile = Hostile()
-        HostileStr.touched.clear()
-        HostileInt.touched.clear()
-        values: list[object] = [
-            hostile,
-            [1, 2],
-            {"a": 1},
-            HostileStr("authentication_failed"),
-            HostileInt(401),
-            "x" * 10_000,
-        ]
-        recursive: list[object] = []
-        recursive.append(recursive)
-        values.append(recursive)
-        for value in values:
-            assert lm.assistant_error_of(value) == "other"
-            assert lm.api_status_of(value) == "other"
-        assert hostile.touched == []
-        assert HostileStr.touched == [] and HostileInt.touched == []
-        observation = lm.Observation("x", hostile, hostile, None)  # type: ignore[arg-type]
-        got = diag_of([], [observation])
-        assert got["diag_assistant_error"] == "other" and got["diag_api_status"] == "other"
-        assert hostile.touched == []
-
-    def test_the_helpers_never_produce_unavailable(self) -> None:
-        for value in ("unavailable", "absent", "other", None, 0, Hostile(), "", b"x"):
-            assert lm.assistant_error_of(value) != "unavailable"
-            assert lm.api_status_of(value) != "unavailable"
-        assert lm.provider_retryability_of([]) != "unavailable"
-
-    # -- agreement with the gate predicate (a test oracle, not production code) ----------------
-
-    def test_the_triple_agrees_with_classify_l3_over_the_whole_product(self) -> None:
-        seen_invalid = 0
-        for chain in retryability_scenarios().values():
-            for error in (None, *DIAG_ASSISTANT_VALUES):
-                for status in DIAG_STATUS_SAMPLES:
-                    observations = [
-                        message_obs(error=error if error != "other" else "zz", status=status)
-                    ]
-                    triple = diag_of(chain, observations)
-                    outcome = lm.classify_l3(observations, chain, [])
-                    qualifies = triple["diag_provider_retryability"] in (NR_ERROR, "mixed")
-                    typed = (
-                        triple["diag_assistant_error"] == "authentication_failed"
-                        or triple["diag_api_status"] == "401"
-                    )
-                    assert (outcome is lm.Outcome.INVALID_KEY) == (qualifies and typed)
-                    assert (outcome is lm.Outcome.MODEL_UNAVAILABLE) == (
-                        qualifies and not typed and triple["diag_api_status"] == "404"
-                    )
-                    if outcome is lm.Outcome.INVALID_KEY:
-                        seen_invalid += 1
-                        assert qualifies and typed  # satisfies the official item 9 predicate
-        assert seen_invalid > 0
-
-
-# The ``Outcome`` value set before the diagnostic amendment (H56 (iv)): it gained no member.
-PRE_AMENDMENT_OUTCOMES = frozenset(
-    {
-        "adapters_not_wired",
-        "billing_aggregate_mismatch",
-        "billing_label_missing",
-        "billing_not_subscription",
-        "canary_leak",
-        "canary_scan_incomplete",
-        "canary_used_in_l2",
-        "case_failed",
-        "descendant_leak",
-        "effective_model_missing",
-        "fell_back_to_login",
-        "first_party_mismatch",
-        "inconclusive",
-        "interrupted",
-        "invalid_key",
-        "invalid_model_override",
-        "isolation_fixtures_missing",
-        "l2_l3_not_paired",
-        "live_opt_in_error",
-        "model_unavailable",
-        "no_descendants_remaining",
-        "not_executed_after_interrupt",
-        "not_executed_after_l0_failure",
-        "not_executed_after_l1_failure",
-        "not_executed_after_safety_failure",
-        "not_executed_l3_fell_back_to_login",
-        "not_executed_l3_inconclusive",
-        "not_executed_l3_model_unavailable",
-        "not_logged_in",
-        "ok",
-        "output_missing",
-        "prereq_cli_missing",
-        "prereq_cli_not_bundled",
-        "prereq_file_console_active",
-        "prereq_ps_missing",
-        "prereq_report_sanitizer_unavailable",
-        "prereq_sdk_missing",
-        "prereq_terminalreporter_missing",
-        "quota_ceiling_exceeded",
-        "readiness_evidence_contradiction",
-        "readiness_evidence_missing",
-        "readiness_stub_active",
-        "source_tree_mismatch",
-        "unpriced_model_label_unexercised",
+    world: dict[str, Any] = {
+        "callbacks": [],
+        "handlers": [],
+        "registries": [],
+        "loaded": [],  # (path, cfg) of each L1 load: the only config the engine may receive
+        "engine_calls": [],  # (cfg, workflow_path) of each engine construction
     }
-)
+    real_load, real_display = loader_module.load_config, run_module.display_usage_summary
+
+    class FakeEmitter:
+        __slots__ = ()
+
+        def __init__(self) -> None:
+            counts.once(FakeSite.emitter, FakeViolation.second_construction)
+
+        def subscribe(self, callback: Callable[[Any], None]) -> None:
+            counts.once(FakeSite.emitter_subscribe)
+            world["callbacks"].append(callback)
+
+        def __getattr__(self, name: str) -> Any:
+            counts.bump(FakeSite.emitter)
+            counts.fail(FakeSite.emitter, FakeViolation.unexpected_attribute)
+
+    class FakeRegistry:
+        __slots__ = ()
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            if counts.bump(FakeSite.registry) > 1:
+                counts.fail(FakeSite.registry, FakeViolation.second_construction)
+            if len(args) != 1 or kwargs or not hasattr(args[0], "workflow"):
+                counts.fail(FakeSite.registry, FakeViolation.unexpected_argument)
+            if not world["loaded"] or args[0] is not world["loaded"][-1][1]:
+                counts.fail(FakeSite.registry, FakeViolation.unexpected_argument)
+            world["registries"].append(self)
+
+        async def __aenter__(self) -> FakeRegistry:
+            counts.once(FakeSite.registry_enter)
+            return self
+
+        async def __aexit__(self, *exc_info: object) -> None:
+            counts.once(FakeSite.registry_exit)
+
+        def __getattr__(self, name: str) -> Any:
+            counts.bump(FakeSite.registry)
+            counts.fail(FakeSite.registry, FakeViolation.unexpected_attribute)
+
+    class FakeEngine:
+        __slots__ = ()
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            if counts.bump(FakeSite.engine) > 1:
+                counts.fail(FakeSite.engine, FakeViolation.second_construction)
+            if len(args) != 1 or set(kwargs) != {"registry", "event_emitter", "workflow_path"}:
+                counts.fail(FakeSite.engine, FakeViolation.unexpected_argument)
+            if not isinstance(kwargs["registry"], FakeRegistry) or not isinstance(
+                kwargs["event_emitter"], FakeEmitter
+            ):
+                counts.fail(FakeSite.engine, FakeViolation.unexpected_argument)
+            if not world["loaded"]:
+                counts.fail(FakeSite.engine, FakeViolation.unexpected_argument)
+            loaded_path, loaded_cfg = world["loaded"][-1]
+            if args[0] is not loaded_cfg or kwargs["workflow_path"] != loaded_path:
+                counts.fail(FakeSite.engine, FakeViolation.unexpected_argument)
+            world["engine_calls"].append((args[0], kwargs["workflow_path"]))
+
+        async def run(self, inputs: Any) -> Any:
+            counts.once(FakeSite.engine_run)
+            if inputs != {"question": lm.LIVE_QUESTION}:
+                counts.fail(FakeSite.engine_run, FakeViolation.unexpected_run_input)
+            if engine_run is not None:
+                return await engine_run(world, counts)
+            return await default_engine_run(world, counts)
+
+        def get_execution_summary(self) -> dict[str, Any]:
+            counts.once(FakeSite.execution_summary)
+            return {"usage": dict(SDK_USAGE)}
+
+        def __getattr__(self, name: str) -> Any:
+            counts.bump(FakeSite.engine)
+            counts.fail(FakeSite.engine, FakeViolation.unexpected_attribute)
+
+    def counted_load(path: Any) -> Any:  # a pass-through: it counts and never fails
+        cfg = real_load(path)
+        if Path(path).name == "workflow-L1.yaml":  # the L0 adapter loads the example, too
+            counts.bump(FakeSite.load_config)
+            world["loaded"].append((Path(path), cfg))
+        return cfg
+
+    def counted_display(usage: Any, console: Any = None) -> Any:  # a pass-through
+        counts.bump(FakeSite.display_usage_summary)
+        return real_display(usage, console=console)
+
+    monkeypatch.setattr(registry_module, "ProviderRegistry", FakeRegistry)
+    monkeypatch.setattr(workflow_module, "WorkflowEngine", FakeEngine)
+    monkeypatch.setattr(events_module, "WorkflowEventEmitter", FakeEmitter)
+    monkeypatch.setattr(loader_module, "load_config", counted_load)
+    monkeypatch.setattr(run_module, "display_usage_summary", counted_display)
+    return world
 
 
-# -- running real runners through the real case wrapper with fake adapters -------------------
+async def default_engine_run(world: dict[str, Any], counts: Counts) -> dict[str, Any]:
+    """The fake ``engine.run``: checks the sink the adapter installed, logs, emits one event."""
+    names = lm.PRIVATE_LOGGERS
+    for name in names:
+        logger = logging.getLogger(name)
+        extra = [h for h in logger.handlers if isinstance(h, lm._CountingDiscardHandler)]
+        if logger.propagate is not False or len(extra) != 1:
+            counts.violations.append((FakeSite.engine_run, FakeViolation.sink_not_installed))
+    for name in names:
+        logging.getLogger(name).warning("planted %s", SECRET)
+    world["handlers"] = [
+        h
+        for name in names
+        for h in logging.getLogger(name).handlers
+        if isinstance(h, lm._CountingDiscardHandler)
+    ]
+    for callback in world["callbacks"]:
+        callback(SimpleNamespace(to_dict=lambda: dict(COMPLETED_EVENT)))
+    return {"answer": "A workflow is a sequence of steps."}
 
 
-def diag_variants() -> dict[lm.Case, lm.CaseVariant]:
-    env = lm.EnvPlan((), (), {})
-    return {case: lm.CaseVariant(case, "auto", {}, env) for case in (S.L1, S.L3, S.L2)}
+class RecordingProvider:
+    """Stands in for the L0 provider: every attribute but the three permitted ones raises."""
+
+    def __init__(self, counts: Counts) -> None:
+        self._counts = counts
+
+    def _capture_auth_context(self, cwd: str) -> Any:
+        self._counts.once(FakeSite.capture_auth_context)
+        return SimpleNamespace(finalized_child_env={}, setting_sources=[])
+
+    async def _check_auth_readiness(self, *, context: Any) -> Any:
+        self._counts.once(FakeSite.check_auth_readiness)
+        for name in lm.PRIVATE_LOGGERS:
+            logger = logging.getLogger(name)
+            extra = [h for h in logger.handlers if isinstance(h, lm._CountingDiscardHandler)]
+            if logger.propagate is not False or len(extra) != 1:
+                self._counts.violations.append(
+                    (FakeSite.check_auth_readiness, FakeViolation.sink_not_installed)
+                )
+        return sdk.ClaudeAuthStatus(
+            requested_mode="subscription",
+            inferred_mode="subscription",
+            ready=True,
+            auth_method="claude.ai",
+            api_provider="firstParty",
+            subscription_type="max",
+        )
+
+    async def close(self) -> None:
+        self._counts.once(FakeSite.provider_close)
+
+    def __getattr__(self, name: str) -> Any:
+        self._counts.bump(FakeSite.provider_execute)
+        self._counts.fail(FakeSite.provider_execute, FakeViolation.unexpected_attribute)
+
+
+def recording_factory(monkeypatch: pytest.MonkeyPatch, counts: Counts) -> None:
+    import conductor.providers.factory as factory_module
+
+    async def create_provider(**kwargs: Any) -> RecordingProvider:
+        counts.once(FakeSite.create_provider)
+        if kwargs.get("validate") is not False or set(kwargs) != set(L0_CREATE_PROVIDER_KEYWORDS):
+            counts.fail(FakeSite.create_provider, FakeViolation.unexpected_argument)
+        return RecordingProvider(counts)
+
+    monkeypatch.setattr(factory_module, "create_provider", create_provider)
 
 
 @dataclasses.dataclass
-class DiagRun:
-    """One run of the module's runners through ``run_ordered_cases`` with fake adapters."""
-
-    records: list[dict[str, object]]
-    result: lm.SessionResult | None
-    raised: BaseException | None
-    adapters: lm.AdapterSet
-
-    def case_record(self, case: str) -> dict[str, object]:
-        return next(r for r in self.records if r.get("case") == case)
-
-
-def run_cases(
-    fake: FakeAdapterSet,
-    cases: Sequence[lm.Case] = (S.L3,),
-    *,
-    adapters: lm.AdapterSet | None = None,
-    quota: lm.QuotaCounter | None = None,
-) -> DiagRun:
-    adapter_set = adapters or dataclasses.replace(fake.as_set(), board=lm.FindingsBoard(CANARY))
-    runners = lm.build_case_runners(
-        adapter_set, variants=diag_variants(), canary=CANARY, requested_model="claude-haiku-4-5"
-    )
-    records: list[dict[str, object]] = []
-
-    async def go() -> lm.SessionResult:
-        return await lm.run_ordered_cases(
-            runners,
-            quota=quota or lm.QuotaCounter(),
-            emit=records.append,
-            cases=tuple(cases),
-            board=adapter_set.board,
-        )
-
-    result: lm.SessionResult | None = None
-    raised: BaseException | None = None
-    try:
-        result = asyncio.run(go())
-    except BaseException as exc:
-        raised = exc
-    return DiagRun(records, result, raised, adapter_set)
-
-
-def l3_builder(
-    *,
-    exception: BaseException | None = None,
-    observations: Sequence[lm.Observation] = (),
-    events: Sequence[object] = (),
-    streams: Mapping[str, object] | None = None,
-    fields: Mapping[str, object] | None = None,
-) -> Callable[[list[lm.Observation]], lm.RunObservation]:
-    def build(sink: list[lm.Observation]) -> lm.RunObservation:
-        sink.extend(observations)
-        return lm.RunObservation(
-            events=list(events),
-            exception=exception,
-            streams=dict(streams) if streams is not None else clean_streams(),
-            fields=dict(fields or {}),
-        )
-
-    return build
-
-
-def nr() -> ProviderError:
-    return ProviderError("rejected", is_retryable=False)
-
-
-def rt() -> ProviderError:
-    return ProviderError("retry", is_retryable=True)
-
-
-COMPLETED = {"type": "agent_completed", "data": {"billing_mode": "subscription"}}
-
-# name -> (builder arguments, adapter outcome, (retryability, assistant error, status))
-L3_SCENARIOS: dict[str, tuple[dict[str, Any], lm.Outcome, tuple[str, str, str]]] = {
-    "invalid_key": (
-        {"exception": nr(), "observations": [obs(error="authentication_failed", status=401)]},
-        O.INVALID_KEY,
-        ("non_retryable", "authentication_failed", "401"),
-    ),
-    "invalid_key_status_only": (
-        {"exception": nr(), "observations": [obs(status=401)]},
-        O.INVALID_KEY,
-        ("non_retryable", "absent", "401"),
-    ),
-    "retryable": (
-        {"exception": rt(), "observations": [obs(error="rate_limit", status=429)]},
-        O.INCONCLUSIVE,
-        ("retryable", "rate_limit", "429"),
-    ),
-    "nr_untyped": (
-        {"exception": nr(), "observations": [obs()]},
-        O.INCONCLUSIVE,
-        ("non_retryable", "absent", "absent"),
-    ),
-    "nr_403": (
-        {"exception": nr(), "observations": [obs(status=403)]},
-        O.INCONCLUSIVE,
-        ("non_retryable", "absent", "403"),
-    ),
-    "nr_5xx": (
-        {"exception": nr(), "observations": [obs(error="server_error", status=500)]},
-        O.INCONCLUSIVE,
-        ("non_retryable", "server_error", "5xx"),
-    ),
-    "model_unavailable": (
-        {"exception": nr(), "observations": [obs(status=404)]},
-        O.MODEL_UNAVAILABLE,
-        ("non_retryable", "absent", "404"),
-    ),
-    "fell_back": (
-        {"exception": None, "events": [COMPLETED]},
-        O.FELL_BACK_TO_LOGIN,
-        ("absent", "absent", "absent"),
-    ),
-}
-
-
-def fresh_scenario(name: str) -> tuple[dict[str, Any], lm.Outcome, tuple[str, str, str]]:
-    """Scenarios hold exception objects; rebuild them for every use."""
-    kwargs, outcome, expected = L3_SCENARIOS[name]
-    rebuilt = dict(kwargs)
-    if isinstance(kwargs.get("exception"), ProviderError):
-        retryable = kwargs["exception"].is_retryable
-        rebuilt["exception"] = ProviderError("rejected", is_retryable=retryable)
-    return rebuilt, outcome, expected
-
-
-def triple_of(record: Mapping[str, object]) -> dict[str, object]:
-    return {key: record[key] for key in lm.DIAG_KEYS if key in record}
-
-
-def assert_triple_state(record: Mapping[str, object]) -> str:
-    """``omitted``, ``complete`` or ``unavailable``; never one or two keys, ``null`` or a mix."""
-    present = [key for key in lm.DIAG_KEYS if key in record]
-    assert len(present) in (0, 3), present
-    if not present:
-        return "omitted"
-    assert all(isinstance(record[key], str) for key in present)
-    values = [record[key] for key in present]
-    assert values.count("unavailable") in (0, 3)
-    return "unavailable" if values[0] == "unavailable" else "complete"
-
-
-@pytest.mark.usefixtures("gates_on")
-class TestDiagnosticEmission:
-    """H53: emission, guard, order and propagation through the real runner and case wrapper."""
-
-    @pytest.mark.parametrize("name", list(L3_SCENARIOS))
-    def test_l3_carries_exactly_the_three_keys_and_adapter_outcome(self, name: str) -> None:
-        kwargs, outcome, expected = fresh_scenario(name)
-        out = run_cases(FakeAdapterSet({S.L3: l3_builder(**kwargs)}))
-        assert out.raised is None
-        record = out.case_record("L3")
-        assert triple_of(record) == dict(zip(lm.DIAG_KEYS, expected, strict=True))
-        assert record["adapter_outcome"] == outcome.value
-        assert record["outcome"] == outcome.value
-        line = lm.emit_evidence(record)  # the real emitter re-validates every key
-        assert json.loads(line[len("EVIDENCE ") :])["diag_api_status"] == expected[2]
-
-    @pytest.mark.parametrize("case", [S.L1, S.L2])
-    @pytest.mark.parametrize("name", list(L3_SCENARIOS))
-    def test_the_same_scenarios_as_l1_or_l2_carry_none(self, case: lm.Case, name: str) -> None:
-        kwargs, _, _ = fresh_scenario(name)
-        out = run_cases(FakeAdapterSet({case: l3_builder(**kwargs)}), cases=(case,))
-        assert out.raised is None
-        assert triple_of(out.case_record(case.value)) == {}
-
-    def test_l0_session_and_run_level_records_never_carry_the_keys(self, tmp_path: Path) -> None:
-        result = official(tmp_path, FakeAdapterSet())
-        lm.finalize(result)
-        for record in [*result.evidence, lm.run_level_record(result)]:
-            if record.get("case") == "L3":
-                assert assert_triple_state(record) == "complete"
-            else:
-                assert triple_of(record) == {}, record.get("case")
-
-    def test_a_timeout_observation_still_carries_the_triple(self) -> None:
-        builder = l3_builder(
-            exception=TimeoutError("t"), observations=[obs(error="rate_limit")], events=[]
-        )
-        record = run_cases(FakeAdapterSet({S.L3: builder})).case_record("L3")
-        assert triple_of(record) == {
-            "diag_provider_retryability": "absent",
-            "diag_assistant_error": "rate_limit",
-            "diag_api_status": "absent",
-        }
-        cause = TimeoutError("t")
-        cause.__cause__ = nr()
-        record = run_cases(
-            FakeAdapterSet({S.L3: l3_builder(exception=cause, observations=[obs(status=401)])})
-        ).case_record("L3")
-        assert record["diag_provider_retryability"] == "non_retryable"
-        assert record["outcome"] == "invalid_key"
-
-    @pytest.mark.parametrize(
-        "interrupt",
-        [KeyboardInterrupt(), asyncio.CancelledError(), OtherInterrupt()],
-        ids=["keyboard_interrupt", "cancelled", "other_base_exception"],
-    )
-    def test_an_interrupt_leaves_no_keys_and_is_the_same_object(
-        self, interrupt: BaseException
-    ) -> None:
-        def build(sink: list[lm.Observation]) -> lm.RunObservation:
-            sink.append(obs(error="authentication_failed", status=401))
-            raise interrupt
-
-        out = run_cases(FakeAdapterSet({S.L3: build}))
-        assert out.raised is interrupt
-        assert triple_of(out.case_record("L3")) == {}
-        assert out.case_record("L3")["interrupted"] != "none"
-        assert all(triple_of(record) == {} for record in out.records)
-        findings = lm.CaseFindings(S.L3)
-        findings.cleanup_failed.append("evidence")  # as the wrapper does before the fallback
-        fallback = lm._fallback_record(findings, CANARY, case=S.L3, interrupt=KeyboardInterrupt())
-        assert triple_of(fallback) == {}
-
-    def test_classification_never_reached_means_omitted_with_an_exception_class(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        reducer_calls: list[object] = []
-        real = lm.l3_diagnostics
-        monkeypatch.setattr(lm, "l3_diagnostics", lambda *a: reducer_calls.append(a) or real(*a))
-
-        def boom(sink: list[lm.Observation]) -> lm.RunObservation:
-            raise RuntimeError("PLANTED-execute-4417")
-
-        out = run_cases(FakeAdapterSet({S.L3: boom}))
-        record = out.case_record("L3")
-        assert triple_of(record) == {} and record["outcome"] == "inconclusive"
-        assert record["exception_class"] == "RuntimeError"
-
-        def missing_sdk(sink: list[lm.Observation]) -> lm.RunObservation:
-            raise lm.HarnessFailure(O.PREREQ_SDK_MISSING)
-
-        record = run_cases(FakeAdapterSet({S.L3: missing_sdk})).case_record("L3")
-        assert triple_of(record) == {} and record["exception_class"] == "HarnessFailure"
-
-        fake = FakeAdapterSet({S.L3: l3_builder(**fresh_scenario("invalid_key")[0])})
-        adapters = fake.as_set()
-
-        class BadObserver:
-            def observing(self) -> Any:
-                raise lm.HarnessFailure(O.CASE_FAILED)
-
-        record = run_cases(
-            fake, adapters=dataclasses.replace(adapters, observer=BadObserver())
-        ).case_record("L3")
-        assert triple_of(record) == {} and record["exception_class"] == "HarnessFailure"
-
-        def raising_classify(*args: object) -> lm.Outcome:
-            raise RuntimeError("PLANTED-classify-4417")
-
-        monkeypatch.setattr(lm, "classify_l3", raising_classify)
-        record = run_cases(
-            FakeAdapterSet({S.L3: l3_builder(**fresh_scenario("invalid_key")[0])})
-        ).case_record("L3")
-        assert triple_of(record) == {} and record["outcome"] == "inconclusive"
-        assert "exception_class" in record
-        assert reducer_calls == []  # never called when classification did not complete
-
-    def test_the_three_states_are_exact(self) -> None:
-        # No exception and no signals: the signals were collected and nothing was seen.
-        out = run_cases(FakeAdapterSet({S.L3: l3_builder()}))
-        record = out.case_record("L3")
-        assert triple_of(record) == dict.fromkeys(lm.DIAG_KEYS, "absent")
-        assert assert_triple_state(record) == "complete"
-        for scenario in L3_SCENARIOS:
-            kwargs = fresh_scenario(scenario)[0]
-            got = run_cases(FakeAdapterSet({S.L3: l3_builder(**kwargs)})).case_record("L3")
-            assert assert_triple_state(got) == "complete"
-
-    # -- order and identity ----------------------------------------------------------------------
-
-    def test_classification_returns_before_the_diagnostics_and_both_get_the_same_objects(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        events: list[tuple[str, object]] = []
-        real_classify, real_diag = lm.classify_l3, lm.l3_diagnostics
-
-        def classify(*args: Any) -> lm.Outcome:
-            events.append(("classify_call", args))
-            result = real_classify(*args)
-            events.append(("classify_return", result))
-            return result
-
-        def diagnostics(*args: Any) -> dict[str, str]:
-            events.append(("diag_call", args))
-            return real_diag(*args)
-
-        monkeypatch.setattr(lm, "classify_l3", classify)
-        monkeypatch.setattr(lm, "l3_diagnostics", diagnostics)
-        inner = nr()
-        outer = RuntimeError("wrapped")
-        outer.__cause__ = inner
-        fake = FakeAdapterSet({S.L3: l3_builder(exception=outer, observations=[obs(status=401)])})
-        out = run_cases(fake)
-        assert out.raised is None
-        assert [name for name, _ in events] == ["classify_call", "classify_return", "diag_call"]
-        classify_args = events[0][1]
-        diag_args = events[2][1]
-        assert isinstance(classify_args, tuple) and isinstance(diag_args, tuple)
-        assert diag_args[0] is classify_args[0]  # the same sink object
-        assert diag_args[1] is classify_args[1]  # the same chain object
-        assert type(classify_args[1]) is list and type(diag_args[1]) is list
-        assert inner in diag_args[1]  # nothing was lost, nothing was converted
-        assert diag_args[0] is fake.sink
-
-    def test_the_diagnostics_run_once_for_l3_and_never_for_the_other_cases(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        calls: list[object] = []
-        real = lm.l3_diagnostics
-        monkeypatch.setattr(lm, "l3_diagnostics", lambda *a: calls.append(a) or real(*a))
-        official(tmp_path, FakeAdapterSet())
-        assert len(calls) == 1
-        calls.clear()
-        run_cases(FakeAdapterSet(), cases=(S.L1, S.L2))
-        assert calls == []
-        run_cases(FakeAdapterSet({S.L3: l3_builder()}))
-        assert len(calls) == 1
-
-    # -- the guard -------------------------------------------------------------------------------
-
-    @staticmethod
-    def _summary(out: DiagRun) -> dict[str, object]:
-        assert out.result is not None
-        record = out.case_record("L3")
-        return {
-            "outcome": record["outcome"],
-            "adapter_outcome": record["adapter_outcome"],
-            "attempted": record["attempted_quota_execution"],
-            "quota": out.result.quota_attempts,
-            "results": [(r.case, r.status, r.outcome) for r in out.result.results],
-            "primary": out.result.primary_failure,
-        }
-
-    def test_a_failing_reducer_yields_the_constant_triple_and_changes_nothing_else(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        def run() -> DiagRun:
-            fake = FakeAdapterSet({S.L3: l3_builder(**fresh_scenario("invalid_key")[0])})
-            return run_cases(fake, cases=(S.L1, S.L3, S.L2))
-
-        baseline = run()
-        monkeypatch.setattr(lm, "l3_diagnostics", lambda *a: (_ for _ in ()).throw(Exception("x")))
-        failing = run()
-        assert triple_of(failing.case_record("L3")) == dict.fromkeys(lm.DIAG_KEYS, "unavailable")
-        assert triple_of(failing.case_record("L3")) == dict(lm.DIAG_UNAVAILABLE)
-        assert self._summary(failing) == self._summary(baseline)
-        assert self._summary(failing)["outcome"] == "invalid_key"
-
-    def test_a_reducer_that_fails_for_the_second_key_only_leaves_no_partial_triple(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        def explode(value: object) -> object:
-            raise RuntimeError("second key")
-
-        monkeypatch.setattr(lm, "assistant_error_of", explode)
-        fake = FakeAdapterSet({S.L3: l3_builder(**fresh_scenario("invalid_key")[0])})
-        record = run_cases(fake).case_record("L3")
-        assert triple_of(record) == dict(lm.DIAG_UNAVAILABLE)
-        assert record["outcome"] == "invalid_key"
-
-    BAD_TRIPLES = [
-        ("padded", {"diag_provider_retryability": "non_retryable "}),
-        ("canary", {"diag_assistant_error": CANARY}),
-        ("number", {"diag_api_status": 401}),
-        ("list", {"diag_provider_retryability": ["mixed"]}),
-        ("empty", {"diag_assistant_error": ""}),
-        ("none", {"diag_api_status": None}),
-        ("mixed_unavailable", {"diag_assistant_error": "unavailable"}),
-        ("missing_key", None),
-        ("extra_key", {"extra": "x"}),
-        ("not_a_mapping", "nope"),
-    ]
-
-    @pytest.mark.parametrize(("label", "change"), BAD_TRIPLES, ids=[b[0] for b in BAD_TRIPLES])
-    def test_an_invalid_triple_from_the_reducer_becomes_the_constant_triple(
-        self, monkeypatch: pytest.MonkeyPatch, label: str, change: object
-    ) -> None:
-        good = {
-            "diag_provider_retryability": "non_retryable",
-            "diag_assistant_error": "authentication_failed",
-            "diag_api_status": "401",
-        }
-
-        def reducer(*args: object) -> object:
-            if label == "missing_key":
-                return {k: v for k, v in good.items() if k != "diag_api_status"}
-            if label == "not_a_mapping":
-                return change
-            return {**good, **cast("dict[str, object]", change)}
-
-        monkeypatch.setattr(lm, "l3_diagnostics", reducer)
-        fake = FakeAdapterSet({S.L3: l3_builder(**fresh_scenario("invalid_key")[0])})
-        out = run_cases(fake)
-        assert out.raised is None  # no EvidenceError escaped
-        record = out.case_record("L3")
-        assert triple_of(record) == dict(lm.DIAG_UNAVAILABLE)
-        assert record["outcome"] == "invalid_key" and record["adapter_outcome"] == "invalid_key"
-        assert CANARY not in json.dumps(out.records)
-
-    def test_a_triple_that_raises_during_validation_is_contained_by_the_guard(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        class Booby(dict[str, object]):
-            def __len__(self) -> int:
-                raise Exception("PLANTED-validation")
-
-        monkeypatch.setattr(lm, "l3_diagnostics", lambda *a: Booby(QUALIFYING_TRIPLE))
-        fake = FakeAdapterSet({S.L3: l3_builder(**fresh_scenario("invalid_key")[0])})
-        out = run_cases(fake)
-        assert out.raised is None
-        record = out.case_record("L3")
-        assert triple_of(record) == dict(lm.DIAG_UNAVAILABLE)
-        assert record["outcome"] == "invalid_key"  # the validation fault cannot change the outcome
-
-    def test_the_validator_objects_are_shared_and_accept_every_valid_triple(self) -> None:
-        for key in lm.DIAG_KEYS:
-            assert lm._EVIDENCE_SPECS[key] is lm.DIAG_VALIDATORS[key]
-        sets = (lm.DIAG_PROVIDER_RETRYABILITY, lm.DIAG_ASSISTANT_ERROR, lm.DIAG_API_STATUS)
-        import itertools
-
-        count = 0
-        for combo in itertools.product(*(sorted(s) for s in sets)):
-            triple = dict(zip(lm.DIAG_KEYS, combo, strict=True))
-            lm.evidence(case="L3", canary_scan=list(lm.EMPTY_SCAN), **triple)  # per-key grammar
-            expected = combo.count("unavailable") in (0, 3)
-            assert lm.diag_triple_valid(triple) is expected
-            count += 1
-        assert count == 5 * 9 * 9
-        assert lm.diag_triple_valid(dict(lm.DIAG_UNAVAILABLE))
-        for key, values in zip(lm.DIAG_KEYS, sets, strict=True):
-            assert lm.DIAG_UNAVAILABLE[key] == "unavailable" and "unavailable" in values
-
-    def test_the_guard_and_the_validator_use_the_shared_objects(self) -> None:
-        tree = ast.parse(inspect.getsource(lm.guarded_diagnostics))
-        names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-        assert {"diag_triple_valid", "DIAG_UNAVAILABLE", "l3_diagnostics"} <= names
-        validator = ast.parse(inspect.getsource(lm.diag_triple_valid))
-        assert "DIAG_VALIDATORS" in {n.id for n in ast.walk(validator) if isinstance(n, ast.Name)}
-
-    @pytest.mark.parametrize(
-        "exc_type",
-        [KeyboardInterrupt, asyncio.CancelledError, OtherInterrupt, GeneratorExit],
-    )
-    def test_a_base_exception_from_a_reducer_propagates_unchanged(
-        self, monkeypatch: pytest.MonkeyPatch, exc_type: type[BaseException]
-    ) -> None:
-        planted = exc_type()
-
-        def reducer(*args: object) -> object:
-            raise planted
-
-        monkeypatch.setattr(lm, "l3_diagnostics", reducer)
-        fake = FakeAdapterSet({S.L3: l3_builder(**fresh_scenario("invalid_key")[0])})
-        out = run_cases(fake)
-        assert out.raised is planted
-        assert triple_of(out.case_record("L3")) == {}
-
-    # -- atomic assignment ---------------------------------------------------------------------
-
-    @pytest.mark.parametrize("fail", [False, True], ids=["computed", "validation_fails"])
-    def test_the_three_keys_enter_the_fields_in_one_merge(
-        self, monkeypatch: pytest.MonkeyPatch, fail: bool
-    ) -> None:
-        log: list[list[str]] = []
-
-        class Recording(dict[str, object]):
-            def update(self, *args: Any, **kwargs: Any) -> None:
-                log.append(sorted(dict(*args, **kwargs)))
-                super().update(*args, **kwargs)
-
-            def __setitem__(self, key: str, value: object) -> None:
-                log.append([key])
-                super().__setitem__(key, value)
-
-        real_safe = lm._safe_fields
-        monkeypatch.setattr(lm, "_safe_fields", lambda fields: Recording(real_safe(fields)))
-        if fail:
-            monkeypatch.setattr(lm, "l3_diagnostics", lambda *a: {"diag_api_status": "401"})
-        fake = FakeAdapterSet({S.L3: l3_builder(**fresh_scenario("invalid_key")[0])})
-        out = run_cases(fake)
-        diagnostic_writes = [w for w in log if set(w) & set(lm.DIAG_KEYS)]
-        assert diagnostic_writes == [sorted(lm.DIAG_KEYS)]
-        assert assert_triple_state(out.case_record("L3")) == ("unavailable" if fail else "complete")
-
-    # -- adapter_outcome is not the final outcome (TA3) ----------------------------------------
-
-    @staticmethod
-    def _override_run(monkeypatch: pytest.MonkeyPatch, kind: str) -> tuple[DiagRun, list[object]]:
-        returns: list[object] = []
-        real = lm.classify_l3
-
-        def spy(*args: Any) -> lm.Outcome:
-            result = real(*args)
-            returns.append(result)
-            return result
-
-        monkeypatch.setattr(lm, "classify_l3", spy)
-        streams = clean_streams()
-        if kind == "canary_leak":
-            streams["stdout_stderr"] = f"leaked {CANARY}"
-        elif kind == "incomplete":
-            del streams["events"]
-        kwargs = fresh_scenario("invalid_key")[0]
-        fake = FakeAdapterSet({S.L3: l3_builder(streams=streams, **kwargs)})
-        return run_cases(fake), returns
-
-    @pytest.mark.parametrize(
-        ("kind", "final"),
-        [("canary_leak", "canary_leak"), ("incomplete", "canary_scan_incomplete")],
-    )
-    def test_the_final_outcome_may_differ_from_adapter_outcome(
-        self, monkeypatch: pytest.MonkeyPatch, kind: str, final: str
-    ) -> None:
-        out, returns = self._override_run(monkeypatch, kind)
-        record = out.case_record("L3")
-        assert returns == [O.INVALID_KEY]  # the spy proves what classify_l3 returned
-        assert record["outcome"] == final
-        assert record["adapter_outcome"] == "invalid_key" == returns[0].value  # type: ignore[union-attr]
-        assert triple_of(record) == dict(
-            zip(lm.DIAG_KEYS, L3_SCENARIOS["invalid_key"][2], strict=True)
-        )
-        lm.emit_evidence(record)
-
-    def test_without_an_override_both_fields_are_invalid_key(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        out, returns = self._override_run(monkeypatch, "none")
-        record = out.case_record("L3")
-        assert returns == [O.INVALID_KEY]
-        assert record["outcome"] == record["adapter_outcome"] == "invalid_key"
-
-
-# ============================================================================
-# H54: classifier validation, placement, boundary and verdict invariance
-# ============================================================================
-
-ALL_SETS = (lm.DIAG_PROVIDER_RETRYABILITY, lm.DIAG_ASSISTANT_ERROR, lm.DIAG_API_STATUS)
-STATUS_NO_UNAVAILABLE = sorted(lm.DIAG_API_STATUS - {"unavailable"})
-ASSISTANT_NO_UNAVAILABLE = sorted(lm.DIAG_ASSISTANT_ERROR - {"unavailable"})
-RETRYABILITY_NO_UNAVAILABLE = sorted(lm.DIAG_PROVIDER_RETRYABILITY - {"unavailable"})
-NO_UNAVAILABLE_TRIPLES = [
-    diag_triple(r, a, s)
-    for r in RETRYABILITY_NO_UNAVAILABLE
-    for a in ASSISTANT_NO_UNAVAILABLE
-    for s in STATUS_NO_UNAVAILABLE
-]
-ALL_UNAVAILABLE = dict.fromkeys(lm.DIAG_KEYS, "unavailable")
-
-
-def qualifies(triple: Mapping[str, str]) -> bool:
-    return triple["diag_provider_retryability"] in ("non_retryable", "mixed") and (
-        triple["diag_assistant_error"] == "authentication_failed"
-        or triple["diag_api_status"] == "401"
-    )
-
-
-def failure_l3_parts(l3_extra: Mapping[str, Any] | None = None, **l3_over: Any) -> dict[str, Any]:
-    """An official-path run whose L3 ended ``inconclusive``: a structurally valid failure record."""
-    cases = [
-        case_fields("L0", "ok"),
-        case_fields("L1", "ok"),
-        case_fields("L3", "inconclusive", **{**(l3_extra or {}), **l3_over}),
-    ]
-    return edited(
-        official_parts,
-        cases=cases,
-        run=run_fields(
-            quota_attempts_total=2,
-            primary_failure="L3:inconclusive:ProviderError",
-            not_executed="L2:not_executed_l3_inconclusive",
-        ),
-        g4=(0, "pass", "false"),
-        count="1 failed, 1 deselected in 2.00s",
-    )
-
-
-def official_with(triple: Mapping[str, Any] | None) -> dict[str, Any]:
-    """The official base with the L3 triple replaced (``None`` omits it)."""
-    cases = official_cases()
-    l3 = cases[2]
-    for key in lm.DIAG_KEYS:
-        l3.pop(key, None)
-    if triple is not None:
-        l3.update(triple)
-    return edited(official_parts, cases=cases)
-
-
-class TestDiagnosticClassifier:
-    """H54: grammar, placement, atomicity, the restrict-only official item 9, invariance."""
-
-    # one member per closed set that has letters, so case and padding variants really differ
-    LETTERED_MEMBER = {
-        "diag_provider_retryability": "non_retryable",
-        "diag_assistant_error": "authentication_failed",
-        "diag_api_status": "other_4xx",
-    }
-    BAD_VALUES = [
-        ("different_case", lambda member: member.capitalize()),
-        ("upper_case", lambda member: member.upper()),
-        ("padded_trailing", lambda member: member + " "),
-        ("padded_leading", lambda member: " " + member),
-        ("newline", lambda member: member + "\n"),
-        ("prefix", lambda member: "x" + member),
-        ("long", lambda member: member * 40),
-        ("number", lambda member: 401),
-        ("boolean", lambda member: True),
-        ("null", lambda member: None),
-        ("list", lambda member: [member]),
-        ("object", lambda member: {"a": member}),
-        ("empty", lambda member: ""),
-        ("non_member", lambda member: "nonmember"),
-    ]
-
-    @pytest.mark.parametrize("key", lm.DIAG_KEYS)
-    @pytest.mark.parametrize(("label", "make"), BAD_VALUES, ids=[b[0] for b in BAD_VALUES])
-    def test_a_malformed_value_is_an_invalid_record(
-        self, key: str, label: str, make: Callable[[str], object]
-    ) -> None:
-        value = make(self.LETTERED_MEMBER[key])
-        assert value != self.LETTERED_MEMBER[key]
-        triple: dict[str, Any] = {**QUALIFYING_TRIPLE, key: value}
-        assert classify(failure_l3_parts(triple), 1) == ("discard", "evidence_record_invalid")
-
-    @pytest.mark.parametrize("key", lm.DIAG_KEYS)
-    def test_every_member_of_each_closed_set_is_accepted(self, key: str) -> None:
-        members = dict(zip(lm.DIAG_KEYS, ALL_SETS, strict=True))[key]
-        for member in sorted(members - {"unavailable"}):
-            triple = {**diag_triple("absent", "absent", "absent"), key: member}
-            assert classify(failure_l3_parts(triple), 1) == ("failure_record", "ok"), member
-        assert classify(failure_l3_parts(ALL_UNAVAILABLE), 1) == ("failure_record", "ok")
-
-    @pytest.mark.parametrize("case", ["L0", "L1", "L2"])
-    @pytest.mark.parametrize("keys", [1, 3], ids=["one_key", "three_keys"])
-    def test_the_keys_on_another_case_record_are_inconsistent(self, case: str, keys: int) -> None:
-        extra = dict(list(QUALIFYING_TRIPLE.items())[:keys])
-        cases = [case_fields(c, o, **(extra if c == case else {})) for c, o in OFFICIAL_OUTCOMES]
-        got = classify(edited(official_parts, cases=cases), 0)
-        assert got == ("discard", "evidence_inconsistent")
-
-    def test_the_keys_on_the_session_or_run_record_are_inconsistent(self) -> None:
-        for change in (
-            {"session": session_fields(**QUALIFYING_TRIPLE)},
-            {"run": run_fields(**QUALIFYING_TRIPLE)},
-            {"session": session_fields(diag_api_status="absent")},
-            {"run": run_fields(diag_provider_retryability="absent")},
-        ):
-            assert classify(edited(official_with(QUALIFYING_TRIPLE), **change), 0) == (
-                "discard",
-                "evidence_inconsistent",
-            )
-
-    @pytest.mark.parametrize("count", [1, 2], ids=["one_key", "two_keys"])
-    def test_a_partial_triple_on_l3_is_inconsistent(self, count: int) -> None:
-        for keys in itertools.combinations(lm.DIAG_KEYS, count):
-            partial = {key: QUALIFYING_TRIPLE[key] for key in keys}
-            assert classify(failure_l3_parts(partial), 1) == ("discard", "evidence_inconsistent")
-
-    def test_every_mixed_placement_of_unavailable_is_inconsistent(self) -> None:
-        placements = [keys for n in (1, 2) for keys in itertools.combinations(lm.DIAG_KEYS, n)]
-        assert len(placements) == 6
-        for keys in placements:
-            triple = {**QUALIFYING_TRIPLE, **dict.fromkeys(keys, "unavailable")}
-            assert classify(failure_l3_parts(triple), 1) == ("discard", "evidence_inconsistent")
-
-    def test_the_whole_mixed_unavailable_space_is_inconsistent_and_the_rest_is_valid(self) -> None:
-        verdicts: Counter[tuple[str, str]] = Counter()
-        for combo in itertools.product(*(sorted(s) for s in ALL_SETS)):
-            triple = dict(zip(lm.DIAG_KEYS, combo, strict=True))
-            verdicts[classify(failure_l3_parts(triple), 1)] += 1
-        assert verdicts == {
-            ("failure_record", "ok"): 256 + 1,
-            ("discard", "evidence_inconsistent"): 5 * 9 * 9 - 257,
-        }
-
-    # -- the boundary (restrict-only) ----------------------------------------------------------
-
-    def test_a_failure_record_keeps_every_grammatical_triple_and_the_omitted_one(self) -> None:
-        omitted = classify(failure_l3_parts(), 1)
-        assert omitted == ("failure_record", "ok")
-        for triple in [*NO_UNAVAILABLE_TRIPLES, ALL_UNAVAILABLE]:
-            assert classify(failure_l3_parts(triple), 1) == omitted
-        # an impossible reading: a qualifying triple under an inconclusive outcome (row 6b)
-        assert classify(failure_l3_parts(QUALIFYING_TRIPLE), 1) == ("failure_record", "ok")
-        # a contradictory reading: retryable with a typed 401 (row 5a)
-        assert classify(failure_l3_parts(diag_triple("retryable", "authentication_failed")), 1) == (
-            "failure_record",
-            "ok",
-        )
-
-    def test_a_readiness_only_base_has_no_l3_and_is_otherwise_unchanged(self) -> None:
-        assert classify(readiness_parts(), 0) == ("readiness_only", "ok")
-        placed = edited(readiness_parts, cases=[case_fields("L0", **QUALIFYING_TRIPLE)])
-        assert classify(placed, 0) == ("discard", "evidence_inconsistent")
-
-    def test_an_official_capture_needs_a_qualifying_or_all_unavailable_triple(self) -> None:
-        official_count = 0
-        for triple in NO_UNAVAILABLE_TRIPLES:
-            got = classify(official_with(triple), 0)
-            if qualifies(triple):
-                assert got == ("official", "ok"), triple
-                official_count += 1
-            else:
-                assert got == ("discard", "evidence_inconsistent"), triple
-        assert official_count == 30
-        assert classify(official_with(ALL_UNAVAILABLE), 0) == ("official", "ok")
-        assert classify(official_with(None), 0) == ("discard", "evidence_inconsistent")
-
-    def test_a_nonzero_pipeline_status_wins_whatever_the_triple(self) -> None:
-        for triple in (QUALIFYING_TRIPLE, ALL_UNAVAILABLE, diag_triple("retryable"), None):
-            assert classify(official_with(triple), 1) == ("discard", "pipeline_status_nonzero")
-
-    NON_OFFICIAL_BASES = {
-        "dirty_tree": lambda: edited(
-            official_with(None),
-            session=session_fields(git_dirty=True),
-            g4=(0, "pass", "false"),
-        ),
-        "g4_false": lambda: edited(official_with(None), g4=(0, "pass", "false")),
-        "l3_fell_back": lambda: edited(
-            official_parts,
-            cases=[
-                case_fields(c, "fell_back_to_login" if c == "L3" else o)
-                for c, o in OFFICIAL_OUTCOMES
-            ],
-        ),
-        "l3_inconclusive": lambda: failure_l3_parts(),
-        "bad_count": lambda: edited(official_with(None), count="2 passed in 2.00s"),
-        "skipped": lambda: edited(official_with(None), g4=(1, "fail", "true")),
-        "unsafe_scan": lambda: edited(
-            official_parts,
-            cases=[
-                case_fields(c, o, canary_scan=[*CLEAN_SCAN[:-1], "tmp_files:leak"])
-                for c, o in OFFICIAL_OUTCOMES
-            ],
-        ),
+class FakeCliAdapter:
+    def resolve(self) -> lm.CliEvidence:
+        return lm.CliEvidence("bundled", "2.1.150")
+
+
+@dataclasses.dataclass
+class FakeDescendants:
+    def snapshot(self) -> dict[int, tuple[int, str]]:
+        return {}
+
+
+def real_adapter_set(config: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> lm.AdapterSet:
+    adapters = lm.configured_adapters(config, tmp_path, monkeypatch)
+    return dataclasses.replace(adapters, cli=FakeCliAdapter(), descendants=FakeDescendants())
+
+
+def l1_expected_counts() -> dict[FakeSite, int]:
+    return {
+        FakeSite.registry: 1,
+        FakeSite.registry_enter: 1,
+        FakeSite.registry_exit: 1,
+        FakeSite.engine: 1,
+        FakeSite.engine_run: 1,
+        FakeSite.execution_summary: 1,
+        FakeSite.emitter: 1,
+        FakeSite.emitter_subscribe: 1,
+        FakeSite.load_config: 1,
+        FakeSite.display_usage_summary: 1,
     }
 
-    @pytest.mark.parametrize("name", list(NON_OFFICIAL_BASES))
-    def test_a_triple_never_changes_a_verdict_that_is_not_official(self, name: str) -> None:
-        def with_triple(parts: dict[str, Any], triple: Mapping[str, Any] | None) -> dict[str, Any]:
-            cases = [dict(c) for c in parts["cases"]]
-            for case in cases:
-                if case["case"] == "L3":
-                    for key in lm.DIAG_KEYS:
-                        case.pop(key, None)
-                    if triple is not None:
-                        case.update(triple)
-            return edited(parts, cases=cases)
 
-        parts = self.NON_OFFICIAL_BASES[name]()
-        for status in (0, 1):
-            baseline = classify(with_triple(parts, None), status)
-            assert baseline[0] != "official"
-            for triple in (
-                QUALIFYING_TRIPLE,
-                ALL_UNAVAILABLE,
-                diag_triple("retryable"),
-                diag_triple("absent", "absent", "absent"),
-            ):
-                assert classify(with_triple(parts, triple), status) == baseline, (name, triple)
+class RootProbe:
+    """A root handler and a counting last-resort handler: nothing may reach either."""
 
-    def test_no_triple_makes_an_official_capture_from_a_non_invalid_key_l3(self) -> None:
-        for outcome in ("inconclusive", "fell_back_to_login", "model_unavailable"):
-            cases = [
-                case_fields(
-                    c, outcome if c == "L3" else o, **(QUALIFYING_TRIPLE if c == "L3" else {})
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.records: list[logging.LogRecord] = []
+        self.resort: list[object] = []
+        outer = self
+
+        class Handler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                outer.records.append(record)
+
+        class Resort:
+            def handle(self, record: logging.LogRecord) -> None:
+                outer.resort.append(record)
+
+        self.handler = Handler(level=0)
+        logging.getLogger().addHandler(self.handler)
+        monkeypatch.setattr(logging, "lastResort", Resort())
+
+    def close(self) -> None:
+        logging.getLogger().removeHandler(self.handler)
+
+
+@pytest.mark.claude_auth_readiness_mocked
+class TestCountingFakes:
+    """H59 (vi) (n): the real ``RealWorkflowAdapter.execute`` over fail-fast counting fakes."""
+
+    @staticmethod
+    def adapter(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cls: type = lm.RealWorkflowAdapter
+    ) -> Any:
+        return cls(make_config(), tmp_path, monkeypatch)
+
+    def test_real_workflow_adapter_counts_one_inference(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        boundary_hits: list[str],
+        gates_on: None,
+    ) -> None:
+        counts = Counts()
+        world = counting_world(monkeypatch, counts)
+        loggers_before = private_logger_state()
+        probe = RootProbe(monkeypatch)
+        adapter = lm.RealWorkflowAdapter(make_config(), tmp_path, monkeypatch)
+        config = lm.build_l1_config(lm.EXAMPLE_PATH.read_text(), None)
+        order: list[str] = []
+
+        async def go() -> lm.RunObservation:
+            async with scoped_tripwires(counts.violations, counts.n, order):
+                observation = await adapter.execute(config)
+            return observation
+
+        try:
+            observation = asyncio.run(go())
+        finally:
+            probe.close()
+        assert counts.violations == []
+        assert dict(counts.n) == l1_expected_counts()
+        assert observation.exception is None
+        lm.assert_inference_success(observation, lm.DEFAULT_MODEL)  # non-vacuity
+        (handler, *_rest) = world["handlers"]
+        assert handler.arrivals == 2 and type(handler.arrivals) is int
+        ((loaded_path, loaded_cfg),) = world["loaded"]
+        assert loaded_path == tmp_path / "workflow-L1.yaml"
+        ((engine_cfg, engine_path),) = world["engine_calls"]
+        assert engine_cfg is loaded_cfg  # the engine receives the config the loader returned
+        assert engine_path == tmp_path / "workflow-L1.yaml"  # the exact file that was loaded
+        assert probe.records == [] and probe.resort == []
+        assert private_logger_state() == loggers_before
+        assert order == ["pending_checked", "restored"]
+        assert boundary_hits == []
+
+    def test_an_ordinary_exception_in_run_is_the_observations_exception(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        boundary_hits: list[str],
+        gates_on: None,
+    ) -> None:
+        counts = Counts()
+
+        async def explode(world: dict[str, Any], counts: Counts) -> Any:
+            raise RuntimeError("boom")
+
+        counting_world(monkeypatch, counts, engine_run=explode)
+        adapter = lm.RealWorkflowAdapter(make_config(), tmp_path, monkeypatch)
+
+        async def go() -> lm.RunObservation:
+            async with scoped_tripwires(counts.violations, counts.n):
+                observation = await adapter.execute(
+                    lm.build_l1_config(lm.EXAMPLE_PATH.read_text(), None)
                 )
-                for c, o in OFFICIAL_OUTCOMES
-            ]
-            assert classify(edited(official_parts, cases=cases), 0)[0] != "official"
+            return observation
 
-    def test_the_verdict_never_depends_on_outcome_versus_adapter_outcome(self) -> None:
-        cases = official_cases()
-        cases[2]["adapter_outcome"] = "inconclusive"  # a harness oddity the classifier ignores
-        assert classify(edited(official_parts, cases=cases), 0) == ("official", "ok")
-        cases[2]["adapter_outcome"] = "invalid_key"
-        cases[2].update(diag_triple("retryable", "absent", "absent"))
-        assert classify(edited(official_parts, cases=cases), 0) == (
-            "discard",
-            "evidence_inconsistent",
-        )
+        observation = asyncio.run(go())
+        assert counts.violations == []
+        expected = l1_expected_counts()
+        del expected[FakeSite.execution_summary], expected[FakeSite.display_usage_summary]
+        assert counts.n == expected
+        assert type(observation.exception) is RuntimeError
+        assert boundary_hits == []
 
-    # -- reason codes, head and allowlist ---------------------------------------------------------
-
-    def test_no_new_reason_code(self) -> None:
-        assert len(lm.REASON_CODES) == 20
-        assert not [code for code in lm.REASON_CODES if "diag" in code]
-
-    def test_the_diagnostic_names_are_defined_once_in_the_head(self) -> None:
-        source = LIVE_MODULE.read_text()
-        tree = ast.parse(source)
-        head_end = next(
-            node.lineno
-            for node in tree.body
-            if isinstance(node, (ast.Import, ast.ImportFrom))
-            and (getattr(node, "module", None) or node.names[0].name).split(".")[0]
-            not in {"__future__", "enum", "json", "re", "sys", "typing", "collections"}
-        )
-        names = {
-            target.id
-            for node in tree.body
-            if node.lineno < head_end
-            for target in (
-                [node.target] if isinstance(node, ast.AnnAssign) else getattr(node, "targets", [])
-            )
-            if isinstance(target, ast.Name)
-        }
-        functions = {
-            n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.lineno < head_end
-        }
-        for name in (
-            "ASSISTANT_ERRORS",
-            "DIAG_PROVIDER_RETRYABILITY",
-            "DIAG_ASSISTANT_ERROR",
-            "DIAG_API_STATUS",
-            "DIAG_KEYS",
-            "DIAG_VALIDATORS",
-            "DIAG_UNAVAILABLE",
-            "DIAG_ASSISTANT_ERROR_PRECEDENCE",
-            "DIAG_API_STATUS_PRECEDENCE",
-        ):
-            assert name in names, name
-        assert "diag_triple_valid" in functions
-        # the pure layer defines none of them again and uses the head's ASSISTANT_ERRORS
-        assert source.count("ASSISTANT_ERRORS: Final") == 1
-        record_observation = ast.parse(inspect.getsource(lm.record_observation))
-        assert "ASSISTANT_ERRORS" in {
-            n.id for n in ast.walk(record_observation) if isinstance(n, ast.Name)
-        }
-        assert lm.ASSISTANT_ERRORS | {"other", "absent", "unavailable"} == lm.DIAG_ASSISTANT_ERROR
-        assert lm.DIAG_ASSISTANT_ERROR >= lm.ASSISTANT_ERRORS
-        for key in lm.DIAG_KEYS:
-            assert lm._EVIDENCE_SPECS[key] is lm.DIAG_VALIDATORS[key]
-
-    def test_the_allowlist_gained_exactly_the_three_case_keys(self) -> None:
-        assert len(lm.SESSION_KEYS) == 11 and len(lm.RUN_KEYS) == 8
-        assert set(lm.DIAG_KEYS) <= lm.CASE_KEYS
-        assert not set(lm.DIAG_KEYS) & (lm.SESSION_KEYS | lm.RUN_KEYS)
-        assert (lm.EVIDENCE_KEYS - lm.SESSION_KEYS - lm.RUN_KEYS) | {"case"} == lm.CASE_KEYS
-        assert len(lm.EVIDENCE_KEYS) == 48 + 3  # 48 before the amendment, exactly three added
-        assert len(lm.CASE_KEYS - set(lm.DIAG_KEYS)) == 30
-
-
-class TestDiagnosticClassifierEntry:
-    """H54 (vii): the real hardened classifier invocation (Class C)."""
-
-    def test_a_failure_record_with_the_triple_keeps_its_verdict(self, class_c: ClassC) -> None:
-        path = class_c.capture(build_capture(failure_l3_parts(QUALIFYING_TRIPLE)))
-        done = class_c.run(class_c.command(path, 3))
-        assert (done.stdout, done.returncode, done.stderr) == ("failure_record\n", 3, "")
-        assert class_c.before == class_c.after
-
-    def test_an_official_capture_with_a_non_qualifying_triple_is_discarded(
-        self, class_c: ClassC
+    def test_a_run_exceeding_the_l1_timeout_is_an_observation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        boundary_hits: list[str],
+        gates_on: None,
     ) -> None:
-        path = class_c.capture(
-            build_capture(official_with(diag_triple("retryable", "absent", "absent")))
-        )
-        done = class_c.run(class_c.command(path, 0))
-        assert (done.stdout, done.returncode, done.stderr) == (
-            "discard evidence_inconsistent\n",
-            1,
-            "",
-        )
-        assert class_c.before == class_c.after
+        counts = Counts()
 
-    def test_an_official_capture_with_a_qualifying_triple_is_official(
-        self, class_c: ClassC
+        async def hang(world: dict[str, Any], counts: Counts) -> Any:
+            await asyncio.sleep(3600)
+
+        counting_world(monkeypatch, counts, engine_run=hang)
+        monkeypatch.setitem(lm.CASE_TIMEOUTS_S, S.L1, 0.05)
+        adapter = lm.RealWorkflowAdapter(make_config(), tmp_path, monkeypatch)
+
+        async def go() -> lm.RunObservation:
+            async with scoped_tripwires(counts.violations, counts.n):
+                observation = await adapter.execute(
+                    lm.build_l1_config(lm.EXAMPLE_PATH.read_text(), None)
+                )
+            return observation
+
+        observation = asyncio.run(go())
+        assert counts.violations == []
+        assert counts.n[FakeSite.engine_run] == 1 and FakeSite.execution_summary not in counts.n
+        assert isinstance(observation.exception, TimeoutError)
+        assert boundary_hits == []
+
+    def test_a_swallowed_repeat_stays_observable(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        boundary_hits: list[str],
+        gates_on: None,
     ) -> None:
-        path = class_c.capture(build_capture(official_parts()))
-        done = class_c.run(class_c.command(path, 0))
-        assert (done.stdout, done.returncode, done.stderr) == ("official\n", 0, "")
+        """A decorator or wrapper that awaits ``execute`` twice inside ``except Exception``."""
+        counts = Counts()
+        counting_world(monkeypatch, counts)
 
+        class Twice(lm.RealWorkflowAdapter):
+            async def execute(self, config: Any) -> Any:
+                first = await super().execute(config)
+                with contextlib.suppress(Exception):
+                    await super().execute(config)
+                return first
 
-# ============================================================================
-# H55: raw and arbitrary values cannot enter evidence
-# ============================================================================
-
-PLANTED = (
-    "PLANTED-canary-shaped-sk-ant-api03-CANARY-deadbeef-DO-NOT-USE",
-    "https://planted.example/secret?token=PLANTED",
-    "/Users/planted/home/.claude/credentials",
-    "ProviderError('PLANTED-repr', is_retryable=False)",
-    'Traceback (most recent call last):\n  File "PLANTED.py", line 1',
-    "\x1b[31mPLANTED-ansi\x1b[0m",
-    "PLANTED-non-ascii-é中",
-    "PLANTED-" + "x" * 10_000,
-)
-
-
-def planted_fragments() -> list[str]:
-    """Substrings of every planted value that must never reach a retained line."""
-    return [
-        "PLANTED",
-        "planted.example",
-        "/Users/planted",
-        "Traceback",
-        "é",
-        "\x1b",
-        "sk-ant",
-    ]
-
-
-class TestDiagnosticSafety:
-    """H55: planted raw values reach neither the computed values nor any retained line."""
-
-    @pytest.mark.parametrize("planted", PLANTED, ids=range(len(PLANTED)))
-    def test_a_planted_signal_or_message_never_reaches_the_record(self, planted: str) -> None:
-        statuses: list[object] = [planted, 99, 600, 10**30, 401.5, True]
-        observations = [
-            lm.record_observation(SimpleNamespace(error=planted, api_error_status=value))
-            for value in statuses
-        ]
-        error = ProviderError(
-            planted,
-            suggestion=planted,
-            file_path=planted,
-            provider_name=planted,
-            is_retryable=False,
-        )
-        cause = RuntimeError(planted)
-        cause.__cause__ = error
-        triple = diag_of(lm.exception_chain(cause), observations)
-        assert lm.diag_triple_valid(triple)
-        assert triple == {
-            "diag_provider_retryability": "non_retryable",
-            "diag_assistant_error": "other",
-            "diag_api_status": "absent",
-        }
-        out = run_cases(
-            FakeAdapterSet({S.L3: l3_builder(exception=cause, observations=observations)})
-        )
-        text = json.dumps(out.records)
-        for fragment in planted_fragments():
-            assert fragment not in text, fragment
-
-    @pytest.mark.parametrize("key", lm.DIAG_KEYS)
-    @pytest.mark.parametrize("planted", [PLANTED[0], PLANTED[2], "PLANTED"], ids=range(3))
-    def test_the_validator_rejects_a_non_member_without_echoing_it(
-        self, key: str, planted: str
-    ) -> None:
-        with pytest.raises(lm.EvidenceError) as raised:
-            lm.evidence(case="L3", canary_scan=list(lm.EMPTY_SCAN), **{key: planted})
-        assert planted not in str(raised.value)
-        assert planted not in repr(raised.value)
-
-    def test_a_canary_in_a_diagnostic_value_is_scanned_and_never_retained(self) -> None:
-        records: list[dict[str, object]] = []
-        board = lm.FindingsBoard(CANARY)
-
-        async def runner(case: lm.Case) -> lm.CaseOutcome:
-            return lm.CaseOutcome(O.INVALID_KEY, {"diag_api_status": CANARY})
+        adapter = Twice(make_config(), tmp_path, monkeypatch)
 
         async def go() -> None:
-            await lm.run_ordered_cases(
-                {S.L3: runner},
-                quota=lm.QuotaCounter(),
-                emit=records.append,
-                cases=(S.L3,),
-                board=board,
+            async with scoped_tripwires(counts.violations, counts.n):
+                await adapter.execute(lm.build_l1_config(lm.EXAMPLE_PATH.read_text(), None))
+
+        asyncio.run(go())
+        assert counts.n[FakeSite.registry] == 2
+        assert counts.violations == [(FakeSite.registry, FakeViolation.second_construction)]
+
+    def test_an_unexpected_constructor_argument_and_attribute_are_recorded(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        boundary_hits: list[str],
+        gates_on: None,
+    ) -> None:
+        counts = Counts()
+        counting_world(monkeypatch, counts)
+        import conductor.engine.workflow as workflow_module
+
+        with pytest.raises(CountingFakeViolation):
+            workflow_module.WorkflowEngine(1, 2)  # type: ignore[call-arg]
+        assert counts.violations == [(FakeSite.engine, FakeViolation.unexpected_argument)]
+        counts2 = Counts()
+        counting_world(monkeypatch, counts2)
+        with pytest.raises(CountingFakeViolation):
+            workflow_module.WorkflowEngine(
+                cast(Any, SimpleNamespace()), registry=None, event_emitter=None, workflow_path=None
             )
+        assert counts2.violations == [(FakeSite.engine, FakeViolation.unexpected_argument)]
 
-        with contextlib.suppress(lm.EvidenceError):  # rejected by the validator before retention
+        assert boundary_hits == []
+
+    def test_the_scope_restores_every_patched_attribute_also_when_the_call_raises(self) -> None:
+        import concurrent.futures
+        import multiprocessing.process
+        import socket
+        import threading
+
+        targets = [
+            (os, "fork"),
+            (os, "forkpty"),
+            (os, "posix_spawn"),
+            (os, "posix_spawnp"),
+            (os, "system"),
+            (subprocess, "Popen"),
+            (asyncio, "create_subprocess_exec"),
+            (asyncio, "create_subprocess_shell"),
+            (threading.Thread, "start"),
+            (multiprocessing.process.BaseProcess, "start"),
+            (concurrent.futures.ThreadPoolExecutor, "submit"),
+            (concurrent.futures.ProcessPoolExecutor, "submit"),
+            (socket.socket, "connect"),
+        ]
+        before = [(o, a, getattr(o, a)) for o, a in targets]
+        execute_child = subprocess.Popen.__dict__["_execute_child"]
+        violations: Violations = []
+
+        async def raising() -> None:
+            raise RuntimeError("raised inside the scope")
+
+        async def go() -> None:
+            async with scoped_tripwires(violations):
+                await raising()
+
+        with pytest.raises(RuntimeError):
             asyncio.run(go())
-        assert CANARY not in json.dumps(records)
-        # the evidence scan covers the diagnostic values exactly like every other value
-        findings = board.for_case(S.L3)
-        assert findings.canary_leak
-        assert findings.entries[lm.REQUIRED_STREAMS.index("evidence")] == "evidence:leak"
-        assert len(findings.entries) == 8
-        direct = lm.CaseFindings(S.L3)
-        direct.record_evidence(CANARY, {**QUALIFYING_TRIPLE, "diag_api_status": CANARY})
-        assert direct.entries[lm.REQUIRED_STREAMS.index("evidence")] == "evidence:leak"
-        clean = lm.CaseFindings(S.L3)
-        clean.record_evidence(CANARY, dict(QUALIFYING_TRIPLE))
-        assert clean.entries[lm.REQUIRED_STREAMS.index("evidence")] == "evidence:clean"
+        assert all(getattr(o, a) is original for o, a, original in before)
+        assert subprocess.Popen.__dict__["_execute_child"] is execute_child
+        assert violations == []
 
-    def test_a_patched_reducer_returning_a_canary_never_reaches_the_evidence_validator(
+    def test_a_delayed_task_is_recorded_cancelled_and_checked_before_restoration(self) -> None:
+        for raises in (False, True):
+            violations: Violations = []
+            order: list[str] = []
+            holder: list[asyncio.Task[Any]] = []
+
+            async def schedule(
+                holder: list[asyncio.Task[Any]] = holder, raises: bool = raises
+            ) -> None:
+                holder.append(asyncio.get_running_loop().create_task(asyncio.sleep(3600)))
+                if raises:
+                    raise RuntimeError("after scheduling")
+
+            async def go(violations: Violations = violations, order: list[str] = order) -> None:
+                async with scoped_tripwires(violations, None, order):
+                    await schedule()
+
+            if raises:
+                with pytest.raises(RuntimeError):
+                    asyncio.run(go())
+            else:
+                asyncio.run(go())
+            assert violations == [(FakeSite.event_loop, FakeViolation.pending_task)]
+            assert holder[0].cancelled() and holder[0].done()
+            assert order == ["pending_checked", "restored"]
+
+    def test_a_counting_fake_counts_and_records_before_it_raises(self) -> None:
+        tree = ast.parse(Path(__file__).read_text())
+        counted = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+            and node.name in {"fail", "raiser"}
+        ]
+        assert counted
+        for fn in counted:
+            statements = [
+                ast.unparse(s) for s in ast.walk(fn) if isinstance(s, ast.Expr | ast.Raise)
+            ]
+            raise_index = next(i for i, t in enumerate(statements) if t.startswith("raise"))
+            assert any("append((" in t for t in statements[:raise_index]), fn.name
+
+
+@pytest.mark.claude_auth_readiness_mocked
+class TestCountingOfficialSession:
+    """H59 (vi) (o): the real official session over the recording provider and counting fakes."""
+
+    def run_session(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        official_session: bool = True,
+        counts: Counts,
+    ) -> lm.SessionResult:
+        recording_factory(monkeypatch, counts)
+        counting_world(monkeypatch, counts)
+        config = make_config()
+        adapters = real_adapter_set(config, tmp_path, monkeypatch)
+        clock = Clock()
+        records: list[dict[str, object]] = []
+        entry = lm.run_official_session if official_session else lm.probe_readiness
+        extra: dict[str, Any] = (
+            {"git_state": lambda: (GIT_SHA, False), "facts": lambda: dict(FACTS)}
+            if official_session
+            else {}
+        )
+
+        async def go() -> lm.SessionResult:
+            async with scoped_tripwires(counts.violations, counts.n):
+                result = await entry(
+                    config,
+                    tmp_path,
+                    adapters,
+                    readiness_check=lambda: None,
+                    prereq_check=lambda: "bundled",
+                    emit=records.append,
+                    read_table=dict,
+                    sleep=clock.sleep,
+                    grace_s=0.0,
+                    **extra,
+                )
+            return result
+
+        return asyncio.run(go())
+
+    def test_official_session_counts_one_inference_end_to_end(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        boundary_hits: list[str],
+        gates_on: None,
+    ) -> None:
+        counts = Counts()
+        result = self.run_session(tmp_path, monkeypatch, counts=counts)
+        assert counts.violations == []
+        expected = {
+            **l1_expected_counts(),
+            FakeSite.create_provider: 1,
+            FakeSite.capture_auth_context: 1,
+            FakeSite.check_auth_readiness: 1,
+            FakeSite.provider_close: 1,
+        }
+        assert counts.n == expected
+        assert result.succeeded, result.primary_failure
+        assert result.quota_attempts == 1
+        assert boundary_hits == []
+
+    def test_a_readiness_only_run_never_reaches_the_registry_or_the_engine(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        boundary_hits: list[str],
+        gates_on: None,
+    ) -> None:
+        counts = Counts()
+        result = self.run_session(tmp_path, monkeypatch, official_session=False, counts=counts)
+        assert counts.violations == []
+        assert FakeSite.registry not in counts.n and FakeSite.engine not in counts.n
+        assert counts.n[FakeSite.create_provider] == 1 and result.succeeded
+        assert result.quota_attempts == 0
+
+    def test_a_missing_sink_is_recorded_by_the_recording_provider(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        boundary_hits: list[str],
+        gates_on: None,
+    ) -> None:
+        counts = Counts()
+        monkeypatch.setattr(lm, "PrivateLogSink", lambda: contextlib.nullcontext())
+        result = self.run_session(tmp_path, monkeypatch, official_session=False, counts=counts)
+        assert (
+            FakeSite.check_auth_readiness,
+            FakeViolation.sink_not_installed,
+        ) in counts.violations
+        assert result.succeeded
+
+
+class TestScopedTripwireSelfControls:
+    """H59 (vi) (p): the standalone controls; no ``boundary_hits`` and no real adapter."""
+
+    def test_scoped_tripwire_catches_bound_default_popen(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(lm, "l3_diagnostics", lambda *a: dict.fromkeys(lm.DIAG_KEYS, CANARY))
-        out = run_cases(FakeAdapterSet({S.L3: l3_builder(**fresh_scenario("invalid_key")[0])}))
-        assert out.raised is None
-        assert triple_of(out.case_record("L3")) == dict(lm.DIAG_UNAVAILABLE)
-        assert CANARY not in json.dumps(out.records)
+        original_popen = subprocess.Popen
+        original_execute_child = original_popen.__dict__["_execute_child"]
+        real_posix_spawn = os.posix_spawn
+        assert _spawn_with_bound_default.__defaults__ is not None
+        assert _spawn_with_bound_default.__defaults__[0] is original_popen
+        assert original_popen.__init__.__qualname__ == "Popen.__init__"  # no class-level tripwire
+        assert original_popen.__init__.__module__ == "subprocess"
+        assert hasattr(subprocess, "_fork_exec")  # fail closed on another CPython (R-AP)
+        real_fork_exec = subprocess._fork_exec
+        violations: Violations = []
+        backstops: list[str] = []
 
-    MAPPING_FUNCTIONS = (
+        def fork_backstop(*args: object, **kwargs: object) -> None:
+            backstops.append("fork_exec")
+            violations.append((FakeSite.popen_child_backstop, FakeViolation.tripwire_hit))
+            raise CountingFakeViolation()
+
+        def spawn_backstop(*args: object, **kwargs: object) -> None:
+            backstops.append("posix_spawn")
+            violations.append((FakeSite.popen_child_backstop, FakeViolation.tripwire_hit))
+            raise CountingFakeViolation()
+
+        # control-local backstops below ``_execute_child``, installed before the scope is entered
+        monkeypatch.setattr(subprocess, "_fork_exec", fork_backstop)
+        monkeypatch.setattr(os, "posix_spawn", spawn_backstop)
+
+        async def go() -> None:
+            async with scoped_tripwires(violations):
+                await _call_spawn_with_bound_default()
+
+        with pytest.raises(CountingFakeViolation) as excinfo:
+            asyncio.run(go())
+        assert excinfo.type is CountingFakeViolation
+        assert violations == [(FakeSite.popen_execute_child, FakeViolation.tripwire_hit)]
+        assert backstops == []  # neither backstop was reached: no child-creating call
+        assert subprocess.Popen is original_popen
+        assert subprocess.Popen.__dict__["_execute_child"] is original_execute_child
+        assert os.posix_spawn is spawn_backstop  # the scope restored what it found
+        assert subprocess._fork_exec is fork_backstop
+        monkeypatch.undo()  # a controlled point: the backstops themselves are restored
+        assert os.posix_spawn is real_posix_spawn
+        assert subprocess._fork_exec is real_fork_exec
+
+    @pytest.mark.parametrize("suppress", [False, True], ids=["delayed", "suppressed"])
+    def test_scoped_tripwire_pending_drain_is_bounded(self, suppress: bool) -> None:
+        results: dict[str, Any] = {}
+
+        async def body() -> None:
+            violations: Violations = []
+            order: list[str] = []
+            holder: list[asyncio.Task[Any]] = []
+            release = asyncio.Event()
+            before = {"popen": subprocess.Popen, "spawn": os.posix_spawn}
+            try:
+                async with scoped_tripwires(violations, None, order):
+                    await _schedule_task(holder, release, suppress)
+                assert order == ["pending_checked", "restored"]
+                assert subprocess.Popen is before["popen"] and os.posix_spawn is before["spawn"]
+                results["violations"] = violations
+                results["done"] = holder[0].done()
+            finally:
+                release.set()  # bounded final await, whatever happened above
+                if holder:
+                    await asyncio.wait_for(holder[0], 1.0)
+
+        try:
+            asyncio.run(asyncio.wait_for(body(), CONTROL_TIMEOUT_S))
+        except TimeoutError as exc:
+            raise AssertionError("the pending-task drain is not bounded") from exc
+        pending = (FakeSite.event_loop, FakeViolation.pending_task)
+        if suppress:
+            assert results["violations"] == [
+                pending,
+                (FakeSite.event_loop, FakeViolation.pending_task_not_drained),
+            ]
+            assert results["done"] is False  # the task outlives restoration; the pair reports it
+        else:
+            assert results["violations"] == [pending]
+            assert results["done"] is True
+
+
+def _spawn_with_bound_default(popen=subprocess.Popen):  # bound at definition time
+    popen(["/nonexistent-tripwire-control"])
+
+
+async def _call_spawn_with_bound_default():
+    _spawn_with_bound_default()
+
+
+async def _schedule_task(
+    holder: list[asyncio.Task[Any]], release: asyncio.Event, suppress: bool
+) -> None:
+    async def stubborn() -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            if suppress:
+                await release.wait()  # the first cancellation is suppressed, beyond the bound
+            else:
+                await asyncio.sleep(0)  # delayed, but within the bound
+
+    holder.append(asyncio.get_running_loop().create_task(stubborn()))
+    await asyncio.sleep(0)  # let the task reach its first await
+
+
+# ============================================================================
+# H59 (i)-(v): the official sequence is L0 -> L1 only (revision 15, D31, D32)
+# ============================================================================
+
+RETIRED_NAMES = frozenset(
+    {
+        "classify_l3",
+        "install_spy",
+        "make_spy",
+        "_observe",
+        "record_observation",
+        "Observation",
+        "ObserverInstaller",
+        "RealObserverInstaller",
+        "make_canary",
+        "canary_fragments",
+        "assert_no_canary",
+        "assert_config_paired",
+        "assert_env_paired",
+        "guarded_diagnostics",
+        "l3_diagnostics",
+        "ASSISTANT_ERRORS",
+        "canary_scans_complete",
+        "PrivateLogCapture",
+        "_BufferHandler",
+        "ScanReport",
+        "EMPTY_SCAN",
+        "_CANARY_RE",
+        "build_streams",
+        "record_case_scan",
+        "render_exception_chain",
+        "_stream_text",
+        "exception_chain",
+        "unavailable_allowed",
+        "_is_canary_scan",
+        "_scan_state",
+        "_SCAN_RANK",
+        "_diag_problem",
         "assistant_error_of",
-        "api_status_of",
         "provider_retryability_of",
         "_first_present",
-        "l3_diagnostics",
-        "guarded_diagnostics",
-        "diag_triple_valid",
-    )
-    FORBIDDEN_CALLS = {"str", "repr", "format", "ascii", "print"}
-    FORBIDDEN_NAMES = {
-        "args",
-        "message",
-        "__str__",
-        "__repr__",
-        "with_traceback",
-        "suggestion",
-        "file_path",
-        "provider_name",
+        "EnvPlan",
+        "CaseVariant",
+        "build_env_plan",
+        "build_variants",
+        "apply_env_plan",
+        "_with_auth_mode",
+        "config_diff_paths",
+        "_AUTH_MODE_PATH",
+        "_drain",
+        "ProviderError",
+        "record_streams",
+        "record_evidence",
+        "canary_leak",
+        "REQUIRED_STREAMS",
+        "scan_is_clean_and_complete",
+        "validate_canary",
+        "scan_streams",
+        "scan_report",
+        "SCAN_STATES",
+        "NOT_AVAILABLE",
+        "read_tmp_files",
+        "pre_hooks",
     }
-
-    @pytest.mark.parametrize("name", MAPPING_FUNCTIONS)
-    def test_the_mapping_functions_are_static_text_free(self, name: str) -> None:
-        tree = ast.parse(inspect.getsource(getattr(lm, name)))
-        for node in ast.walk(tree):
-            assert not isinstance(node, ast.JoinedStr), name  # no f-string
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                assert node.func.id not in self.FORBIDDEN_CALLS, (name, node.func.id)
-            if isinstance(node, ast.Attribute):
-                assert node.attr not in self.FORBIDDEN_NAMES, (name, node.attr)
-            if isinstance(node, ast.Name):
-                assert node.id not in self.FORBIDDEN_NAMES, (name, node.id)
-
-    @pytest.mark.parametrize("name", ["assistant_error_of", "api_status_of"])
-    def test_a_single_value_reducer_returns_only_a_literal_or_its_argument(self, name: str) -> None:
-        function = ast.parse(inspect.getsource(getattr(lm, name))).body[0]
-        assert isinstance(function, ast.FunctionDef)
-        parameter = function.args.args[0].arg
-        for node in ast.walk(function):
-            if isinstance(node, ast.Return):
-                assert isinstance(node.value, ast.Constant) or (
-                    isinstance(node.value, ast.Name) and node.value.id == parameter
-                ), ast.dump(node)
-
-    def test_the_closed_sets_are_ascii_and_at_most_24_characters(self) -> None:
-        for closed in (
-            lm.DIAG_PROVIDER_RETRYABILITY,
-            lm.DIAG_ASSISTANT_ERROR,
-            lm.DIAG_API_STATUS,
-            lm.DIAG_ASSISTANT_ERROR_PRECEDENCE,
-            lm.DIAG_API_STATUS_PRECEDENCE,
-        ):
-            assert isinstance(closed, (frozenset, tuple))
-            for member in closed:
-                assert isinstance(member, str) and member.isascii() and len(member) <= 24
-        assert len("authentication_failed") == 21  # revision 10's bound of 16 would reject it
-        assert max(len(m) for m in lm.DIAG_ASSISTANT_ERROR) == 21
-
-
-# ============================================================================
-# H56: classification, stop rules and authorization unchanged
-# ============================================================================
-
-
-def _chain_mixed() -> BaseException:
-    outer = ProviderError("retry", is_retryable=True)
-    outer.__cause__ = ProviderError("rejected", is_retryable=False)
-    return outer
-
-
-def _chain_timeout() -> BaseException:
-    return TimeoutError("t")
-
-
-def _chain_msg(retryable: bool) -> Callable[[], BaseException]:
-    return lambda: ProviderError(
-        "401 authentication_failed invalid api key", is_retryable=retryable
-    )
-
-
-def _chain(retryable: bool) -> Callable[[], BaseException]:
-    return lambda: ProviderError("x", is_retryable=retryable)
-
-
-# (name, exception factory, observations (error, status), events, expected) - written here, not
-# derived from ``classify_l3``.
-TRUTH_TABLE: list[
-    tuple[str, Callable[[], BaseException | None], list[tuple[Any, Any]], list[object], lm.Outcome]
-] = [
-    ("completed", lambda: None, [], [COMPLETED], O.FELL_BACK_TO_LOGIN),
-    ("completed_with_error", _chain(False), [(None, 401)], [COMPLETED], O.FELL_BACK_TO_LOGIN),
-    ("nr_auth_error", _chain(False), [("authentication_failed", None)], [], O.INVALID_KEY),
-    ("nr_401", _chain(False), [(None, 401)], [], O.INVALID_KEY),
-    ("nr_404_only", _chain(False), [(None, 404)], [], O.MODEL_UNAVAILABLE),
-    ("nr_401_and_404", _chain(False), [(None, 404), (None, 401)], [], O.INVALID_KEY),
-    ("r_auth_error", _chain(True), [("authentication_failed", None)], [], O.INCONCLUSIVE),
-    ("r_401", _chain(True), [(None, 401)], [], O.INCONCLUSIVE),
-    ("no_provider_error_401", lambda: RuntimeError("x"), [(None, 401)], [], O.INCONCLUSIVE),
-    ("no_exception_401", lambda: None, [("authentication_failed", 401)], [], O.INCONCLUSIVE),
-    ("nr_403", _chain(False), [(None, 403)], [], O.INCONCLUSIVE),
-    ("nr_400", _chain(False), [(None, 400)], [], O.INCONCLUSIVE),
-    ("nr_429", _chain(False), [(None, 429)], [], O.INCONCLUSIVE),
-    ("nr_500", _chain(False), [(None, 500)], [], O.INCONCLUSIVE),
-    ("nr_no_signal", _chain(False), [], [], O.INCONCLUSIVE),
-    ("mixed_401", _chain_mixed, [(None, 401)], [], O.INVALID_KEY),
-    ("timeout", _chain_timeout, [], [], O.INCONCLUSIVE),
-    ("nr_message_says_401", _chain_msg(False), [], [], O.INCONCLUSIVE),
-    ("r_message_says_401", _chain_msg(True), [], [], O.INCONCLUSIVE),
-]
-
-
-def truth_inputs(
-    row: tuple[
-        str, Callable[[], BaseException | None], list[tuple[Any, Any]], list[object], lm.Outcome
-    ],
-) -> tuple[list[lm.Observation], list[BaseException], list[object], BaseException | None]:
-    _, factory, observations, events, _ = row
-    exc = factory()
-    return [obs(error=e, status=s) for e, s in observations], lm.exception_chain(exc), events, exc
-
-
-class TestClassificationUnchanged:
-    """H56: the frozen truth table, with-and-without diagnostics, AST pins, constants, runbook."""
-
-    @pytest.mark.parametrize("row", TRUTH_TABLE, ids=[r[0] for r in TRUTH_TABLE])
-    def test_classify_l3_equals_the_frozen_table(self, row: Any) -> None:
-        observations, chain, events, _ = truth_inputs(row)
-        assert lm.classify_l3(observations, chain, events) is row[4]
-
-    @staticmethod
-    def _l3_run(row: Any, *, cases: Sequence[lm.Case] = (S.L1, S.L3, S.L2)) -> DiagRun:
-        observations, _, events, exc = truth_inputs(row)
-        fake = FakeAdapterSet(
-            {S.L3: l3_builder(exception=exc, observations=observations, events=events)}
-        )
-        return run_cases(fake, cases=cases)
-
-    @staticmethod
-    def _summary(out: DiagRun) -> dict[str, object]:
-        assert out.result is not None
-        record = out.case_record("L3")
-        return {
-            "outcome": record["outcome"],
-            "adapter_outcome": record["adapter_outcome"],
-            "results": [(r.case, r.status, r.outcome) for r in out.result.results],
-            "quota": out.result.quota_attempts,
-            "primary": out.result.primary_failure,
-            "executed": [
-                c for c in ("L1", "L3", "L2") if any(r.get("case") == c for r in out.records)
-            ],
-        }
-
-    PATCHES: dict[str, Any] = {
-        "empty_result": lambda *a: {},
-        "adversarial_valid": lambda *a: diag_triple(),
-        "raises": lambda *a: (_ for _ in ()).throw(Exception("PLANTED")),
-        "non_member": lambda *a: diag_triple(status="PLANTED"),
-        "mixed_unavailable": lambda *a: {**diag_triple(), "diag_api_status": "unavailable"},
+)
+RETIRED_VALUES = frozenset(
+    {
+        "invalid_key",
+        "fell_back_to_login",
+        "model_unavailable",
+        "l2_l3_not_paired",
+        "canary_leak",
+        "canary_scan_incomplete",
+        "canary_used_in_l2",
+        "not_executed_after_l1_failure",
+        "not_executed_l3_fell_back_to_login",
+        "not_executed_l3_inconclusive",
+        "not_executed_l3_model_unavailable",
+        "canary_scan",
     }
+)
 
-    @pytest.mark.parametrize("row", TRUTH_TABLE, ids=[r[0] for r in TRUTH_TABLE])
-    def test_the_outcome_and_the_stop_rules_ignore_the_diagnostics(
-        self, monkeypatch: pytest.MonkeyPatch, row: Any
-    ) -> None:
-        baseline = self._summary(self._l3_run(row))
-        assert baseline["outcome"] == row[4].value or baseline["outcome"] == "canary_leak"
-        for label, patch in self.PATCHES.items():
-            with monkeypatch.context() as scoped:
-                scoped.setattr(lm, "l3_diagnostics", patch)
-                out = self._l3_run(row)
-            assert self._summary(out) == baseline, label
-            record = out.case_record("L3")
-            if label == "adversarial_valid":
-                assert triple_of(record) == diag_triple()
-            else:
-                assert triple_of(record) == dict(lm.DIAG_UNAVAILABLE), label
 
-    PINNED_CLASSIFY_NAMES = {
-        "BaseException", "Observation", "Outcome", "ProviderError", "Sequence", "_has_completed",
-        "any", "events", "exc", "exc_chain", "isinstance", "non_retryable", "o", "object",
-        "observations", "FELL_BACK_TO_LOGIN", "INCONCLUSIVE", "INVALID_KEY", "MODEL_UNAVAILABLE",
-        "api_error_status", "assistant_error", "is_retryable",
-    }  # fmt: skip
-
-    def test_classify_l3_references_exactly_its_pinned_names_and_constants(self) -> None:
-        function = ast.parse(inspect.getsource(lm.classify_l3)).body[0]
-        assert isinstance(function, ast.FunctionDef)
-        names: set[str] = set()
-        constants: set[object] = set()
-        for node in ast.walk(function):
-            if isinstance(node, ast.Name):
-                names.add(node.id)
-            elif isinstance(node, ast.arg):
-                names.add(node.arg)
-            elif isinstance(node, ast.Attribute):
-                names.add(node.attr)
-            elif isinstance(node, ast.Constant) and node is not function.body[0].value:  # type: ignore[attr-defined]
-                constants.add(node.value)
-        assert names == self.PINNED_CLASSIFY_NAMES
-        assert constants == {False, 401, 404, "authentication_failed"}
+def retired_machinery_problems(source: str) -> list[str]:
+    """Names, strings and tokens of the removal lists of design 24, 24.1 and 24.2."""
+    tree = ast.parse(source)
+    problems: list[str] = []
+    for node in ast.walk(tree):
+        names: list[str] = []
+        if isinstance(node, ast.Name):
+            names.append(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.append(node.attr)
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            names.append(node.name)
+        elif isinstance(node, ast.arg) or (isinstance(node, ast.keyword) and node.arg):
+            names.append(str(node.arg))
+        elif isinstance(node, ast.alias):
+            names.extend(n for n in (node.name, node.asname) if n)
         for name in names:
-            assert not re.search(r"diag|DIAG_|l3_diagnostics|^str$|^repr$|^args$", name), name
-
-    DIAG_NAME = re.compile(
-        r"DIAG_|^diag_|l3_diagnostics|guarded_diagnostics|assistant_error_of|api_status_of"
-        r"|provider_retryability_of|_diag_problem|_qualifying_triple"
-    )
-
-    def test_only_the_expected_runtime_code_references_the_diagnostic_names(self) -> None:
-        tree = ast.parse(LIVE_MODULE.read_text())
-        referencing: dict[str, set[str]] = {}
-        for node in tree.body:
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            used = {
-                n.id
-                for n in ast.walk(node)
-                if isinstance(n, ast.Name) and self.DIAG_NAME.search(n.id)
-            }
-            if used:
-                referencing[node.name] = used
-        assert set(referencing) == {
-            "diag_triple_valid",
-            "l3_diagnostics",
-            "guarded_diagnostics",
-            "_diag_problem",
-            "_qualifying_triple",
-            "_classify",
-            "_safe_fields",
-            "_inference_runner",
-            "run_ordered_cases",
-        }
-        for pure in (
-            "resolve_outcome",
-            "not_executed_value",
-            "_case_record",
-            "classify_l3",
-            "finalize",
-        ):
-            assert pure not in referencing, pure
-        wrapper = next(n for n in tree.body if getattr(n, "name", "") == "run_ordered_cases")
-        handlers = [n for n in ast.walk(wrapper) if isinstance(n, ast.ExceptHandler)]
-        inside = {
-            id(n)
-            for handler in handlers
-            if isinstance(handler.type, ast.Name) and handler.type.id == "HarnessFailure"
-            for n in ast.walk(handler)
-        }
-        for node in ast.walk(wrapper):
-            if isinstance(node, ast.Name) and self.DIAG_NAME.search(node.id):
-                assert id(node) in inside, node.id  # only the HarnessFailure branch
-
-    def test_the_constants_and_the_outcome_set_are_unchanged(self) -> None:
-        assert lm.EXPECTED_OUTCOME == {
-            S.L0: O.OK, S.L1: O.OK, S.L3: O.INVALID_KEY, S.L2: O.OK,
-        }  # fmt: skip
-        assert lm.ORDER == (S.L0, S.L1, S.L3, S.L2)
-        assert frozenset({S.L1, S.L3, S.L2}) == lm.INFERENCE_CASES
-        assert lm.DEFAULT_QUOTA_CEILING == 3 and lm.QuotaCounter().ceiling == 3
-        assert {o.value for o in lm.Outcome} == PRE_AMENDMENT_OUTCOMES
-        assert len(lm.Outcome) == 44
-        table = {
-            (S.L3, O.INVALID_KEY): None,
-            (S.L3, O.INCONCLUSIVE): O.NOT_EXECUTED_L3_INCONCLUSIVE,
-            (S.L3, O.FELL_BACK_TO_LOGIN): O.NOT_EXECUTED_L3_FELL_BACK_TO_LOGIN,
-            (S.L3, O.MODEL_UNAVAILABLE): O.NOT_EXECUTED_L3_MODEL_UNAVAILABLE,
-            (S.L3, O.CANARY_LEAK): O.NOT_EXECUTED_AFTER_SAFETY_FAILURE,
-            (S.L1, O.INCONCLUSIVE): O.NOT_EXECUTED_AFTER_L1_FAILURE,
-            (S.L0, O.NOT_LOGGED_IN): O.NOT_EXECUTED_AFTER_L0_FAILURE,
-            (S.L2, O.INVALID_KEY): None,
-        }
-        for (case, outcome), expected in table.items():
-            assert lm.not_executed_value(case, outcome) is expected
-
-    def test_the_runbook_states_the_diagnostic_contract_and_the_sequence(self) -> None:
-        text = normalized(RUNBOOK_PATH.read_text())
-        for statement in (
-            "They **only describe** what the harness observed",
-            "never classify, never change an outcome and never authorize a step",
-            "**Omission of all three fields** means L3 classification was never reached",
-            "`unavailable` (always all three fields) means the outcome was already fixed",
-            "**No step is ever retried automatically.**",
-            "**fresh, separate human approval**",
-            "implemented, the full offline safety tests and the focused falsification checks pass, "
-            "an independent reviewer accepts it and it is committed on the same feature branch",
-            "retained local failure record",
-            "never shared, committed, quoted as successful or official evidence or used to "
-            "authorize another step",
-            "has **not** passed",
-        ):
-            assert statement in text, statement
-        section = RUNBOOK_PATH.read_text().split("### Reading the L3 diagnostic fields")[1]
-        section = normalized(section.split("\n### ")[0])
-        for sentence in re.split(r"(?<=[.!?])\s+", section):
-            if re.search(r"live validation|first run", sentence) and re.search(
-                r"\b(passed|succeeded|a pass)\b", sentence
+            if (
+                name in RETIRED_NAMES
+                or name.startswith(("DIAG_", "diag_"))
+                or name in {"capfd", "canary"}
             ):
-                assert re.search(r"\bnot\b|\bnothing\b|\bnever\b", sentence), sentence
+                problems.append(f"retired name {name}")
+            if re.search(r"(^|_)canary(_|$)|^L[23]$|L[23]_", name):
+                problems.append(f"retired token in {name}")
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value in {"L3", "L2", "auto"} or node.value in RETIRED_VALUES:
+                problems.append(f"retired literal {node.value!r}")
+            if node.value.strip().startswith("sk-ant-"):
+                problems.append("a credential-shaped literal")
+    texts = [
+        n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    ]
+    if any(re.search(r"\bL[23]\b", t) and len(t) < 20 for t in texts):
+        problems.append("a short literal naming a retired case")
+    return problems
 
 
-# ============================================================================
-# H57: adapters can never supply the diagnostic keys
-# ============================================================================
-
-FORGED_VALID = diag_triple("retryable", "rate_limit", "429")
-FORGED_QUALIFYING = dict(QUALIFYING_TRIPLE)
-FORGED_NON_STRING = {
-    "diag_provider_retryability": 7,
-    "diag_assistant_error": ["authentication_failed"],
-    "diag_api_status": None,
-}
-FORGED_VARIANTS = {
-    "valid_looking": FORGED_VALID,
-    "qualifying": FORGED_QUALIFYING,
-    "non_string": FORGED_NON_STRING,
-}
-ALLOWLISTED_EXTRA = {"billing_mode": "subscription", "requested_model": "claude-haiku-4-5"}
+LOGGING_MUTATORS = frozenset(
+    {
+        "addHandler",
+        "removeHandler",
+        "addFilter",
+        "setLevel",
+        "getLogger",
+        "basicConfig",
+        "captureWarnings",
+    }
+)
 
 
-class SpyExtra(dict[str, object]):
-    """A ``HarnessFailure.extra`` that records that, and with what content, it was read."""
-
-    def __init__(self, content: Mapping[str, object]) -> None:
-        super().__init__(content)
-        self.reads: list[dict[str, object]] = []
-
-    def _note(self) -> None:
-        self.reads.append(dict(dict.items(self)))
-
-    def __iter__(self) -> Any:
-        self._note()
-        return super().__iter__()
-
-    def keys(self) -> Any:
-        self._note()
-        return super().keys()
-
-    def items(self) -> Any:
-        self._note()
-        return super().items()
-
-    def values(self) -> Any:
-        self._note()
-        return super().values()
-
-    def get(self, key: str, default: object = None) -> Any:
-        self._note()
-        return super().get(key, default)
-
-    def __getitem__(self, key: str) -> Any:
-        self._note()
-        return super().__getitem__(key)
-
-    def copy(self) -> Any:
-        self._note()
-        return dict(dict.items(self))
+def logging_implementation_problems(source: str) -> list[str]:
+    """No logging capture outside ``PrivateLogSink`` / ``_CountingDiscardHandler``."""
+    live = LiveSource(source)
+    problems: list[str] = []
+    for call in live.nodes(ast.Call):
+        if (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr in LOGGING_MUTATORS
+            and not live.qualname(call).startswith("PrivateLogSink")
+        ):
+            problems.append(f"{call.func.attr} in {live.qualname(call)}")
+    for node in live.nodes(ast.Attribute):
+        if (
+            isinstance(node.ctx, ast.Store)
+            and node.attr in {"propagate", "disabled"}
+            and not live.qualname(node).startswith("PrivateLogSink")
+        ):
+            problems.append(f"{node.attr} assigned in {live.qualname(node)}")
+    for cls in live.nodes(ast.ClassDef):
+        bases = [ast.unparse(b) for b in cls.bases]
+        if (
+            any("Handler" in b or "Filter" in b for b in bases)
+            and cls.name != "_CountingDiscardHandler"
+        ):
+            problems.append(f"another handler or filter: {cls.name}")
+    for name in ("caplog", "logging.handlers", "logging.config"):
+        if name in source:
+            problems.append(f"{name} appears")
+    return problems
 
 
-def forged_failure(extra: Mapping[str, object]) -> tuple[lm.HarnessFailure, SpyExtra]:
-    failure = lm.HarnessFailure(O.CASE_FAILED, extra=extra)
-    spy = SpyExtra(extra)
-    failure.extra = spy
-    return failure, spy
+class TestOfficialSequence:
+    """H59 (i)-(v): constants, the L0 -> L1 sequence, transitions, environment and retired names."""
 
+    def test_constants(self) -> None:
+        assert lm.ORDER == (S.L0, S.L1)
+        assert {S.L1} == lm.INFERENCE_CASES
+        assert lm.EXPECTED_OUTCOME == {S.L0: O.OK, S.L1: O.OK}
+        assert lm.CASE_NAMES == ("L0", "L1")
+        assert lm.CASE_TIMEOUTS_S == {S.L1: 120.0}
+        assert lm.DEFAULT_QUOTA_CEILING == 1
+        quota = lm.QuotaCounter(1)
+        quota.begin_attempt()
+        with raises_outcome(O.QUOTA_CEILING_EXCEEDED):
+            quota.begin_attempt()
+        assert lm._CASE_ALT == "L0|L1" and lm._CASE_RE == "L0|L1"
+        assert 'lm._CASE_ALT: Final = "L0|L1"' not in LIVE_MODULE.read_text()
 
-class RaisingReadiness:
-    """A readiness adapter whose ``probe()`` raises the given exception."""
+    def test_the_case_alternation_literal_is_in_the_source(self) -> None:
+        assert '_CASE_ALT: Final = "L0|L1"' in LIVE_MODULE.read_text()
 
-    def __init__(self, exc: BaseException) -> None:
-        self.exc = exc
+    @pytest.mark.usefixtures("gates_on")
+    def test_a_passing_session_calls_each_adapter_once_for_l1_only(self, tmp_path: Path) -> None:
+        fake = FakeAdapterSet()
+        result = official(tmp_path, fake)
+        assert fake.calls == ["cli", "readiness", "execute:L1"]
+        (config,) = fake.configs
+        assert config["workflow"]["runtime"]["provider"]["auth_mode"] == "subscription"
+        record = lm.run_level_record(result)
+        assert (record["quota_attempts_total"], record["quota_ceiling"]) == (1, 1)
+        assert [
+            r["case"] for r in result.evidence if r.get("case") in {"L0", "L1", "L3", "L2"}
+        ] == ["L0", "L1"]
+        assert "not_executed" not in record
 
-    async def probe(self) -> lm.ReadinessObservation:
-        raise self.exc
-
-
-def raise_from_adapter(case: lm.Case, exc: BaseException) -> DiagRun:
-    """Raise ``exc`` from the readiness ``probe()`` (L0) or the execution ``execute()`` (others)."""
-    fake = FakeAdapterSet()
-    adapters = dataclasses.replace(fake.as_set(), board=lm.FindingsBoard(CANARY))
-    if case is S.L0:
-        adapters = dataclasses.replace(adapters, readiness=RaisingReadiness(exc))
-    else:
-
-        def build(sink: list[lm.Observation]) -> lm.RunObservation:
-            raise exc
-
-        fake = FakeAdapterSet({case: build})
-        adapters = dataclasses.replace(fake.as_set(), board=lm.FindingsBoard(CANARY))
-    return run_cases(fake, cases=(case,), adapters=adapters)
-
-
-class TestDiagnosticSpoofing:
-    """H57: forged diagnostic keys die on every adapter-controlled path."""
-
-    @pytest.mark.parametrize("case", ["L0", "L1", "L2", "L3"])
-    @pytest.mark.parametrize("variant", list(FORGED_VARIANTS))
-    @pytest.mark.parametrize("keys", [1, 2, 3], ids=["one_key", "two_keys", "all_three"])
-    def test_safe_fields_strips_every_forged_subset(
-        self, case: str, variant: str, keys: int
-    ) -> None:
-        forged = FORGED_VARIANTS[variant]
-        for subset in itertools.combinations(lm.DIAG_KEYS, keys):
-            fields = {**ALLOWLISTED_EXTRA, **{k: forged[k] for k in subset}, "ready": True}
-            filtered = lm._safe_fields(fields)
-            assert not set(filtered) & set(lm.DIAG_KEYS)
-            assert filtered == {**ALLOWLISTED_EXTRA, "ready": True}
-
-    @staticmethod
-    def _forging_readiness(forged: Mapping[str, object]) -> Any:
-        class Forger:
-            async def probe(self) -> lm.ReadinessObservation:
-                return lm.ReadinessObservation(True, {**l0_fields(), **forged})
-
-        return Forger()
-
-    def test_each_case_through_the_wrapper_carries_none(self) -> None:
-        for variant, forged in FORGED_VARIANTS.items():
-            read = FakeAdapterSet()
-            adapters = dataclasses.replace(
-                read.as_set(),
-                board=lm.FindingsBoard(CANARY),
-                readiness=self._forging_readiness(forged),
-            )
-            out = run_cases(read, cases=(S.L0,), adapters=adapters)
-            assert triple_of(out.case_record("L0")) == {}, variant
-            for case in (S.L1, S.L2):
-                fake = FakeAdapterSet({case: lambda sink, f=forged: run_ok(fields=dict(f))})
-                out = run_cases(fake, cases=(case,))
-                record = out.case_record(case.value)
-                assert triple_of(record) == {} and record["outcome"] == "ok", (variant, case)
-
-    def test_the_l3_normal_path_holds_the_computed_triple_only(self) -> None:
-        for variant, forged in FORGED_VARIANTS.items():
-            kwargs = fresh_scenario("retryable")[0]
-            out = run_cases(FakeAdapterSet({S.L3: l3_builder(fields=forged, **kwargs)}))
-            expected = dict(zip(lm.DIAG_KEYS, L3_SCENARIOS["retryable"][2], strict=True))
-            assert triple_of(out.case_record("L3")) == expected, variant
-
-    @pytest.mark.parametrize("forged_kind", ["complete_qualifying", "partial"])
-    @pytest.mark.parametrize("patch", ["raises", "non_member"])
-    def test_forged_values_never_survive_a_reducer_failure(
-        self, monkeypatch: pytest.MonkeyPatch, forged_kind: str, patch: str
-    ) -> None:
-        forged = (
-            dict(FORGED_QUALIFYING)
-            if forged_kind == "complete_qualifying"
-            else {"diag_api_status": "401"}
-        )
-
-        def run() -> DiagRun:
-            kwargs = fresh_scenario("nr_untyped")[0]
-            return run_cases(
-                FakeAdapterSet({S.L3: l3_builder(fields=forged, **kwargs)}),
-                cases=(S.L1, S.L3, S.L2),
-            )
-
-        baseline = run()
-        if patch == "raises":
-            monkeypatch.setattr(
-                lm, "l3_diagnostics", lambda *a: (_ for _ in ()).throw(Exception("x"))
-            )
-        else:
-            monkeypatch.setattr(lm, "l3_diagnostics", lambda *a: diag_triple(status="PLANTED"))
-        out = run()
-        record = out.case_record("L3")
-        assert triple_of(record) == dict(lm.DIAG_UNAVAILABLE)
-        base_record = baseline.case_record("L3")
-        for key in ("outcome", "adapter_outcome", "attempted_quota_execution"):
-            assert record[key] == base_record[key]
-        assert out.result is not None and baseline.result is not None
-        assert out.result.quota_attempts == baseline.result.quota_attempts
-        assert "PLANTED" not in json.dumps(out.records)
-
-    # -- an escaping HarnessFailure.extra through the real wrapper branch -------------------------
-
-    @staticmethod
-    def _wrapper_branch_reads_extra_and_strips() -> bool:
-        tree = ast.parse(inspect.getsource(lm.run_ordered_cases))
-        for handler in (n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)):
-            if isinstance(handler.type, ast.Name) and handler.type.id == "HarnessFailure":
-                reads = any(
-                    isinstance(n, ast.Attribute)
-                    and n.attr == "extra"
-                    and isinstance(n.value, ast.Name)
-                    and n.value.id == "exc"
-                    for n in ast.walk(handler)
-                )
-                strips = any(
-                    isinstance(n, ast.Name) and n.id == "DIAG_KEYS" for n in ast.walk(handler)
-                )
-                return reads and strips
-        return False
-
-    @pytest.mark.parametrize("case", ["L0", "L1", "L2", "L3"])
-    @pytest.mark.parametrize("variant", list(FORGED_VARIANTS))
-    @pytest.mark.parametrize("keys", [3, 1, 2], ids=["all_three", "one_key", "two_keys"])
-    def test_an_escaping_harness_failure_extra_is_stripped_in_the_wrapper(
-        self, monkeypatch: pytest.MonkeyPatch, case: str, variant: str, keys: int
-    ) -> None:
-        assert self._wrapper_branch_reads_extra_and_strips()  # the branch is the one under test
-        forged = FORGED_VARIANTS[variant]
-        subset = lm.DIAG_KEYS[:keys] if keys != 2 else lm.DIAG_KEYS[1:]
-        extra = {**ALLOWLISTED_EXTRA, **{k: forged[k] for k in subset}}
-        failure, spy = forged_failure(extra)
-        leaving: list[Mapping[str, object]] = []
-        real_case_record = lm._case_record
-
-        def recording(*args: Any, **kwargs: Any) -> Any:
-            leaving.append(dict(kwargs["fields"]))
-            return real_case_record(*args, **kwargs)
-
-        monkeypatch.setattr(lm, "_case_record", recording)
-        out = raise_from_adapter(S(case), failure)
-        assert out.raised is None  # a HarnessFailure is recorded, not propagated
-        # the real branch read the unfiltered mapping and handed on a mapping without DIAG_KEYS
-        assert spy.reads and set(subset) <= set(spy.reads[0])
-        assert len(leaving) == 1 and not set(leaving[0]) & set(lm.DIAG_KEYS)
-        record = out.case_record(case)
-        assert triple_of(record) == {}  # L3: omitted, classification was never reached
-        assert record["outcome"] == "case_failed"
-        assert record["exception_class"] == "HarnessFailure"
-        for key, value in ALLOWLISTED_EXTRA.items():
-            assert record[key] == value
-        assert all(triple_of(r) == {} for r in out.records)
-
-    @pytest.mark.parametrize("case", ["L0", "L1", "L2", "L3"])
-    def test_a_clean_extra_is_carried_unchanged(
-        self, monkeypatch: pytest.MonkeyPatch, case: str
-    ) -> None:
-        failure, spy = forged_failure(dict(ALLOWLISTED_EXTRA))
-        leaving: list[Mapping[str, object]] = []
-        real_case_record = lm._case_record
-
-        def recording(*args: Any, **kwargs: Any) -> Any:
-            leaving.append(dict(kwargs["fields"]))
-            return real_case_record(*args, **kwargs)
-
-        monkeypatch.setattr(lm, "_case_record", recording)
-        out = raise_from_adapter(S(case), failure)
-        assert spy.reads and leaving == [ALLOWLISTED_EXTRA]
-        record = out.case_record(case)
-        assert {k: record[k] for k in ALLOWLISTED_EXTRA} == ALLOWLISTED_EXTRA
-        assert triple_of(record) == {}
-
-    def test_a_forged_extra_with_a_failing_reducer_never_calls_the_reducer(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        calls: list[object] = []
-
-        def reducer(*args: object) -> object:
-            calls.append(args)
-            raise Exception("PLANTED-reducer")
-
-        monkeypatch.setattr(lm, "l3_diagnostics", reducer)
-        failure, _ = forged_failure({**ALLOWLISTED_EXTRA, **FORGED_QUALIFYING})
-        out = raise_from_adapter(S.L3, failure)
-        assert calls == []
-        assert triple_of(out.case_record("L3")) == {}
-        text = json.dumps(out.records)
-        assert "authentication_failed" not in text and '"401"' not in text
-        assert "PLANTED" not in text
-
-    def test_a_timeout_observation_with_forged_keys_holds_the_computed_values_only(self) -> None:
-        builder = l3_builder(
-            exception=TimeoutError("t"),
-            observations=[obs(error="rate_limit")],
-            fields=FORGED_QUALIFYING,
-        )
-        record = run_cases(FakeAdapterSet({S.L3: builder})).case_record("L3")
-        assert triple_of(record) == {
-            "diag_provider_retryability": "absent",
-            "diag_assistant_error": "rate_limit",
-            "diag_api_status": "absent",
-        }
-
-    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt(), asyncio.CancelledError()], ids=type)
-    def test_an_interrupt_with_forged_keys_leaves_none_in_either_record(
-        self, interrupt: BaseException
-    ) -> None:
-        def build(sink: list[lm.Observation]) -> lm.RunObservation:
-            sink.append(obs(error="authentication_failed", status=401))
-            raise interrupt
-
-        out = run_cases(FakeAdapterSet({S.L3: build}))
-        assert out.raised is interrupt
-        assert all(triple_of(r) == {} for r in out.records)
-        findings = lm.CaseFindings(S.L3)
-        findings.cleanup_failed.append("evidence")  # as the wrapper does before the fallback
-        fallback = lm._fallback_record(findings, CANARY, case=S.L3, interrupt=interrupt)
-        assert triple_of(fallback) == {}
-
+    @pytest.mark.usefixtures("gates_on")
     @pytest.mark.parametrize(
-        "name",
+        ("kind", "expected"),
         [
-            "DIAG_API_STATUS",
-            "Diag_api_status",
-            "diag_api_status ",
-            " diag_api_status",
-            "diag_api_ѕtatus",
+            ("not_logged_in", O.NOT_EXECUTED_AFTER_L0_FAILURE),
+            ("descendant", O.NOT_EXECUTED_AFTER_SAFETY_FAILURE),
+            ("interrupt", O.NOT_EXECUTED_AFTER_INTERRUPT),
         ],
     )
-    def test_a_lookalike_spelling_is_not_an_allowlist_member(self, name: str) -> None:
-        assert name not in lm.EVIDENCE_KEYS
-        assert lm._safe_fields({name: "401", "ready": True}) == {"ready": True}
-        kwargs = fresh_scenario("nr_untyped")[0]
-        out = run_cases(FakeAdapterSet({S.L3: l3_builder(fields={name: "401"}, **kwargs)}))
-        record = out.case_record("L3")
-        assert name not in record
-        assert record["diag_api_status"] == "absent"  # the computed value only
+    def test_an_l0_failure_never_reaches_the_workflow_adapter(
+        self, tmp_path: Path, kind: str, expected: lm.Outcome
+    ) -> None:
+        fake = FakeAdapterSet(ready=kind != "not_logged_in")
+        if kind == "descendant":
+            fake.on_probe = lambda: fake.table.update(
+                {os.getpid() + 100000: (os.getpid(), "leaky")}
+            )
+        if kind == "interrupt":
 
-    def test_the_wrapper_keeps_a_computed_triple_it_does_not_strip_runner_fields(self) -> None:
-        # the strip belongs to the HarnessFailure branch only: a CaseOutcome's fields keep the
-        # computed triple the L3 runner assigned
-        out = run_cases(FakeAdapterSet({S.L3: l3_builder(**fresh_scenario("invalid_key")[0])}))
-        assert triple_of(out.case_record("L3")) == dict(
-            zip(lm.DIAG_KEYS, L3_SCENARIOS["invalid_key"][2], strict=True)
+            def interrupt() -> None:
+                raise KeyboardInterrupt
+
+            fake.on_probe = interrupt
+            with pytest.raises(KeyboardInterrupt):
+                official(tmp_path, fake)
+            assert fake.calls == ["cli", "readiness"]
+            return
+        result = official(tmp_path, fake)
+        assert fake.calls == ["cli", "readiness"]  # the workflow adapter is never called
+        assert result.quota_attempts == 0
+        assert result.results[1].outcome is expected
+
+    @pytest.mark.usefixtures("gates_on")
+    def test_the_harness_sets_no_credential_and_no_auto_configuration(self, tmp_path: Path) -> None:
+        fake = FakeAdapterSet()
+        result = official(tmp_path, fake)
+        for record in result.evidence:
+            if record.get("case") in {"L0", "L1"}:
+                assert not record.get("env_names_set")
+        text = LIVE_MODULE.read_text()
+        assert (
+            "receive_response" not in text
+            and "ANTHROPIC_API_KEY" not in text.replace("ANTHROPIC_API_KEY", "", 0)
+            or "setenv" not in text
         )
+        assert "setenv" not in text and ".setenv(" not in text
+
+    def test_the_live_module_has_no_retired_name_or_literal(self) -> None:
+        assert retired_machinery_problems(LIVE_MODULE.read_text()) == []
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            "def classify_l3():\n    pass\n",
+            "x = 'L3'\n",
+            "x = 'auto'\n",
+            "def f(capfd):\n    pass\n",
+            "DIAG_KEYS = ()\n",
+            "class PrivateLogCapture:\n    pass\n",
+            "from conductor.exceptions import ProviderError\n",
+            "y = 'canary_scan'\n",
+            "z = REQUIRED_STREAMS\n",
+        ],
+    )
+    def test_retired_name_controls(self, extra: str) -> None:
+        assert retired_machinery_problems(LIVE_MODULE.read_text() + "\n" + extra) != []
+
+    def test_exactly_two_live_tests_and_the_pinned_log_classes(self) -> None:
+        tree = module_ast()
+        tests = [
+            n.name
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name.startswith("test_")
+        ]
+        assert tests == ["test_readiness_probe_only", "test_official_live_evidence"]
+        classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+        assert [
+            n.name for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "PrivateLogSink"
+        ] == ["PrivateLogSink"]
+        handler = classes["_CountingDiscardHandler"]
+        assert [ast.unparse(b) for b in handler.bases] == ["logging.Handler"]
+        assert not handler.decorator_list and not handler.keywords
+
+    def test_no_other_logging_implementation(self) -> None:
+        assert logging_implementation_problems(LIVE_MODULE.read_text()) == []
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            "import logging\nclass Other(logging.Handler):\n    pass\n",
+            "def f(lg):\n    lg.addHandler(None)\n",
+            "def f(lg):\n    lg.propagate = False\n",
+            "def f():\n    logging.getLogger('x')\n",
+            "def f(lg):\n    lg.setLevel(10)\n",
+        ],
+    )
+    def test_logging_controls(self, extra: str) -> None:
+        assert logging_implementation_problems(LIVE_MODULE.read_text() + "\n" + extra) != []
 
 
 # ============================================================================
-# H58: the decision-table oracle
+# H60: the official contract binds L0 and L1 (revision 15, section 5.8)
 # ============================================================================
 
-OR_SET = frozenset({"absent", "retryable", "non_retryable", "mixed", "unavailable"})
-OA_SET = frozenset(
-    {
-        "authentication_failed", "billing_error", "invalid_request", "rate_limit",
-        "server_error", "unknown", "other", "absent", "unavailable",
-    }
-)  # fmt: skip
-OS_SET = frozenset(
-    {"401", "403", "404", "429", "other_4xx", "5xx", "other", "absent", "unavailable"}
-)
-O_KEYS = ("diag_provider_retryability", "diag_assistant_error", "diag_api_status")
-
-
-def triple_state(triple: object) -> str:
-    """C complete, U all ``unavailable``, O omitted, M malformed (a test oracle, literal sets)."""
-    if triple is None:
-        return "O"
-    if not isinstance(triple, dict) or set(triple) != set(O_KEYS):
-        return "M"
-    fields = cast("dict[str, object]", triple)
-    r, a, s = (fields[k] for k in O_KEYS)
-    if not (
-        isinstance(r, str) and r in OR_SET and isinstance(a, str) and a in OA_SET
-        and isinstance(s, str) and s in OS_SET
-    ):  # fmt: skip
-        return "M"
-    unavailable = [r, a, s].count("unavailable")
-    return {0: "C", 3: "U"}.get(unavailable, "M")
-
-
-def _t(triple: Any) -> tuple[str, str, str]:
-    return (
-        triple["diag_provider_retryability"],
-        triple["diag_assistant_error"],
-        triple["diag_api_status"],
-    )
-
-
-def _typed(triple: Any) -> bool:  # T
-    _, a, s = _t(triple)
-    return a == "authentication_failed" or s == "401"
-
-
-def _gate_nr(triple: Any) -> bool:  # Q
-    return _t(triple)[0] in ("non_retryable", "mixed")
-
-
-def _transient(triple: Any) -> bool:  # X
-    _, a, s = _t(triple)
-    return a in ("rate_limit", "server_error") or s in ("429", "5xx")
-
-
-KEEP = ("invalid_key", "inconclusive")
-
-
-def _c(ao: Any, triple: Any, want: str) -> bool:
-    return ao == want and triple_state(triple) == "C"
-
-
-def _nr_plain(
-    ao: Any, triple: Any
-) -> bool:  # AO=inconclusive, C, R=non_retryable, not T, S!=404, not X
-    return (
-        _c(ao, triple, "inconclusive")
-        and _t(triple)[0] == "non_retryable"
-        and not _typed(triple)
-        and _t(triple)[2] != "404"
-        and not _transient(triple)
-    )
-
-
-def _r(t: Any) -> str:
-    return _t(t)[0]
-
-
-def _a(t: Any) -> str:
-    return _t(t)[1]
-
-
-def _s(t: Any) -> str:
-    return _t(t)[2]
-
-
-def _row_1(ao: Any, t: Any) -> bool:
-    return _c(ao, t, "inconclusive") and _r(t) == "retryable" and not _typed(t)
-
-
-def _row_2(ao: Any, t: Any) -> bool:
-    return _c(ao, t, "invalid_key") and _gate_nr(t) and _typed(t)
-
-
-def _row_3(ao: Any, t: Any) -> bool:
-    return _nr_plain(ao, t) and (
-        _s(t) in ("403", "other_4xx") or _a(t) in ("billing_error", "invalid_request")
-    )
-
-
-def _row_4a(ao: Any, t: Any) -> bool:
-    return (
-        _nr_plain(ao, t)
-        and _s(t) in ("absent", "other")
-        and _a(t) in ("unknown", "other", "absent")
-    )
-
-
-def _row_4b(ao: Any, t: Any) -> bool:
-    return _c(ao, t, "inconclusive") and _r(t) == "absent" and not _typed(t)
-
-
-def _row_5a(ao: Any, t: Any) -> bool:
-    return _c(ao, t, "inconclusive") and _r(t) == "retryable" and _typed(t)
-
-
-def _row_5b(ao: Any, t: Any) -> bool:
-    return _c(ao, t, "inconclusive") and _r(t) == "absent" and _typed(t)
-
-
-def _row_5c(ao: Any, t: Any) -> bool:
-    return _c(ao, t, "inconclusive") and _r(t) == "mixed" and not _typed(t) and _s(t) != "404"
-
-
-def _row_5d(ao: Any, t: Any) -> bool:
-    return (
-        _c(ao, t, "inconclusive")
-        and _r(t) == "non_retryable"
-        and not _typed(t)
-        and _s(t) != "404"
-        and _transient(t)
-    )
-
-
-def _row_6a(ao: Any, t: Any) -> bool:
-    return _c(ao, t, "invalid_key") and not (_gate_nr(t) and _typed(t))
-
-
-def _row_6b(ao: Any, t: Any) -> bool:
-    return _c(ao, t, "inconclusive") and _gate_nr(t) and _typed(t)
-
-
-def _row_6c(ao: Any, t: Any) -> bool:
-    return _c(ao, t, "inconclusive") and _gate_nr(t) and not _typed(t) and _s(t) == "404"
-
-
-def _row_7a(ao: Any, t: Any) -> bool:
-    return ao not in KEEP
-
-
-def _row_7b(ao: Any, t: Any) -> bool:
-    return ao in KEEP and triple_state(t) == "U"
-
-
-def _row_7c(ao: Any, t: Any) -> bool:
-    return ao in KEEP and triple_state(t) == "O"
-
-
-def _row_7d(ao: Any, t: Any) -> bool:
-    return ao in KEEP and triple_state(t) == "M"
-
-
-ENV_INVESTIGATION = "environment_investigation"
-HARNESS_INVESTIGATION = "harness_investigation"
-HARNESS_DEFECT = "harness_defect_review"
-NO_READING = "no_diagnostic_reading"
-_P3 = (
-    'AO = inconclusive ∧ C ∧ R = non_retryable ∧ ¬T ∧ S ≠ "404" ∧ ¬X ∧ '
-    '(S ∈ {"403", other_4xx} ∨ A ∈ {billing_error, invalid_request})'
-)
-_P4A = (
-    'AO = inconclusive ∧ C ∧ R = non_retryable ∧ ¬T ∧ S ≠ "404" ∧ ¬X ∧ '
-    "S ∈ {absent, other} ∧ A ∈ {unknown, other, absent}"
-)
-
-# (id, predicate text, predicate, next-action token): written here, not derived from production.
-L3_INTERPRETATION_ROWS: list[tuple[str, str, Callable[[Any, Any], bool], str]] = [
-    ("1", "AO = inconclusive ∧ C ∧ R = retryable ∧ ¬T", _row_1, ENV_INVESTIGATION),
-    ("2", "AO = invalid_key ∧ C ∧ Q ∧ T", _row_2, "read_failing_case"),
-    ("3", _P3, _row_3, ENV_INVESTIGATION),
-    ("4a", _P4A, _row_4a, HARNESS_INVESTIGATION),
-    ("4b", "AO = inconclusive ∧ C ∧ R = absent ∧ ¬T", _row_4b, ENV_INVESTIGATION),
-    ("5a", "AO = inconclusive ∧ C ∧ R = retryable ∧ T", _row_5a, "product_investigation_offline"),
-    ("5b", "AO = inconclusive ∧ C ∧ R = absent ∧ T", _row_5b, HARNESS_INVESTIGATION),
+RETIRED_RECORDS = [
+    ("an L3 per-case record", lambda p: p["cases"].append(case_fields("L3", "ok"))),
+    ("an L2 per-case record", lambda p: p["cases"].append(case_fields("L2", "ok"))),
     (
-        "5c",
-        'AO = inconclusive ∧ C ∧ R = mixed ∧ ¬T ∧ S ≠ "404"',
-        _row_5c,
-        HARNESS_INVESTIGATION,
+        "a retired not_executed entry",
+        lambda p: p.update(
+            cases=[case_fields("L0", "case_failed")],
+            run=run_fields(
+                primary_failure="L0:case_failed:HarnessFailure",
+                not_executed="L1:not_executed_after_l0_failure,L3:not_executed_after_l0_failure",
+            ),
+            g4=(0, "pass", "false"),
+        ),
     ),
     (
-        "5d",
-        'AO = inconclusive ∧ C ∧ R = non_retryable ∧ ¬T ∧ S ≠ "404" ∧ X',
-        _row_5d,
-        HARNESS_INVESTIGATION,
+        "a retired primary_failure prefix",
+        lambda p: p.update(
+            run=run_fields(primary_failure="L3:inconclusive:ProviderError"), g4=(0, "pass", "false")
+        ),
     ),
-    ("6a", "AO = invalid_key ∧ C ∧ ¬(Q ∧ T)", _row_6a, HARNESS_DEFECT),
-    ("6b", "AO = inconclusive ∧ C ∧ Q ∧ T", _row_6b, HARNESS_DEFECT),
-    ("6c", 'AO = inconclusive ∧ C ∧ Q ∧ ¬T ∧ S = "404"', _row_6c, HARNESS_DEFECT),
-    ("7a", "AO ∉ K", _row_7a, NO_READING),
-    ("7b", "AO ∈ K ∧ U", _row_7b, HARNESS_INVESTIGATION),
-    ("7c", "AO ∈ K ∧ O", _row_7c, NO_READING),
-    ("7d", "AO ∈ K ∧ M", _row_7d, HARNESS_DEFECT),
 ]
 
-ROW_IDS = [row[0] for row in L3_INTERPRETATION_ROWS]
+
+class TestOfficialContractBindings:
+    """H60: one mutation per binding, the retired names and values, the quota validators."""
+
+    def test_the_valid_capture_is_official(self) -> None:
+        assert classify(official_parts(), 0) == ("official", "ok")
+
+    @pytest.mark.parametrize(("name", "mutate"), RETIRED_RECORDS)
+    def test_a_retired_case_name_is_discarded_for_every_status(
+        self, name: str, mutate: Callable[[dict[str, Any]], None]
+    ) -> None:
+        parts = official_parts()
+        mutate(parts)
+        for status in (0, 1, 2, 3):
+            verdict = classify(parts, status)
+            assert verdict[0] == "discard" and verdict[1] in lm.REASON_CODES, (
+                name,
+                status,
+                verdict,
+            )
+
+    def test_retired_lines_are_line_outside_grammar(self) -> None:
+        for extra in (["evidence_fallback_failed: L3"], ["evidence_fallback_failed: L2"]):
+            parts = edited(official_parts, extra_section=extra)
+            assert classify(parts, 1) == ("discard", "line_outside_grammar")
+        listing = "cases: L0:ok,L3:ok; first_failure: L3:ok:none"
+        assert classify(edited(official_parts, tail=[listing]), 1) == (
+            "discard",
+            "line_outside_grammar",
+        )
+
+    @pytest.mark.parametrize(
+        "key",
+        ["canary_scan", "diag_provider_retryability", "diag_assistant_error", "diag_api_status"],
+    )
+    def test_a_retired_key_on_any_record_is_invalid(self, key: str) -> None:
+        for where in ("L0", "L1"):
+            parts = official_parts()
+            next(c for c in parts["cases"] if c["case"] == where)[key] = "x"
+            assert classify(parts, 0) == ("discard", "evidence_record_invalid")
+        parts = official_parts()
+        parts["run"][key] = "x"
+        assert classify(parts, 0) == ("discard", "evidence_record_invalid")
+
+    @pytest.mark.parametrize("value", sorted(RETIRED_VALUES - {"canary_scan"}))
+    def test_a_retired_outcome_value_is_invalid_in_a_record(self, value: str) -> None:
+        parts = official_parts()
+        parts["cases"][1]["outcome"] = parts["cases"][1]["adapter_outcome"] = value
+        parts["g4"] = (0, "pass", "false")
+        assert classify(parts, 1) == ("discard", "evidence_record_invalid")
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            "not_logged_in",
+            "inconclusive",
+            "output_missing",
+            "billing_not_subscription",
+            "billing_aggregate_mismatch",
+            "billing_label_missing",
+            "unpriced_model_label_unexercised",
+            "effective_model_missing",
+        ],
+    )
+    def test_each_other_l1_outcome_is_never_official(self, outcome: str) -> None:
+        for case in ("L0", "L1"):
+            parts = official_parts()
+            record = next(c for c in parts["cases"] if c["case"] == case)
+            record["outcome"] = record["adapter_outcome"] = outcome
+            assert classify(parts, 0) == ("discard", "evidence_inconsistent")
+            parts["g4"] = (0, "pass", "false")
+            assert classify(parts, 0)[0] != "official"
+
+    def test_a_readiness_only_capture_stays_readiness_only(self) -> None:
+        assert classify(readiness_parts(), 0) == ("readiness_only", "ok")
+
+    @pytest.mark.parametrize("status", [0, 1, 2, 3])
+    @pytest.mark.parametrize(
+        ("name", "parts_fn"),
+        [
+            ("official ceiling 0", lambda: edited(official_parts, run=run_fields(quota_ceiling=0))),
+            ("official ceiling 2", lambda: edited(official_parts, run=run_fields(quota_ceiling=2))),
+            ("official ceiling 3", lambda: edited(official_parts, run=run_fields(quota_ceiling=3))),
+            (
+                "readiness ceiling 3",
+                lambda: edited(
+                    readiness_parts, run=run_fields(quota_attempts_total=0, quota_ceiling=3)
+                ),
+            ),
+            ("failure ceiling 3", lambda: failing_readiness_with(quota_ceiling=3)),
+            (
+                "official total 2",
+                lambda: edited(official_parts, run=run_fields(quota_attempts_total=2)),
+            ),
+            (
+                "readiness total -1",
+                lambda: edited(readiness_parts, run=run_fields(quota_attempts_total=-1)),
+            ),
+        ],
+    )
+    def test_the_quota_validators_discard_as_record_invalid(
+        self, name: str, parts_fn: Callable[[], dict[str, Any]], status: int
+    ) -> None:
+        assert classify(parts_fn(), status) == ("discard", "evidence_record_invalid"), name
+
+    def test_the_attempt_flags_and_the_total_agree(self) -> None:
+        l0_true = edited(
+            official_parts,
+            cases=[case_fields("L0", attempted_quota_execution=True), official_cases()[1]],
+        )
+        assert classify(l0_true, 0) == ("discard", "evidence_inconsistent")
+        l1_true_total_zero = edited(official_parts, run=run_fields(quota_attempts_total=0))
+        assert classify(l1_true_total_zero, 0) == ("discard", "evidence_inconsistent")
+        for parts in (
+            edited(
+                official_parts,
+                session=None,
+                cases=[],
+                run=run_fields(
+                    primary_failure="session:prereq_cli_missing:HarnessFailure",
+                    not_executed="L0:not_executed_after_safety_failure,L1:not_executed_after_safety_failure",
+                ),
+                g4=(0, "pass", "false"),
+            ),
+            edited(readiness_parts, run=run_fields(quota_attempts_total=1)),
+        ):  # a total of 1 in shape P or R
+            assert classify(parts, 1) == ("discard", "evidence_inconsistent")
+        ready = classify(edited(readiness_parts), 0)
+        assert ready == ("readiness_only", "ok")
+        fallback_l1 = edited(
+            official_parts,
+            cases=[case_fields("L0"), FALLBACK_L1_RECORD],
+            run=run_fields(primary_failure="L1:interrupted:KeyboardInterrupt"),
+            g4=(0, "pass", "false"),
+            interrupt=True,
+            count="no tests ran in 0.14s",
+        )
+        assert classify(fallback_l1, 2) == (
+            "failure_record",
+            "ok",
+        )  # no key, never discarded for it
+
+    def test_an_l0_fallback_record_omits_the_key_and_is_not_an_attempt(self) -> None:
+        official_path = edited(
+            official_parts,
+            cases=[FALLBACK_L0_RECORD],
+            run=run_fields(
+                quota_attempts_total=0,
+                primary_failure="L0:interrupted:KeyboardInterrupt",
+                not_executed="L1:not_executed_after_interrupt",
+            ),
+            g4=(0, "pass", "false"),
+            interrupt=True,
+            count="no tests ran in 0.14s",
+        )
+        assert classify(official_path, 2) == ("failure_record", "ok")
+        readiness = edited(
+            readiness_parts,
+            cases=[FALLBACK_L0_RECORD],
+            run=run_fields(
+                quota_attempts_total=0, primary_failure="L0:interrupted:KeyboardInterrupt"
+            ),
+            interrupt=True,
+            count="no tests ran in 0.14s",
+        )
+        assert classify(readiness, 2) == ("failure_record", "ok")  # never readiness_only
+        counted = edited(
+            official_path,
+            run=run_fields(
+                quota_attempts_total=1,
+                primary_failure="L0:interrupted:KeyboardInterrupt",
+                not_executed="L1:not_executed_after_interrupt",
+            ),
+        )
+        assert classify(counted, 2) == (
+            "discard",
+            "evidence_inconsistent",
+        )  # omission is no attempt
+        flagged = edited(
+            official_path, cases=[{**FALLBACK_L0_RECORD, "attempted_quota_execution": True}]
+        )
+        assert classify(flagged, 2) == ("discard", "evidence_inconsistent")
+
+    def test_g6_l1_fallback_marker_is_discarded(self) -> None:
+        base = {
+            "session": session_fields(),
+            "cases": [case_fields("L0")],
+            "g4": (0, "pass", "false"),
+            "count": "no tests ran in 0.14s",
+            "interrupt": True,
+            "pre": [".", ""],
+            "extra_section": ["evidence_fallback_failed: L1"],
+            "tail": [],
+        }
+        runs = {
+            "total 1": (
+                run_fields(primary_failure="L1:interrupted:KeyboardInterrupt"),
+                "evidence_inconsistent",
+            ),
+            "none": (None, "run_record_missing"),
+            "total 0": (
+                run_fields(
+                    quota_attempts_total=0, primary_failure="L1:interrupted:KeyboardInterrupt"
+                ),
+                "evidence_inconsistent",
+            ),
+        }
+        for name, (run, code) in runs.items():
+            parts = {**base, "run": run}
+            for status in (0, 1, 2, 3):
+                verdict = classify(parts, status)
+                assert verdict[0] == "discard", (name, status, verdict)
+                if status in (1, 2, 3):
+                    assert verdict == ("discard", code), (name, status, verdict)
 
 
-def oracle_rows(adapter_outcome: object, triple: object) -> list[str]:
-    """Every row whose own predicate holds (a count, never an ``if``/``elif`` ladder)."""
-    return [row[0] for row in L3_INTERPRETATION_ROWS if row[2](adapter_outcome, triple)]
+FALLBACK_L0_RECORD = {
+    "case": "L0",
+    "outcome": "interrupted",
+    "adapter_outcome": "interrupted",
+    "interrupted": "keyboard_interrupt",
+    "exception_class": "KeyboardInterrupt",
+    "cleanup_failed": ["evidence"],
+    "secondary_findings": [],
+    "descendants": "no_descendants_remaining",
+}
+FALLBACK_L1_RECORD = {**FALLBACK_L0_RECORD, "case": "L1"}
 
 
-def triple_states() -> list[dict[str, Any] | None]:
-    states: list[dict[str, Any] | None] = [
-        dict(zip(O_KEYS, combo, strict=True))
-        for combo in itertools.product(*(sorted(s) for s in (OR_SET, OA_SET, OS_SET)))
+def failing_readiness_with(**run: Any) -> dict[str, Any]:
+    return edited(
+        readiness_parts,
+        cases=[case_fields("L0", "not_logged_in")],
+        run=run_fields(
+            primary_failure="L0:not_logged_in:HarnessFailure", quota_attempts_total=0, **run
+        ),
+    )
+
+
+# ============================================================================
+# H61: no retroactive acceptance (revision 15, D34)
+# ============================================================================
+
+
+def historical_capture(
+    *,
+    ceiling: int = 3,
+    total: int = 2,
+    with_l3: bool = True,
+    triple: bool = False,
+    official_claim: bool = False,
+    readiness_canary: str | None = None,
+) -> str:
+    """A capture fabricated from the categorical shape of a retained record only."""
+    cases = [case_fields("L0", "ok"), case_fields("L1", "ok", attempted_quota_execution=True)]
+    run = run_fields(quota_attempts_total=total, quota_ceiling=ceiling)
+    if with_l3:
+        l3 = case_fields(
+            "L3", "inconclusive", attempted_quota_execution=True, exception_class="ProviderError"
+        )
+        if triple:
+            l3.update(
+                diag_provider_retryability="non_retryable",
+                diag_assistant_error="absent",
+                diag_api_status="absent",
+            )
+        cases += [l3, case_fields("L2", "not_executed_l3_inconclusive")]
+        run["primary_failure"] = "L3:inconclusive:ProviderError"
+        run["not_executed"] = "L2:not_executed_l3_inconclusive"
+    if official_claim:
+        run.pop("primary_failure", None)
+        run.pop("not_executed", None)
+    parts = {
+        "session": session_fields(),
+        "cases": cases,
+        "run": run,
+        "g4": (0, "pass", "true" if official_claim else "false"),
+        "count": "1 failed in 5.00s",
+        "interrupt": False,
+        "pre": ["."],
+        "extra_section": [],
+        "tail": [],
+    }
+    if readiness_canary is not None:
+        parts = {
+            "session": None,
+            "cases": [
+                case_fields(
+                    "L0",
+                    "ok",
+                    **(
+                        {"canary_scan": ["stdout_stderr:clean"]}
+                        if readiness_canary == "present"
+                        else {}
+                    ),
+                )
+            ],
+            "run": run_fields(
+                quota_attempts_total=0 if readiness_canary != "total3" else 3, quota_ceiling=3
+            ),
+            "g4": (0, "pass", "false"),
+            "count": "1 passed in 1.00s",
+            "interrupt": False,
+            "pre": ["."],
+            "extra_section": [],
+            "tail": [],
+        }
+    return build_capture(parts)
+
+
+class TestNoRetroactiveAcceptance:
+    """H61: fabricated shapes only; the retained files are never read, copied or classified."""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},  # (a) the first official record
+            {"triple": True},  # (b) the second
+            {"with_l3": False},  # (c)/(d) every L3 and L2 line deleted, the run-level kept
+            {"with_l3": False, "triple": True},
+            {"with_l3": False, "official_claim": True},  # (e)/(f) rewritten to claim success
+            {"official_claim": True, "triple": True},
+            {"readiness_canary": "present"},  # (h) the readiness-only record
+            {"readiness_canary": "deleted"},  # (i)
+            {"readiness_canary": "total3"},  # (j)
+        ],
+        ids=["a", "b", "c", "d", "e", "f", "h", "i", "j"],
+    )
+    @pytest.mark.parametrize("status", [0, 1, 2, 3])
+    def test_a_historical_shape_is_never_official_or_readiness_only(
+        self, kwargs: dict[str, Any], status: int
+    ) -> None:
+        verdict = lm.classify_capture(historical_capture(**kwargs), status)
+        assert verdict[0] == "discard", verdict
+        assert verdict[1] in {"evidence_record_invalid", "evidence_inconsistent"}
+
+    def test_the_pinned_codes(self) -> None:
+        assert lm.classify_capture(historical_capture(), 1) == (
+            "discard",
+            "evidence_record_invalid",
+        )
+        assert lm.classify_capture(historical_capture(readiness_canary="present"), 0) == (
+            "discard",
+            "evidence_record_invalid",
+        )
+        assert lm.classify_capture(historical_capture(readiness_canary="total3"), 0) == (
+            "discard",
+            "evidence_record_invalid",
+        )
+
+    @needs_bash
+    def test_the_pre_gate_refuses_an_existing_path(self, gate: GateRunner) -> None:
+        gate.evidence.write_bytes(b"fabricated stand-in bytes\n")
+        before = (gate.evidence.read_bytes(), gate.evidence.stat().st_mtime_ns)
+        result = gate.run(BASH)
+        assert result.returncode != 0
+        assert result.ran is False  # the pytest stand-in never ran
+        assert (gate.evidence.read_bytes(), gate.evidence.stat().st_mtime_ns) == before
+
+    def test_no_legacy_acceptance_branch(self) -> None:
+        tree = module_ast()
+        functions = module_level_functions(tree)
+        constants = {
+            n.value
+            for name in ("classify_capture", "_classify", "_check_shape", "_check_quota")
+            for n in ast.walk(functions[name])
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+        }
+        assert not constants & {"L3", "L2", "canary_scan"}
+        assert not any(c.startswith("diag_") for c in constants)
+        assert len(lm.REASON_CODES) == 20 == len(set(lm.REASON_CODES))
+
+    def test_the_documents_state_the_retained_records_are_never_promoted(self) -> None:
+        for text in (RUNBOOK_PATH.read_text(), lm.__doc__ or ""):
+            flat = normalized(text)
+            assert "never reclassified" in flat
+            assert (
+                "never passed to the classifier or the shell gate" in flat
+                or "never passed to the classifier or the shell gate (whose" in flat
+            )
+            assert "never promoted" in flat
+        assert "calls any of them a pass or a partial pass" in normalized(RUNBOOK_PATH.read_text())
+
+
+# ============================================================================
+# H62: claims and documentation (revision 15, section 3, D31)
+# ============================================================================
+
+EXPERIMENTAL_PATH = REPO_ROOT / "docs" / "providers" / "experimental.md"
+EXAMPLE_FILE = REPO_ROOT / "examples" / "claude-agent-sdk-subscription.yaml"
+CHANGELOG_FRAGMENT = (
+    REPO_ROOT / "changelog.d" / "+claude-agent-sdk-subscription-validation.added.md"
+)
+POST_EVIDENCE_CLAUSE = (
+    "This detection relies on CLI-reported `apiProvider` / `subscriptionType` evidence; one "
+    "official live validation (readiness, then one subscription inference) has confirmed the "
+    "`subscription` result for one plan on one host;"
+)
+CLAIM_PHRASES = (
+    "fake key was rejected",
+    "rejects an invalid key",
+    "honors the API key",
+    "honours the API key",
+    "precedence is proven",
+    "L2 proves",
+    "live blanking",
+)
+APPROVAL_SENTENCE = (
+    "Each official live validation needs a fresh, explicit human approval that names the exact "
+    "tested commit, with the human present."
+)
+NOTHING_PUSHED_SENTENCE = (
+    "After a failure record or a discarded capture, nothing is pushed and no documentation "
+    "commit is made."
+)
+PRECEDENCE_SENTENCE = "Auto-mode credential precedence is unproven and out of scope."
+
+
+def status_table_rows(text: str) -> list[list[str]]:
+    """The rows of the first table after the ``## Status table`` heading."""
+    after = text.split("## Status table", 1)[1]
+    rows: list[list[str]] = []
+    for line in after.splitlines():
+        if line.startswith("|"):
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            rows.append(cells)
+        elif rows:
+            break
+    return rows[2:]  # the header and the separator are not rows
+
+
+def user_facing_texts() -> dict[str, str]:
+    return {
+        "runbook": RUNBOOK_PATH.read_text(),
+        "experimental": EXPERIMENTAL_PATH.read_text(),
+        "example": EXAMPLE_FILE.read_text(),
+        "changelog": CHANGELOG_FRAGMENT.read_text(),
+        "docstring": lm.__doc__ or "",
+    }
+
+
+class TestClaimsAndDocs:
+    """H62: the four claims and nothing stronger, in every user-facing file."""
+
+    def test_the_runbook_states_the_four_claims_and_the_literal_sentence(self) -> None:
+        flat = normalized(RUNBOOK_PATH.read_text())
+        assert normalized(PRECEDENCE_SENTENCE) in flat
+        for claim in (
+            "readiness reports a usable first-party subscription login",
+            "one real inference completes through the subscription path",
+            "neutralizes competing API-key variables",
+            "an offline property proven by the production provider's tests",
+        ):
+            assert claim in flat, claim
+
+    def test_the_status_table_reads_as_the_design_says(self) -> None:
+        rows = {r[0]: r for r in status_table_rows(RUNBOOK_PATH.read_text())}
+        assert rows["`auto` + API key ⇒ `metered_api`"][3] == "out of scope"
+        assert "unproven" in rows["`auto` + API key ⇒ `metered_api`"][4]
+        assert rows["`auth_mode` resolution and env blanking"][3].startswith("not applicable")
+        assert "Live harness (L0, L1)" in rows
+
+    @pytest.mark.parametrize(
+        "name", ["runbook", "experimental", "example", "changelog", "docstring"]
+    )
+    def test_no_file_claims_precedence_or_a_live_neutralization_proof(self, name: str) -> None:
+        flat = normalized(user_facing_texts()[name]).lower()
+        for phrase in CLAIM_PHRASES:
+            assert phrase.lower() not in flat, (name, phrase)
+
+    @pytest.mark.parametrize("name", ["runbook", "experimental", "example", "changelog"])
+    def test_no_user_facing_file_uses_the_retired_names(self, name: str) -> None:
+        text = user_facing_texts()[name]
+        for token in (r"\bL3\b", r"\bL2\b", "invalid_key", "canary"):
+            assert not re.search(token, text), (name, token)
+
+    def test_experimental_md_holds_exactly_one_of_the_two_clauses(self) -> None:
+        flat = normalized(EXPERIMENTAL_PATH.read_text())
+        pre = normalized(EXPERIMENTAL_VALIDATION_CLAUSE) in flat
+        post = normalized(POST_EVIDENCE_CLAUSE) in flat
+        assert pre != post  # exactly one
+
+    def test_the_runbook_contains_the_literal_approval_sentence(self) -> None:
+        flat = normalized(RUNBOOK_PATH.read_text())
+        assert normalized(APPROVAL_SENTENCE) in flat
+        for fragment in (
+            "repeating the readiness-only check",
+            "neither required nor authorized",
+            "covers one readiness-plus-inference session only",
+            "nothing is retried automatically",
+        ):
+            assert fragment in flat or fragment.capitalize() in flat, fragment
+
+    def test_the_runbook_procedure_wording(self) -> None:
+        text = RUNBOOK_PATH.read_text()
+        flat = normalized(text)
+        assert normalized(NOTHING_PUSHED_SENTENCE) in flat
+        assert "After a failure record, nothing is pushed" not in flat  # the revision-17 form
+        assert "same clean commit" not in flat
+        for block in re.findall(r"```(?:bash)?\n(.*?)```", text, flags=re.DOTALL) + re.findall(
+            r"`([^`\n]+)`", text
+        ):
+            assert not re.search(r"git (merge|rebase|pull)\b", block), block
+        for sentence in re.split(r"(?<=[.!?])\s+", flat):
+            if "git ls-remote upstream main" in sentence:
+                assert "informational" in sentence
+        assert "independently reviewed" in flat or "independent reviewer" in flat
+        assert "full SHA" in flat
+
+
+# ============================================================================
+# H63: the runbook decision table matches the classifier oracle (revision 15)
+# ============================================================================
+
+ACCEPTED_PAIRS = {(0, "official"), (0, "readiness_only"), (3, "failure_record")}
+
+
+@dataclasses.dataclass(frozen=True)
+class OutcomeContext:
+    status: int
+    verdict: str
+    interrupted: bool  # I: some per-case record has interrupted other than none
+    prefix: str  # P: session, L0, L1 or none
+
+
+def _failure(
+    status: int, verdict: str, ctx: OutcomeContext, prefix: str, interrupted: bool
+) -> bool:
+    return (
+        ctx.status == status
+        and ctx.verdict == verdict
+        and ctx.interrupted is interrupted
+        and ctx.prefix == prefix
+    )
+
+
+OFFICIAL_OUTCOME_ROWS: list[tuple[str, str, Callable[[OutcomeContext], bool], str]] = [
+    (
+        "V1",
+        "`CLASSIFY_STATUS = 0 ∧ VERDICT = official`",
+        lambda c: (c.status, c.verdict) == (0, "official"),
+        "human_review",
+    ),
+    (
+        "V2",
+        "`CLASSIFY_STATUS = 0 ∧ VERDICT = readiness_only`",
+        lambda c: (c.status, c.verdict) == (0, "readiness_only"),
+        "human_review",
+    ),
+    (
+        "V3",
+        "`CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ I`",
+        lambda c: (c.status, c.verdict) == (3, "failure_record") and c.interrupted,
+        "operator_review",
+    ),
+    (
+        "V4",
+        "`CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ ¬I ∧ P = session`",
+        lambda c: (c.status, c.verdict) == (3, "failure_record")
+        and not c.interrupted
+        and c.prefix == "session",
+        "prerequisite_investigation",
+    ),
+    (
+        "V5",
+        "`CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ ¬I ∧ P = L0`",
+        lambda c: (c.status, c.verdict) == (3, "failure_record")
+        and not c.interrupted
+        and c.prefix == "L0",
+        "login_investigation",
+    ),
+    (
+        "V6",
+        "`CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ ¬I ∧ P = L1`",
+        lambda c: (c.status, c.verdict) == (3, "failure_record")
+        and not c.interrupted
+        and c.prefix == "L1",
+        "inference_investigation",
+    ),
+    (
+        "V7",
+        "`CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ ¬I ∧ P = none`",
+        lambda c: (c.status, c.verdict) == (3, "failure_record")
+        and not c.interrupted
+        and c.prefix == "none",
+        "not_official_no_case_failure",
+    ),
+    (
+        "V8",
+        "any other combination of `CLASSIFY_STATUS` and `VERDICT` (every `discard <code>`, an "
+        "unexpected token, a classifier that failed to start)",
+        lambda c: (c.status, c.verdict) not in ACCEPTED_PAIRS,
+        "delete_and_stop",
+    ),
+]
+
+
+def outcome_context(text: str, pipeline_status: int) -> OutcomeContext:
+    """The classifier result and the records of a capture, as the oracle reads them."""
+    verdict, code = lm.classify_capture(text, pipeline_status)
+    token = verdict if verdict != "discard" else f"discard {code}"
+    status = lm.VERDICT_EXIT_STATUS[verdict]
+    records = [
+        json.loads(line[len("EVIDENCE ") :])
+        for line in text.splitlines()
+        if line.startswith("EVIDENCE ")
     ]
-    states.append(None)  # omitted
-    for key in O_KEYS:  # a non-member in each key
-        states.append({**QUALIFYING_TRIPLE, key: "bogus"})
-        states.append({k: v for k, v in QUALIFYING_TRIPLE.items() if k != key})  # a missing key
-    states.append({**QUALIFYING_TRIPLE, "extra": "x"})
-    return states
+    interrupted = any(
+        r.get("interrupted", "none") != "none" for r in records if r.get("case") in {"L0", "L1"}
+    )
+    prefix = "none"
+    for r in records:
+        if "case" not in r and r.get("primary_failure"):
+            prefix = r["primary_failure"].split(":")[0]
+    return OutcomeContext(status, token, interrupted, prefix)
 
 
-def oracle_of_record(record: Mapping[str, object], *, key: str = "adapter_outcome") -> list[str]:
-    triple = triple_of(record)
-    return oracle_rows(record.get(key), triple if triple else None)
+def oracle_rows(ctx: OutcomeContext) -> list[str]:
+    return [row_id for row_id, _text, predicate, _token in OFFICIAL_OUTCOME_ROWS if predicate(ctx)]
+
+
+def decision_captures() -> dict[str, tuple[str, int]]:
+    interrupted = edited(
+        readiness_parts,
+        cases=[case_fields("L0", "interrupted", interrupted="keyboard_interrupt")],
+        run=run_fields(quota_attempts_total=0, primary_failure="L0:interrupted:KeyboardInterrupt"),
+        interrupt=True,
+        count="no tests ran in 0.14s",
+    )
+    l1_failed = edited(
+        official_parts,
+        cases=[
+            case_fields("L0"),
+            case_fields("L1", "billing_label_missing", attempted_quota_execution=True),
+        ],
+        run=run_fields(primary_failure="L1:billing_label_missing:HarnessFailure"),
+        g4=(0, "pass", "false"),
+        count="1 failed in 5.00s",
+    )
+    l0_failed = edited(
+        official_parts,
+        cases=[case_fields("L0", "not_logged_in")],
+        run=run_fields(
+            quota_attempts_total=0,
+            primary_failure="L0:not_logged_in:HarnessFailure",
+            not_executed="L1:not_executed_after_l0_failure",
+        ),
+        g4=(0, "pass", "false"),
+        count="1 failed in 5.00s",
+    )
+    session_failed = edited(
+        official_parts,
+        session=None,
+        cases=[],
+        run=run_fields(
+            quota_attempts_total=0,
+            primary_failure="session:prereq_cli_missing:HarnessFailure",
+            not_executed="L0:not_executed_after_safety_failure,L1:not_executed_after_safety_failure",
+        ),
+        g4=(0, "pass", "false"),
+        count="1 failed in 5.00s",
+    )
+    zero_skip = edited(
+        official_parts, g4=(1, "fail", "false"), count="1 passed, 1 skipped in 1.00s"
+    )
+    dirty = edited(
+        official_parts,
+        session=session_fields(git_dirty=True),
+        g4=(0, "pass", "false"),
+        count="1 passed in 1.00s",
+    )
+    g6 = {
+        **official_parts(),
+        "cases": [case_fields("L0")],
+        "run": run_fields(primary_failure="L1:interrupted:KeyboardInterrupt"),
+        "g4": (0, "pass", "false"),
+        "interrupt": True,
+        "extra_section": ["evidence_fallback_failed: L1"],
+        "count": "no tests ran in 0.14s",
+    }
+    l0_fallback = edited(
+        official_parts,
+        cases=[FALLBACK_L0_RECORD],
+        run=run_fields(
+            quota_attempts_total=0,
+            primary_failure="L0:interrupted:KeyboardInterrupt",
+            not_executed="L1:not_executed_after_interrupt",
+        ),
+        g4=(0, "pass", "false"),
+        interrupt=True,
+        count="no tests ran in 0.14s",
+    )
+    return {
+        "official": (build_capture(official_parts()), 0),
+        "readiness": (build_capture(readiness_parts()), 0),
+        "interrupted": (build_capture(interrupted), 2),
+        "session": (build_capture(session_failed), 1),
+        "l0": (build_capture(l0_failed), 1),
+        "l1": (build_capture(l1_failed), 1),
+        "zero_skip": (build_capture(zero_skip), 1),
+        "dirty": (build_capture(dirty), 0),
+        "g6": (build_capture(g6), 2),
+        "l0_fallback": (build_capture(l0_fallback), 2),
+        "discard": ("not a capture\n", 1),
+        "bad_status": (build_capture(official_parts()), 1),
+    }
 
 
 class TestDecisionTableOracle:
-    """H58: total, disjoint, keyed on ``adapter_outcome`` and pinned to the runbook."""
+    """H63: a literal oracle, total and disjoint, pinned to the runbook."""
 
-    def test_the_oracle_lists_the_sixteen_rows_and_the_six_tokens(self) -> None:
-        assert ROW_IDS == [
-            "1", "2", "3", "4a", "4b", "5a", "5b", "5c", "5d",
-            "6a", "6b", "6c", "7a", "7b", "7c", "7d",
-        ]  # fmt: skip
-        assert {row[3] for row in L3_INTERPRETATION_ROWS} == {
-            "environment_investigation",
+    EXPECTED = {
+        "official": "V1",
+        "readiness": "V2",
+        "interrupted": "V3",
+        "session": "V4",
+        "l0": "V5",
+        "l1": "V6",
+        "zero_skip": "V7",
+        "dirty": "V7",
+        "g6": "V8",
+        "l0_fallback": "V3",
+        "discard": "V8",
+        "bad_status": "V8",
+    }
+
+    @pytest.mark.parametrize("name", sorted(EXPECTED))
+    def test_every_capture_selects_exactly_one_row(self, name: str) -> None:
+        text, status = decision_captures()[name]
+        ctx = outcome_context(text, status)
+        assert oracle_rows(ctx) == [self.EXPECTED[name]], (name, ctx)
+
+    def test_the_rows_are_total_and_disjoint_over_every_combination(self) -> None:
+        for status in range(0, 8):
+            for verdict in (
+                "official",
+                "readiness_only",
+                "failure_record",
+                "discard x",
+                "",
+                "other",
+            ):
+                for interrupted in (False, True):
+                    for prefix in ("session", "L0", "L1", "none"):
+                        ctx = OutcomeContext(status, verdict, interrupted, prefix)
+                        assert len(oracle_rows(ctx)) == 1, ctx
+
+    def test_the_runbook_reproduces_each_row_identifier_predicate_and_token_in_order(self) -> None:
+        text = RUNBOOK_PATH.read_text()
+        table = text.split("### Reading an official run", 1)[1]
+        rows = [
+            [c.strip() for c in line.strip().strip("|").split("|")]
+            for line in table.splitlines()
+            if re.match(r"\| \*\*V\d", line)
+        ]
+        assert len(rows) == len(OFFICIAL_OUTCOME_ROWS) == 8
+        for cells, (row_id, predicate_text, _fn, token) in zip(
+            rows, OFFICIAL_OUTCOME_ROWS, strict=True
+        ):
+            assert cells[0] == f"**{row_id}**"
+            assert cells[1] == predicate_text
+            assert cells[3] == f"`{token}`"
+        flat = normalized(text)
+        for retired in (
             "read_failing_case",
-            "harness_investigation",
-            "product_investigation_offline",
+            "not_official_dirty_tree",
+            "environment_investigation",
             "harness_defect_review",
-            "no_diagnostic_reading",
-        }
+        ):
+            assert retired not in flat
+        assert "no automatic retry" in flat
 
-    def test_every_state_matches_exactly_one_row(self) -> None:
-        outcomes: list[object] = [o.value for o in lm.Outcome] + [None]
-        states = triple_states()
-        assert len(states) >= 405 + 1 + 7
-        used: set[str] = set()
-        for outcome in outcomes:
-            for state in states:
-                rows = oracle_rows(outcome, state)
-                assert len(rows) == 1, (outcome, state, rows)
-                used.update(rows)
-        assert used == set(ROW_IDS)
-
-    def test_row_two_requires_invalid_key_and_the_row_five_family_requires_inconclusive(
-        self,
-    ) -> None:
-        for state in triple_states():
-            for outcome in [o.value for o in lm.Outcome]:
-                rows = oracle_rows(outcome, state)
-                if "2" in rows:
-                    assert outcome == "invalid_key"
-                if set(rows) & {"5a", "5b", "5c", "5d"}:
-                    assert outcome == "inconclusive"
-                assert not ({"2"} & set(rows) and set(rows) & {"5a", "5b", "5c", "5d"})
-
-    def test_the_named_cases_map_to_their_rows(self) -> None:
-        def row(ao: str | None, r: str, a: str, s: str) -> str:
-            (only,) = oracle_rows(ao, diag_triple(r, a, s))
-            return only
-
-        assert row("invalid_key", "mixed", "authentication_failed", "401") == "2"
-        assert row("inconclusive", "mixed", "authentication_failed", "401") == "6b"
-        assert row("inconclusive", "retryable", "absent", "401") == "5a"
-        assert row("invalid_key", "non_retryable", "rate_limit", "401") == "2"  # reduced to "401"
-        assert row("invalid_key", "non_retryable", "authentication_failed", "absent") == "2"
-        assert row("invalid_key", "non_retryable", "authentication_failed", "404") == "2"
-        assert row("inconclusive", "non_retryable", "absent", "404") == "6c"
-        assert row("model_unavailable", "non_retryable", "absent", "404") == "7a"
-        assert row("inconclusive", "absent", "authentication_failed", "absent") == "5b"
-        assert row("invalid_key", "absent", "authentication_failed", "absent") == "6a"
-        assert row("inconclusive", "non_retryable", "absent", "403") == "3"
-        assert row("inconclusive", "non_retryable", "absent", "absent") == "4a"
-        assert row("inconclusive", "absent", "absent", "absent") == "4b"
-        assert row("inconclusive", "mixed", "absent", "absent") == "5c"
-        assert row("inconclusive", "non_retryable", "absent", "5xx") == "5d"
-        assert row("inconclusive", "retryable", "rate_limit", "429") == "1"
-        assert oracle_rows("inconclusive", dict(lm.DIAG_UNAVAILABLE)) == ["7b"]
-        assert oracle_rows("inconclusive", None) == ["7c"]
-        assert oracle_rows(
-            "invalid_key", {**QUALIFYING_TRIPLE, "diag_api_status": "unavailable"}
-        ) == ["7d"]
-        assert oracle_rows("invalid_key", {"diag_api_status": "401"}) == ["7d"]
-        assert oracle_rows("invalid_key", {**QUALIFYING_TRIPLE, "diag_api_status": "bogus"}) == [
-            "7d"
-        ]
-        assert oracle_rows(None, None) == ["7a"]
-
-    def test_the_five_previously_uncovered_combinations_are_row_6c(self) -> None:
-        for assistant in ("billing_error", "invalid_request", "unknown", "other", "absent"):
-            assert oracle_rows("inconclusive", diag_triple("non_retryable", assistant, "404")) == [
-                "6c"
-            ]
-
-    def test_the_real_classification_reaches_only_the_designed_rows(self) -> None:
-        reached: dict[str, set[str]] = {}
-        for chain in retryability_scenarios().values():
-            for error in (None, *DIAG_ASSISTANT_VALUES):
-                for status in DIAG_STATUS_SAMPLES:
-                    observations = [
-                        message_obs(error=error if error != "other" else "zz", status=status)
-                    ]
-                    for events in ([], [COMPLETED]):
-                        outcome = lm.classify_l3(observations, chain, events)
-                        triple = lm.l3_diagnostics(observations, chain)
-                        (row,) = oracle_rows(outcome.value, triple)
-                        reached.setdefault(outcome.value, set()).add(row)
-        assert reached["invalid_key"] == {"2"}
-        assert reached["inconclusive"] <= {"1", "3", "4a", "4b", "5a", "5b", "5c", "5d"}
-        assert reached["inconclusive"] == {"1", "3", "4a", "4b", "5a", "5b", "5c", "5d"}
-        assert reached["model_unavailable"] == {"7a"} and reached["fell_back_to_login"] == {"7a"}
-        assert not {r for rows in reached.values() for r in rows} & {
-            "6a",
-            "6b",
-            "6c",
-            "7b",
-            "7c",
-            "7d",
-        }
-
-    # -- the runbook is the oracle -----------------------------------------------------------------
-
-    OMISSION_SENTENCE = (
-        "An omitted triple on a `failure_record` is **not itself proof** that classification was "
-        "never reached: it may be a pre-amendment capture; it remains non-authorizing, and an "
-        "`official` capture rejects omission (§5.8 item 9)."
-    )
-
-    @staticmethod
-    def _runbook_rows() -> list[str]:
-        return [
-            line
-            for line in RUNBOOK_PATH.read_text().splitlines()
-            if re.match(r"^\| \*\*(?:[1-7][a-d]?)\. ", line)
-        ]
-
-    def test_the_runbook_holds_every_row_exactly_as_the_oracle(self) -> None:
-        lines = self._runbook_rows()
-        ids = [re.match(r"^\| \*\*([1-7][a-d]?)\. ", line).group(1) for line in lines]  # type: ignore[union-attr]
-        assert ids == ROW_IDS  # the same set, in the oracle's order
-        for line, (row_id, predicate, _, token) in zip(lines, L3_INTERPRETATION_ROWS, strict=True):
-            assert f"`{predicate}`" in line, row_id
-            assert f"`{token}`" in line, row_id
-            assert line.index(f"`{predicate}`") < line.index(f"`{token}`")
-
-    def test_the_runbook_states_the_key_the_hedge_and_the_omission_sentence(self) -> None:
-        text = normalized(RUNBOOK_PATH.read_text())
-        assert "read on the record's **`adapter_outcome`**" in text
-        assert "**not** on `outcome`" in text
-        assert (
-            "for `mixed`, a qualifying non-retryable error existed **and** a retryable "
-            "`ProviderError` was also observed in the same chain"
-        ) in text
-        assert normalized(self.OMISSION_SENTENCE) in text
-        assert (
-            "Every row ends with the same rule: **no further run and no automatic retry**" in text
-        )
-
-    # -- keyed on adapter_outcome through real records (TA3) ---------------------------------------
-
-    @pytest.mark.parametrize("kind", ["canary_leak", "incomplete", "none"])
-    def test_the_oracle_gives_row_two_on_the_emitted_records(
-        self, monkeypatch: pytest.MonkeyPatch, kind: str
-    ) -> None:
-        out, returns = TestDiagnosticEmission._override_run(monkeypatch, kind)
-        record = out.case_record("L3")
-        assert returns == [O.INVALID_KEY]
-        assert oracle_of_record(record) == ["2"]
-        if kind == "none":
-            assert record["outcome"] == "invalid_key"
-            assert oracle_of_record(record, key="outcome") == ["2"]
-        else:
-            assert record["outcome"] != "invalid_key"
-            # an oracle that read ``outcome`` would give row 7a for the override cases
-            assert oracle_of_record(record, key="outcome") == ["7a"]
+    def test_the_g6_captures_select_v8_and_the_l0_fallback_selects_v3(self) -> None:
+        for name, row in (("g6", "V8"), ("l0_fallback", "V3")):
+            text, status = decision_captures()[name]
+            assert oracle_rows(outcome_context(text, status)) == [row]
 
 
 # ============================================================================
-# H53 (ix) and H57 (ix): end to end, Class R (real gate fixture, evidence plugin, real pipeline)
+# H64: fail-closed conditions on the two-case sequence (revision 15)
 # ============================================================================
 
 
 @needs_bash
-class TestDiagnosticEndToEnd:
-    """The real capture, the real classifier and the L3 diagnostic triple through fake adapters."""
+class TestFailClosedConditions:
+    """H64: Class R runs through the real fixture, session, wrapper and evidence plugin."""
 
-    @staticmethod
-    def _l3(out: RealRun) -> dict[str, Any]:
-        return next(r for r in out.cases if r["case"] == "L3")
-
-    @staticmethod
-    def _diag_keys(record: Mapping[str, Any]) -> dict[str, Any]:
-        return {k: record[k] for k in lm.DIAG_KEYS if k in record}
-
-    def test_an_official_run_carries_a_qualifying_triple(self, exact: Exact) -> None:
-        out = real_run(exact)
-        assert out.ran.verdict == ("official", "ok"), out.ran.saved
-        assert self._diag_keys(self._l3(out)) == QUALIFYING_TRIPLE
-        assert all(not self._diag_keys(r) for r in out.records if r.get("case") != "L3")
-        assert not self._diag_keys(out.run_level[0])
+    SCENARIOS = [
+        ("an L0 failure", {"script": {"L0": "not_logged_in"}}, True),
+        ("an L1 billing failure", {"script": {"L1": "label_missing"}}, True),
+        ("an L1 TimeoutError", {"script": {"L1": "timeout"}}, True),
+        ("a skip elsewhere in the session", {"script": {"skip": True}}, True),
+        ("an interrupt in L0", {"script": {"L0": "keyboard_interrupt"}}, True),
+        ("an interrupt in L1", {"script": {"L1": "keyboard_interrupt"}}, True),
+        ("a descendant leak in L1", {"script": {"leak": True}}, True),
+        ("an unavailable sanitizer", {"extra_conftest": DROP_MEMO_CONFTEST}, True),
+        (
+            "a dirty fake Git state",
+            {"env": {"SANDBOX_GIT_PAIR": json.dumps(["1" * 40, True])}},
+            False,
+        ),
+    ]
 
     @pytest.mark.parametrize(
-        ("mode", "expected"),
+        ("name", "kwargs", "nonzero"), SCENARIOS, ids=[s[0] for s in SCENARIOS]
+    )
+    def test_each_condition_is_never_official(
+        self, exact: Exact, name: str, kwargs: dict[str, Any], nonzero: bool
+    ) -> None:
+        pytest.importorskip("claude_agent_sdk")
+        out = real_run(exact, OFFICIAL_NODE, **kwargs)
+        assert out.ran.verdict[0] in {"failure_record", "discard"}, (name, out.ran.saved)
+        assert out.ran.verdict != ("official", "ok") and out.ran.verdict[0] != "readiness_only"
+        assert "official: true" not in out.ran.saved
+        assert (out.ran.returncode != 0) is nonzero, (name, out.ran.returncode)
+        for run in out.run_level:
+            assert run["quota_attempts_total"] <= 1  # never a second inference attempt
+        for planted in ("PLANTED-l0-interrupt-4417", "PLANTED-timeout-4417"):
+            assert planted not in out.ran.saved
+
+    def test_the_two_case_sequence_has_a_passing_control(self, exact: Exact) -> None:
+        pytest.importorskip("claude_agent_sdk")
+        out = real_run(exact, OFFICIAL_NODE)
+        assert out.ran.verdict == ("official", "ok"), out.ran.saved
+
+
+# ============================================================================
+# H65: post-evidence pins and exact evidence cells (section 13.2, 17.3.3, D36, D40)
+# ============================================================================
+
+
+def evidence_cell_problems(
+    text: str,
+    cells: Mapping[str, str],
+    statement: str,
+    *,
+    not_yet: str = NOT_YET_CELL,
+    validated: str = VALIDATED_CELL,
+) -> list[str]:
+    """The structural assertion of H65 (iii)-(v): row by row, with the exact document-wide count."""
+    problems: list[str] = []
+    rows = status_table_rows(text)
+    if [r[0] for r in rows] != list(FIXED_STATUS_ROWS):
+        problems.append("the status table rows or their order differ")
+        return problems
+    for row in rows:
+        live, unverified = FIXED_STATUS_ROWS[row[0]]
+        if row[4] != unverified:
+            problems.append(f"{row[0]}: the Unverified cell")
+        if live is None:
+            if row[3] != cells[row[0]]:
+                problems.append(f"{row[0]}: the Live-proven cell is {row[3]!r}")
+        elif row[3] != live:
+            problems.append(f"{row[0]}: a fixed Live-proven cell changed")
+    states = set(cells.values())
+    if len(states) != 1 or not states <= {not_yet, validated}:
+        problems.append("the five cells are not all in one state")
+    expected_count = sum(1 for value in cells.values() if value == not_yet)
+    if text.count(not_yet) != expected_count:
+        problems.append(f"the document-wide count is {text.count(not_yet)}, not {expected_count}")
+    if "nothing is live-proven yet" in text:
+        problems.append("a narrative not-yet sentence")
+    if normalized(statement) not in normalized(text):
+        problems.append("the status statement differs from its pin constant")
+    return problems
+
+
+class TestEvidenceCellPins:
+    """H65: the state-dependent constants, the state-independent ones and the exact cells."""
+
+    def test_the_constants_are_in_one_state(self) -> None:
+        assert set(LIVE_PROVEN_CELLS) == {
+            "Readiness (`claude auth status --json`)",
+            "`billing_mode == subscription` derivation",
+            "`API-equivalent estimate` label",
+            "Bundled CLI reads the user's login",
+            "Live harness (L0, L1)",
+        }
+        assert set(LIVE_PROVEN_CELLS.values()) in ({NOT_YET_CELL}, {VALIDATED_CELL})
+        assert RUNBOOK_STATUS_STATEMENT.startswith(
+            (RUNBOOK_STATUS_STATEMENT.split(". ")[0] + ".", "One official live validation")
+        )
+        pre = normalized(EXPERIMENTAL_VALIDATION_CLAUSE)
+        assert pre == normalized(EXPERIMENTAL_VALIDATION_CLAUSE)
+        assert VALIDATED_CELL == "yes (official live validation)"
+
+    def test_the_real_runbook_matches_the_pins(self) -> None:
+        text = RUNBOOK_PATH.read_text()
+        assert evidence_cell_problems(text, LIVE_PROVEN_CELLS, RUNBOOK_STATUS_STATEMENT) == []
+        flat = normalized(text)
+        assert (
+            flat.count(normalized(RUNBOOK_STATUS_STATEMENT)) == 4
+        )  # intro, table, operations, commands
+        pre_state = set(LIVE_PROVEN_CELLS.values()) == {NOT_YET_CELL}
+        assert text.count(NOT_YET_CELL) == (5 if pre_state else 0)
+
+    def test_the_post_evidence_state_is_checked_exactly(self) -> None:
+        text = RUNBOOK_PATH.read_text()
+        validated = dict.fromkeys(LIVE_PROVEN_CELLS, VALIDATED_CELL)
+        post_statement = RUNBOOK_STATUS_STATEMENT.replace(
+            RUNBOOK_STATUS_STATEMENT.split(". ")[0] + ".",
+            "One official live validation (readiness, then one subscription inference) has passed.",
+        )
+        post = self._with_statement(text, post_statement)
+        assert evidence_cell_problems(self._table_text(post), validated, post_statement) == []
+        # the checker reads its argument: a post text that differs from the pin is reported
+        assert evidence_cell_problems(self._table_text(text), validated, post_statement)
+        drifted = self._with_statement(
+            text, post_statement.replace("has passed", "has passed twice")
+        )
+        assert evidence_cell_problems(self._table_text(drifted), validated, post_statement)
+        assert evidence_cell_problems(post, validated, post_statement)  # cells left not-yet
+
+    @staticmethod
+    def _with_statement(text: str, statement: str) -> str:
+        """The raw text with every (whitespace-insensitive) status statement replaced."""
+        pattern = r"\s+".join(re.escape(word) for word in RUNBOOK_STATUS_STATEMENT.split())
+        replaced, count = re.subn(pattern, lambda _m: statement, text)
+        assert count == 4
+        return replaced
+
+    @staticmethod
+    def _table_text(text: str) -> str:
+        return text.replace(NOT_YET_CELL, VALIDATED_CELL)
+
+    def test_the_checker_catches_each_drift(self) -> None:
+        text = RUNBOOK_PATH.read_text()
+        cells = dict(LIVE_PROVEN_CELLS)
+        first = next(iter(cells))
+        assert evidence_cell_problems(text, cells, RUNBOOK_STATUS_STATEMENT) == []
+        # a narrative not-yet left behind (count 6), a cell left not-yet after E, a mixed state
+        assert evidence_cell_problems(
+            text + f"\nSee {NOT_YET_CELL}.\n", cells, RUNBOOK_STATUS_STATEMENT
+        )
+        validated_text = text.replace(NOT_YET_CELL, VALIDATED_CELL)
+        validated_cells = dict.fromkeys(cells, VALIDATED_CELL)
+        assert (
+            evidence_cell_problems(validated_text, validated_cells, RUNBOOK_STATUS_STATEMENT) == []
+        )
+        assert evidence_cell_problems(
+            validated_text, {**validated_cells, first: NOT_YET_CELL}, RUNBOOK_STATUS_STATEMENT
+        )
+        assert evidence_cell_problems(
+            text, {**cells, first: VALIDATED_CELL}, RUNBOOK_STATUS_STATEMENT
+        )
+        # a fixed row cell changed, a row removed, a row reordered, the count asserted by a ">="
+        changed = text.replace("| out of scope |", "| yes |")
+        assert evidence_cell_problems(changed, cells, RUNBOOK_STATUS_STATEMENT)
+        lines = text.splitlines()
+        index = next(i for i, ln in enumerate(lines) if ln.startswith("| `API-equivalent"))
+        assert evidence_cell_problems(
+            "\n".join(lines[:index] + lines[index + 1 :]), cells, RUNBOOK_STATUS_STATEMENT
+        )
+        lines[index], lines[index + 1] = lines[index + 1], lines[index]
+        assert evidence_cell_problems("\n".join(lines), cells, RUNBOOK_STATUS_STATEMENT)
+
+    def test_no_other_literal_holds_a_state_dependent_value(self) -> None:
+        source = Path(__file__).read_text()
+        assert source.count("*not " + "yet*") == 1  # only ``NOT_YET_CELL``
+        assert (
+            source.count("No passing official evidence exists " + "yet") == 1
+        )  # only the constant
+
+
+# ============================================================================
+# H66: retired machinery and the production-site boundary in the gate module
+# ============================================================================
+
+PINNED_TABLES = (
+    "LIVE_IMPORT_ALLOWLIST",
+    "L0_PROVIDER_USES",
+    "EXECUTION_SITES",
+    "OWNED_SUBPROCESS_ARGV",
+    "SITE_ANCESTRY",
+    "LIVE_STDLIB_ALLOWLIST",
+    "FORBIDDEN_MODULES",
+    "EXECUTION_PATH_FUNCTIONS",
+    "LOOSE_REFERENCE_ATTRIBUTES",
+    "LOOSE_REFERENCE_NAMES",
+    "INJECTED_CALLABLE_CALLS",
+    "ALLOWED_CALL_BUILTINS",
+    "TABLE_E_CHAINS",
+    "TABLE_A_USES",
+)
+
+
+def scope_shape_problems(source: str) -> list[str]:
+    """Every ``async with scoped_tripwires(...)``: one item, no target, one await statement."""
+    tree = ast.parse(source)
+    problems: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncWith):
+            continue
+        if not any(
+            isinstance(i.context_expr, ast.Call)
+            and ast.unparse(i.context_expr.func) == "scoped_tripwires"
+            for i in node.items
+        ):
+            continue
+        if len(node.items) != 1 or node.items[0].optional_vars is not None:
+            problems.append("the scope has several items or an as target")
+        if len(node.body) != 1:
+            problems.append("the scope body is not one statement")
+            continue
+        body = node.body[0]
+        expr_form = (
+            isinstance(body, ast.Expr)
+            and isinstance(body.value, ast.Await)
+            and isinstance(body.value.value, ast.Call)
+        )
+        assign_form = (
+            isinstance(body, ast.Assign)
+            and len(body.targets) == 1
+            and isinstance(body.targets[0], ast.Name)
+            and body.type_comment is None
+            and isinstance(body.value, ast.Await)
+            and isinstance(body.value.value, ast.Call)
+        )
+        if not (expr_form or assign_form):
+            problems.append(f"the scope body is not an allowed await form: {ast.unparse(body)}")
+    return problems
+
+
+def raise_ordering_problems(source: str) -> list[str]:
+    """Each ``raise CountingFakeViolation()`` is preceded in its block by a violation record."""
+    tree = ast.parse(source)
+    problems: list[str] = []
+    for node in ast.walk(tree):
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(node, field, None)
+            if not isinstance(block, list):
+                continue
+            for index, statement in enumerate(block):
+                if (
+                    isinstance(statement, ast.Raise)
+                    and statement.exc is not None
+                    and ("CountingFakeViolation" in ast.unparse(statement.exc))
+                ):
+                    before = [ast.unparse(s) for s in block[:index]]
+                    if not any(".append((" in text for text in before):
+                        problems.append(
+                            f"a raise without a preceding record: {ast.unparse(statement)}"
+                        )
+    return problems
+
+
+class TestGateModuleBoundary:
+    """H66: retired names absent, literal tables, scope shapes and the standalone controls."""
+
+    def tree(self) -> ast.Module:
+        return ast.parse(Path(__file__).read_text())
+
+    def test_no_retired_class_name_or_reference(self) -> None:
+        tree = self.tree()
+        classes = {n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
+        assert not classes & {
+            "TestCanary",
+            "TestObserver",
+            "TestCanaryScanEvidence",
+            "TestEveryRequiredStreamIsScanned",
+        }
+        assert not [c for c in classes if c.startswith("TestDiagnostic")]
+        assert {
+            "TestRealInferenceAdapters",
+            "TestPerCaseIsolation",
+            "TestEvidenceContract",
+        } <= classes
+        banned = {
+            "REQUIRED_STREAMS",
+            "PrivateLogCapture",
+            "_BufferHandler",
+            "make_canary",
+            "l3_diagnostics",
+            "EnvPlan",
+            "CaseVariant",
+            "build_variants",
+            "apply_env_plan",
+            "_with_auth_mode",
+            "config_diff_paths",
+            "_drain",
+            "build_env_plan",
+            "classify_l3",
+            "Observation",
+            "ASSISTANT_ERRORS",
+            "EMPTY_SCAN",
+            "scan_report",
+            "assert_no_canary",
+        }
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "lm"
+            ):
+                assert node.attr not in banned, node.attr
+                assert not node.attr.startswith("DIAG_"), node.attr
+        assert not [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Name)
+            and n.id in {"CLEAN", "CANARY", "capfd_streams"}
+            and isinstance(n.ctx, ast.Store)
+        ]
+
+    def test_the_tables_are_module_level_literals(self) -> None:
+        tree = self.tree()
+        assigned = {
+            t.id: n.value
+            for n in tree.body
+            if isinstance(n, ast.Assign)
+            for t in n.targets
+            if isinstance(t, ast.Name)
+        }
+        for name in PINNED_TABLES:
+            value = assigned[name]
+            if isinstance(value, ast.Call) and ast.unparse(value.func) in {
+                "frozenset",
+                "tuple",
+                "dict",
+            }:
+                value = value.args[0] if value.args else value
+            for node in ast.walk(value):
+                assert not isinstance(node, (*COMPREHENSIONS, ast.Lambda)), name
+                assert not (
+                    isinstance(node, ast.Call) and ast.unparse(node.func) not in {"frozenset"}
+                ), name
+                assert not (isinstance(node, ast.Name) and node.id == "lm"), name
+
+    def test_the_closed_sets_equal_the_design(self) -> None:
+        assert len(ALLOWED_CALL_BUILTINS) == 26
+        for forbidden in FORBIDDEN_CALL_BUILTINS:
+            assert forbidden not in ALLOWED_CALL_BUILTINS, forbidden
+        assert len(INJECTED_CALLABLE_CALLS) == 30
+        assert not [p for p in INJECTED_CALLABLE_CALLS if p[0] == "probe_readiness.preflight"]
+        assert PENDING_DRAIN_TIMEOUT_S == 1.0 and CONTROL_TIMEOUT_S == 10.0
+        source = Path(__file__).read_text()
+        assert re.search(r"^PENDING_DRAIN_TIMEOUT_S = 1\.0$", source, flags=re.MULTILINE)
+        assert re.search(r"^CONTROL_TIMEOUT_S = 10\.0$", source, flags=re.MULTILINE)
+
+    def test_the_fake_vocabulary_is_defined_once_with_the_listed_members(self) -> None:
+        tree = self.tree()
+        for name in ("FakeSite", "FakeViolation", "CountingFakeViolation"):
+            assert (
+                len([n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name]) == 1
+            )
+        assert [
+            b.id
+            for b in next(
+                n
+                for n in tree.body
+                if isinstance(n, ast.ClassDef) and n.name == "CountingFakeViolation"
+            ).bases
+            if isinstance(b, ast.Name)
+        ] == ["Exception"]
+        assert [m.value for m in FakeViolation] == [
+            "second_construction",
+            "second_call",
+            "unexpected_argument",
+            "unexpected_attribute",
+            "unexpected_run_input",
+            "sink_not_installed",
+            "tripwire_hit",
+            "pending_task",
+            "pending_task_not_drained",
+        ]
+        assert {"popen", "popen_execute_child", "popen_child_backstop", "event_loop"} <= {
+            m.value for m in FakeSite
+        }
+        # disjoint from every closed value set of the live module: nothing can enter live evidence
+        closed = set(lm._OUTCOME_VALUES) | set(lm.CASE_NAMES) | set(lm.INTERRUPT_KINDS)
+        assert (
+            not {m.value for m in FakeSite} & closed
+            and not {m.value for m in FakeViolation} & closed
+        )
+
+    def test_every_raise_is_preceded_by_a_record(self) -> None:
+        assert raise_ordering_problems(Path(__file__).read_text()) == []
+        scratch = "def f(violations):\n    raise CountingFakeViolation()\n"
+        assert raise_ordering_problems(scratch) != []
+
+    def test_every_scope_body_has_one_of_the_two_await_forms(self) -> None:
+        assert scope_shape_problems(Path(__file__).read_text()) == []
+        template = "async def f(v):\n    async with scoped_tripwires(v):\n{body}\n"
+        good = ("        await call()", "        observation = await call()")
+        for body in good:
+            assert scope_shape_problems(template.format(body=body)) == []
+        bad = (
+            "        await call()\n        await other()",
+            "        a, b = await call()",
+            "        a = b = await call()",
+            "        x: int = await call()",
+            "        obj.attr = await call()",
+            "        box[0] = await call()",
+            "        x = (await call()).y",
+            "        try:\n            await call()\n        finally:\n            pass",
+            "        if flag:\n            await call()",
+            "        pass",
+            "        coro_name = make()\n        await coro_name",
+            "        await coro_name",
+            "        x += await call()",
+        )
+        for body in bad:
+            assert scope_shape_problems(template.format(body=body)) != [], body
+        assert (
+            scope_shape_problems(
+                "async def f(v):\n    async with scoped_tripwires(v) as s:\n        await call()\n"
+            )
+            != []
+        )
+
+    def test_the_scope_implementation_has_the_pinned_shape(self) -> None:
+        source = inspect.getsource(scoped_tripwires)
+        for needle in (
+            "_execute_child",
+            "asyncio.wait(pending, timeout=PENDING_DRAIN_TIMEOUT_S)",
+            "task.cancel()",
+            "asyncio.current_task()",
+            "asyncio.all_tasks(asyncio.get_running_loop())",
+        ):
+            assert needle in source, needle
+        assert "gather" not in source and "repr(" not in source and ".name" not in source
+        tree = ast.parse(textwrap.dedent(source))
+        outer = tree.body[0]
+        assert isinstance(outer, ast.AsyncFunctionDef)
+        finals = [n for n in ast.walk(outer) if isinstance(n, ast.Try) and n.finalbody]
+        assert len(finals) >= 2  # the drain and the restoration are both in ``finally``
+
+    def test_the_standalone_controls_exist_and_stay_outside_the_tripwire_fixture(self) -> None:
+        cls = TestScopedTripwireSelfControls
+        for name in (
+            "test_scoped_tripwire_catches_bound_default_popen",
+            "test_scoped_tripwire_pending_drain_is_bounded",
+        ):
+            method = getattr(cls, name)
+            closure = fixture_closure(method)
+            assert "boundary_hits" not in closure and "stack" not in closure, name
+        assert set(
+            inspect.signature(cls.test_scoped_tripwire_catches_bound_default_popen).parameters
+        ) == {"self", "monkeypatch"}
+        assert (
+            "monkeypatch"
+            not in inspect.signature(cls.test_scoped_tripwire_pending_drain_is_bounded).parameters
+        )
+        function = next(
+            n
+            for n in self.tree().body
+            if isinstance(n, ast.FunctionDef) and n.name == "_spawn_with_bound_default"
+        )
+        assert [ast.unparse(d) for d in function.args.defaults] == ["subprocess.Popen"]
+        for name in (
+            "test_scoped_tripwire_catches_bound_default_popen",
+            "test_scoped_tripwire_pending_drain_is_bounded",
+        ):
+            source = textwrap.dedent(inspect.getsource(getattr(cls, name)))
+            assert not re.search(
+                r"\blm\.|RealWorkflowAdapter|RealReadinessAdapter|create_provider|ProviderRegistry|WorkflowEngine",
+                source,
+            ), name
+
+    def test_the_counting_tests_keep_the_tripwire_fixture(self) -> None:
+        methods = {
+            m.name: m
+            for c in self.tree().body
+            if isinstance(c, ast.ClassDef)
+            for m in c.body
+            if isinstance(m, ast.FunctionDef)
+        }
+        for name in (
+            "test_real_workflow_adapter_counts_one_inference",
+            "test_official_session_counts_one_inference_end_to_end",
+        ):
+            fn = methods[name]
+            assert "boundary_hits" in {a.arg for a in fn.args.args}, name
+            assert TestStructuralTripwires.problems(fn) == [], name
+
+
+def fixture_closure(test: Callable[..., Any]) -> set[str]:
+    """The transitive set of fixture names a test requests, through this module's fixtures."""
+    tree = ast.parse(Path(__file__).read_text())
+    fixtures: dict[str, list[str]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and any(
+            "fixture" in ast.unparse(d) for d in node.decorator_list
+        ):
+            fixtures[node.name] = [a.arg for a in node.args.args]
+    closure: set[str] = set()
+    stack = [p for p in inspect.signature(test).parameters if p != "self"]
+    while stack:
+        name = stack.pop()
+        if name in closure:
+            continue
+        closure.add(name)
+        stack.extend(fixtures.get(name, ()))
+    return closure
+
+
+# ============================================================================
+# H31 (vii): the real SDK child logger is caught by the sink, in process
+# ============================================================================
+
+SDK_CHILD_LOGGER = "claude_agent_sdk._internal.transport.subprocess_cli"
+
+
+class _LeakySink:
+    """A negative-control sink with one named defect; the real ``PrivateLogSink`` has none."""
+
+    def __init__(self, defect: str) -> None:
+        self.defect = defect
+        self.real = lm.PrivateLogSink()
+
+    def __enter__(self) -> Any:
+        sink = self.real.__enter__()
+        parent = logging.getLogger("claude_agent_sdk")
+        if self.defect == "handler_not_attached":
+            parent.handlers[:] = [
+                h for h in parent.handlers if not isinstance(h, lm._CountingDiscardHandler)
+            ]
+        elif self.defect == "propagate_left_true":
+            parent.propagate = True
+        elif self.defect in ("level_changed", "sdk_level_set"):
+            parent.setLevel(10)
+        elif self.defect == "provider_level_set":
+            logging.getLogger("conductor.providers.claude_agent_sdk").setLevel(10)
+        elif self.defect == "provider_parent_level_set":
+            logging.getLogger("conductor.providers").setLevel(10)
+        elif self.defect == "child_level_set":
+            logging.getLogger(SDK_CHILD_LOGGER).setLevel(10)
+        return sink
+
+    def __exit__(self, *exc: object) -> None:
+        if self.defect == "not_restored":
+            self.real._saved.clear()  # the loggers keep the sink's handler and propagate=False
+            return
+        self.real.__exit__(*exc)
+
+
+SDK_PARENT_LOGGER = lm.PRIVATE_LOGGERS[0]
+PROVIDER_LOGGER = lm.PRIVATE_LOGGERS[1]
+H31_LOGGERS = (SDK_CHILD_LOGGER, SDK_PARENT_LOGGER, PROVIDER_LOGGER)
+PRISTINE_LOGGER = {"handlers": [], "propagate": True, "level": logging.NOTSET, "disabled": False}
+
+
+def logger_view(name: str) -> dict[str, Any]:
+    """Every logger state the sink must restore, plus the effective level it implies."""
+    logger = logging.getLogger(name)
+    return {
+        "handlers": list(logger.handlers),
+        "propagate": logger.propagate,
+        "level": logger.level,
+        "disabled": logger.disabled,
+        "effective": logger.getEffectiveLevel(),
+    }
+
+
+def levels_of(names: Sequence[str]) -> dict[str, tuple[int, int]]:
+    return {
+        name: (logging.getLogger(name).level, logging.getLogger(name).getEffectiveLevel())
+        for name in names
+    }
+
+
+def real_logger_scenario(
+    sink_factory: Callable[[], Any], *, raise_inside: BaseException | None = None
+) -> list[str]:
+    """Run the complete H31 (vii) scenario; return the failed conditions (empty means it holds).
+
+    The caller has already imported the SDK and the provider, so every logger exists.  Immediately
+    before the sink is entered the three loggers are asserted pristine.  One record is then emitted
+    from each private logger family, and two checkpoints inside the scope check the direct and
+    effective levels of the SDK child, ``claude_agent_sdk``, the provider logger and the root.
+    """
+    for name in H31_LOGGERS:
+        view = logger_view(name)
+        for key, expected in PRISTINE_LOGGER.items():
+            assert view[key] == expected, (name, key, view[key])
+    problems: list[str] = []
+    root = logging.getLogger()
+    snapshot = {name: logger_view(name) for name in H31_LOGGERS}
+    root_before = (root.level, root.getEffectiveLevel(), list(root.handlers))
+    watched = (*H31_LOGGERS, "")
+    levels = levels_of(watched)
+    probe = RecordingHandler()
+    root.addHandler(probe)
+
+    def checkpoint(label: str, arrivals: int, sink: Any) -> None:
+        if levels_of(watched) != levels:
+            problems.append(f"{label}: a direct or effective level changed")
+        if logger_view(SDK_CHILD_LOGGER) != snapshot[SDK_CHILD_LOGGER]:
+            problems.append(f"{label}: the SDK child logger changed")
+        if logging.getLogger(SDK_PARENT_LOGGER).propagate is not False:
+            problems.append(f"{label}: propagation is on")
+        if sink.arrivals != arrivals or type(sink.arrivals) is not int:
+            problems.append(f"{label}: arrivals is {sink.arrivals!r}, expected {arrivals}")
+
+    raised: BaseException | None = None
+    try:
+        try:
+            with sink_factory() as sink:
+                logging.getLogger(SDK_CHILD_LOGGER).warning("sdk %s", SECRET)
+                checkpoint("after the SDK record", 1, sink)
+                logging.getLogger(PROVIDER_LOGGER).warning("provider %s", SECRET)
+                checkpoint("after the provider record", 2, sink)
+                if raise_inside is not None:
+                    raise raise_inside
+        except BaseException as exc:
+            raised = exc
+    finally:
+        root.removeHandler(probe)
+    if raised is not raise_inside:
+        problems.append("the scope swallowed or replaced the exception")
+    if [r for r in probe.records if SECRET in r.getMessage()]:
+        problems.append("a record reached the root logger")
+    for name in H31_LOGGERS:
+        if logger_view(name) != snapshot[name]:
+            problems.append(f"{name} was not restored exactly")
+    if (root.level, root.getEffectiveLevel(), list(root.handlers)) != root_before:
+        problems.append("the root logger was not restored exactly")
+    return problems
+
+
+def sdk_logger_source_facts() -> tuple[bool, str]:
+    """Locate and parse the SDK child module without importing it: (static binding holds, name)."""
+    import importlib.util
+
+    spec = importlib.util.find_spec(SDK_PARENT_LOGGER)  # a top-level name: nothing is imported
+    assert spec is not None and spec.submodule_search_locations
+    package = Path(next(iter(spec.submodule_search_locations)))
+    source = package / "_internal" / "transport" / "subprocess_cli.py"
+    dotted = ".".join((SDK_PARENT_LOGGER, *source.relative_to(package).with_suffix("").parts))
+    bound = any(
+        isinstance(node, ast.Assign)
+        and [t.id for t in node.targets if isinstance(t, ast.Name)] == ["logger"]
+        and ast.unparse(node.value) == "logging.getLogger(__name__)"
+        for node in ast.parse(source.read_text()).body
+    )
+    return bound, dotted
+
+
+class TestRealSdkLoggerIsCaught:
+    """H31 (vii): the pinned SDK child logger reaches the sink, with nothing left behind."""
+
+    def test_the_pinned_child_logger_is_found_statically_without_importing_the_sdk(self) -> None:
+        before = "claude_agent_sdk" in sys.modules
+        bound, dotted = sdk_logger_source_facts()
+        assert ("claude_agent_sdk" in sys.modules) is before  # the lookup imported nothing
+        assert bound and dotted == SDK_CHILD_LOGGER
+        assert SDK_CHILD_LOGGER.startswith(SDK_PARENT_LOGGER + ".")
+
+    def test_no_dotted_module_name_is_given_to_find_spec(self) -> None:
+        tree = ast.parse(Path(__file__).read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if ast.unparse(node.func).split(".")[-1] != "find_spec":
+                continue
+            argument = node.args[0]
+            assert isinstance(argument, ast.Name | ast.Constant)
+            name = argument.id if isinstance(argument, ast.Name) else str(argument.value)
+            assert "." not in name and name != "SDK_CHILD_LOGGER", ast.unparse(node)
+
+    @pytest.fixture
+    def imported_runtime(self) -> None:
+        """The runtime layer: only here are the SDK and the provider imported."""
+        import claude_agent_sdk._internal.transport.subprocess_cli  # noqa: F401
+
+        import conductor.providers.claude_agent_sdk  # noqa: F401
+
+    def test_the_scenario_holds_for_the_real_sink(self, imported_runtime: None) -> None:
+        assert real_logger_scenario(lm.PrivateLogSink) == []
+
+    @pytest.mark.parametrize(
+        "raised",
+        [RuntimeError("boom"), KeyboardInterrupt(), asyncio.CancelledError()],
+        ids=["failure", "interrupt", "cancellation"],
+    )
+    def test_the_scenario_and_restoration_hold_when_the_scope_raises(
+        self, imported_runtime: None, raised: BaseException
+    ) -> None:
+        assert real_logger_scenario(lm.PrivateLogSink, raise_inside=raised) == []
+
+    def test_the_scenario_precondition_rejects_a_dirty_logger(self, imported_runtime: None) -> None:
+        logger = logging.getLogger(SDK_CHILD_LOGGER)
+        logger.setLevel(logging.ERROR)
+        try:
+            with pytest.raises(AssertionError):
+                real_logger_scenario(lm.PrivateLogSink)
+        finally:
+            logger.setLevel(logging.NOTSET)
+
+    @pytest.mark.parametrize(
+        "defect",
         [
-            ("retryable", ("retryable", "rate_limit", "429")),
-            ("nr_untyped", ("non_retryable", "absent", "absent")),
+            "handler_not_attached",
+            "propagate_left_true",
+            "level_changed",
+            "sdk_level_set",
+            "provider_level_set",
+            "provider_parent_level_set",
+            "child_level_set",
+            "not_restored",
         ],
     )
-    def test_an_inconclusive_run_is_a_failure_record_with_its_triple(
-        self, exact: Exact, mode: str, expected: tuple[str, str, str]
-    ) -> None:
-        out = real_run(exact, script={"L3": mode})
-        assert out.ran.verdict == ("failure_record", "ok"), out.ran.saved
-        l3 = self._l3(out)
-        assert l3["outcome"] == "inconclusive"
-        assert self._diag_keys(l3) == dict(zip(lm.DIAG_KEYS, expected, strict=True))
-        assert not self._diag_keys(out.run_level[0])
-        assert set(l3) <= lm.CASE_KEYS
+    def test_each_defective_sink_is_reported(self, imported_runtime: None, defect: str) -> None:
+        names = (*H31_LOGGERS, "conductor.providers", "")
+        pre = sink_state(names)
+        try:
+            assert real_logger_scenario(lambda: _LeakySink(defect)) != []
+        finally:
+            for name, (level, handlers, propagate, disabled) in pre.items():
+                lg = logging.getLogger(name)
+                lg.setLevel(level)
+                lg.handlers[:] = handlers
+                lg.propagate, lg.disabled = propagate, disabled
 
-    def test_a_failing_reducer_is_all_unavailable_and_the_capture_stays_official(
-        self, exact: Exact
-    ) -> None:
-        out = real_run(exact, script={"diag": "raises"})
-        assert out.ran.verdict == ("official", "ok"), out.ran.saved
-        l3 = self._l3(out)
-        assert l3["outcome"] == "invalid_key"
-        assert self._diag_keys(l3) == dict(lm.DIAG_UNAVAILABLE)
-        assert "PLANTED" not in out.ran.saved
 
-    def test_an_omitted_triple_is_discarded_for_an_official_capture(self, exact: Exact) -> None:
-        out = real_run(exact, script={"diag": "omit"})
-        assert self._diag_keys(self._l3(out)) == {}
-        assert out.ran.verdict == ("discard", "evidence_inconsistent"), out.ran.saved
+# ============================================================================
+# Record check 8 (quota attempts) and resolver controls: each kills a relaxation that the
+# broader tests above do not distinguish
+# ============================================================================
 
-    def test_a_forged_l1_triple_never_reaches_the_evidence(self, exact: Exact) -> None:
-        clean = real_run(exact)
-        forged = real_run(exact, script={"forge_l1": QUALIFYING_TRIPLE})
-        l1 = next(r for r in forged.cases if r["case"] == "L1")
-        assert self._diag_keys(l1) == {}
-        assert forged.ran.verdict == clean.ran.verdict == ("official", "ok")
 
-    def test_a_forged_l3_triple_over_an_inconclusive_run_is_never_official(
-        self, exact: Exact
-    ) -> None:
-        out = real_run(exact, script={"L3": "retryable", "forge_l3": QUALIFYING_TRIPLE})
-        assert out.ran.verdict == ("failure_record", "ok"), out.ran.saved
-        assert self._diag_keys(self._l3(out)) == {
-            "diag_provider_retryability": "retryable",
-            "diag_assistant_error": "rate_limit",
-            "diag_api_status": "429",
-        }
+def l1_failure_parts(**case_changes: Any) -> dict[str, Any]:
+    """An official-shaped capture whose L1 case failed after the one inference attempt."""
+    l1 = case_fields("L1", "case_failed", attempted_quota_execution=True)
+    l1.update(case_changes)
+    return edited(
+        official_parts,
+        cases=[case_fields("L0", "ok", attempted_quota_execution=False), l1],
+        run=run_fields(primary_failure="L1:case_failed:HarnessFailure"),
+        g4=(0, "pass", "false"),
+    )
+
+
+class TestQuotaRecordCheckKillers:
+    """Record check 8 (c)-(e) on shapes that are not ``official``: each is discarded, not kept."""
+
+    def test_the_control_failure_record_is_kept(self) -> None:
+        assert classify(l1_failure_parts(), 3)[0] == "failure_record"
+
+    def test_an_l0_record_never_carries_an_attempt(self) -> None:
+        parts = edited(
+            l1_failure_parts(),
+            cases=[
+                case_fields("L0", "ok", attempted_quota_execution=True),
+                case_fields("L1", "case_failed", attempted_quota_execution=True),
+            ],
+        )
+        assert classify(parts, 3) == ("discard", "evidence_inconsistent")
+
+    def test_an_l1_attempt_requires_a_total_of_one(self) -> None:
+        parts = edited(
+            l1_failure_parts(),
+            run=run_fields(quota_attempts_total=0, primary_failure="L1:case_failed:HarnessFailure"),
+        )
+        assert classify(parts, 3) == ("discard", "evidence_inconsistent")
+
+    def test_a_total_of_one_requires_the_session_record(self) -> None:
+        parts = edited(l1_failure_parts(), session=None)
+        assert classify(parts, 3)[0] == "discard"
+        readiness = edited(readiness_parts, run=run_fields(quota_attempts_total=1))
+        assert classify(readiness, 0)[0] == "discard"
+
+    def test_a_total_of_one_requires_an_l1_record(self) -> None:
+        parts = edited(
+            l1_failure_parts(),
+            cases=[case_fields("L0", "ok", attempted_quota_execution=False)],
+        )
+        assert classify(parts, 3)[0] == "discard"
+
+
+class TestCheckQuotaDirectly:
+    """``_check_quota`` is callable on its own, so each of its conjuncts is distinguished here."""
+
+    L1_ATTEMPT = {"case": "L1", "attempted_quota_execution": True}
+    TOTAL_ONE = {"quota_attempts_total": 1}
+
+    def test_a_total_of_one_with_a_session_and_an_l1_record_is_accepted(self) -> None:
+        assert lm._check_quota({"case": "session"}, [self.L1_ATTEMPT], self.TOTAL_ONE) is True
+
+    def test_a_total_of_one_without_a_session_record_is_rejected(self) -> None:
+        assert lm._check_quota(None, [self.L1_ATTEMPT], self.TOTAL_ONE) is False
+
+    def test_a_total_of_one_without_an_l1_record_is_rejected(self) -> None:
+        assert lm._check_quota({"case": "session"}, [], self.TOTAL_ONE) is False
+
+    def test_a_total_of_zero_needs_neither_a_session_nor_an_l1_record(self) -> None:
+        assert lm._check_quota(None, [], {"quota_attempts_total": 0}) is True
+
+
+class TestResolverScopeBindingControls:
+    def test_a_walrus_in_a_comprehension_binds_in_the_enclosing_scope(self) -> None:
+        tree = ast.parse("xs = []\n[(f := len) and f(x) for x in xs]\n")
+        facts = {c.callee: c.kind for c in qualified_calls(tree)}
+        assert facts["f"] == "module-assign"  # the comprehension scope does not own ``f``
+
+    def test_a_runner_never_leaves_the_dispatch_through_a_store(self) -> None:
+        live = LiveSource(live_source_text())
+        for node in live.nodes(ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript):
+                    mentions = {n.id for n in ast.walk(node.value) if isinstance(n, ast.Name)}
+                    assert not mentions & {"runner", "runners"}, ast.unparse(node)
+
+
+class TestV7ReadingPin:
+    """V7 is the neutral reading, never a dirty-tree-only one."""
+
+    def test_the_v7_reading_names_every_non_case_condition_and_presumes_no_cause(self) -> None:
+        table = RUNBOOK_PATH.read_text().split("### Reading an official run", 1)[1]
+        line = next(ln for ln in table.splitlines() if ln.startswith("| **V7**"))
+        reading = normalized([c.strip() for c in line.strip().strip("|").split("|")][2])
+        for needed in (
+            "no interrupt and no case-level or session failure was recorded",
+            "a skip elsewhere in the session (zero-skip)",
+            "a dirty working tree",
+            "another nonzero pipeline status",
+            "no cause is presumed",
+        ):
+            assert needed in reading, needed

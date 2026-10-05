@@ -13,35 +13,48 @@ This module is doubly gated and fail-closed:
 The module has four layers:
 
 * **Classifier head** -- the closed output grammar, the evidence allowlist and validators, the
-  ``Outcome`` enum, ``scan_is_clean_and_complete`` and ``classify_capture``, defined *above every
-  other import* with the standard library only (``re``, ``json``, ``sys``, ``enum``, ``typing``,
-  ``collections.abc``).  Run as a script it is the operator's capture classifier (below).
-* **Pure / hermetic layer** -- gates, isolation, source tree, canaries, model, quota,
-  process-table parsing, the L3 classifier, the passive observer, the ordered state machine, the
-  case success predicates, the report sanitizer and the evidence plugin.
+  ``Outcome`` enum and ``classify_capture``, defined *above every other import* with the standard
+  library only (``re``, ``json``, ``sys``, ``enum``, ``typing``, ``collections.abc``).  Run as a
+  script it is the operator's capture classifier (below).
+* **Pure / hermetic layer** -- gates, isolation, source tree, model, quota, process-table parsing,
+  the ordered state machine, the case success predicates, the report sanitizer and the evidence
+  plugin.
 * **Adapter seams** -- ``ReadinessAdapter``, ``WorkflowExecutionAdapter``,
-  ``CliEvidenceAdapter``, ``DescendantSnapshotAdapter`` and ``ObserverInstaller`` protocols.
+  ``CliEvidenceAdapter`` and ``DescendantSnapshotAdapter`` protocols.
 * **Real adapters** -- ``Real*Adapter`` classes behind ``configured_adapters()``: the provider
   factory and real readiness for L0; ``load_config`` -> ``ProviderRegistry`` ->
-  ``WorkflowEngine`` -> ``display_usage_summary`` for L1 / L3 / L2; the passive spy on the real
-  ``ClaudeSDKClient.receive_response``; the guarded process-table snapshot; the CLI evidence.
+  ``WorkflowEngine`` -> ``display_usage_summary`` for L1; the guarded process-table snapshot; the
+  CLI evidence.
 
 Everything except the two gated live tests at the bottom is exercised offline by
 ``tests/test_config/test_claude_subscription_real_gate.py`` with every CLI, SDK-transport,
-process and network boundary replaced.  Nothing here has been run against a real login.
+process and network boundary replaced.
 
-What a live run may consume: at most three potentially quota-consuming attempts (L1, L3, L2),
-enforced by ``QuotaCounter``.  In the current production path the readiness probe
-(``claude auth status --json``) runs once for L0 and twice for each of L1 and L2.
+The official sequence is L0 -> L1 and nothing else.  L0 shows that readiness reports a usable
+first-party subscription login.  L1 runs one real inference through the subscription path and
+checks its billing provenance.  That an explicit ``subscription`` mode neutralizes competing API-key
+variables is an offline property of the production provider, proven by its own tests, not by a live
+run.  Credential precedence under ``auth_mode: auto`` is unproven and out of scope: no case here
+sets a credential variable or builds an ``auto`` configuration, and no live attempt to prove
+precedence is permitted unless a new, separately reviewed design names a public, stable, typed
+authentication signal in advance.
+
+What a live run may consume: at most **one** potentially quota-consuming attempt (L1), enforced by
+``QuotaCounter``; nothing is ever retried automatically.  In the current production path the
+readiness probe (``claude auth status --json``) runs once for L0 and twice for L1.
+
+Retained records.  The earlier readiness-only capture and the two earlier official attempts are
+historical, non-official records: they are never reclassified, never passed to the classifier or
+the shell gate, never promoted, shared, committed or quoted as evidence, and authorize nothing.
 
 Retained output.  Only :func:`evidence` records are ever retained, as ``EVIDENCE {json}`` lines
 written by the terminal-summary hook of the evidence plugin: one session-facts record (the
 official path only), one per-case record per case that ran, and exactly one run-level record
 (Path A: ``run_level_record`` after ``run_session``; Path B: ``fail_closed(exc, config)`` for a
-failure that escapes before ``run_session`` returns; never both).  Every case scans eight fixed
-streams for the canary (:data:`REQUIRED_STREAMS`) and reports ``canary_scan`` as eight fixed
-``<stream>:<clean|leak|not_available>`` strings.  SDK and provider log records are captured by a
-private handler (:class:`PrivateLogCapture`) that never reaches pytest's report handlers.
+failure that escapes before ``run_session`` returns; never both).  The keys and values of a record
+come from a closed allowlist, so no field can carry free text, a credential, a path or provider
+output.  SDK and provider log records go to a private discarding sink (:class:`PrivateLogSink`)
+that never reaches pytest's report handlers, the root logger or the last-resort handler.
 
 The authorized commands (:data:`READINESS_ONLY_COMMAND`, :data:`OFFICIAL_COMMAND`) start with the
 seven-variable ``env -u`` prefix, carry ``-q --color=no --show-capture=no --disable-warnings
@@ -71,19 +84,16 @@ every other combination.  An interruption before a run-level record exists is di
 the count lines are pytest constants: a change to any fixed line makes the classifier discard the
 capture, and the offline gate tests are rerun after any pytest upgrade and before live validation.
 
-L3 diagnostics.  The L3 case record may carry three closed-enum diagnostic fields
-(``diag_provider_retryability``, ``diag_assistant_error``, ``diag_api_status``) that only describe
-what the harness observed: they are computed after the unchanged ``classify_l3`` has returned,
-never classify, never change an outcome and never authorize a step.  ``absent`` means collected and
-nothing seen, ``unavailable`` (always all three) means the reduction or validation failed after
-classification, and omission of all three means classification was never reached.  Only the L3
-runner assigns them; ``_safe_fields`` and the case wrapper's ``HarnessFailure`` branch each strip
-them from adapter-supplied fields.
-
 Cancellation.  ``KeyboardInterrupt``, ``asyncio.CancelledError`` and any other non-``Exception``
-``BaseException`` are never converted: scan, descendant observation and cleanup run, findings are
+``BaseException`` are never converted: descendant observation and cleanup run, findings are
 recorded as secondary evidence, and the original exception object is re-raised unchanged.  Only
 the terminal rendering of the cancellation is sanitized.
+
+Threat model of the structural tests.  The gate tests pin where, and how often, this module may
+reach production code (imports, owned subprocesses, the single registry/engine/``engine.run``
+site and the single provider use of L0) against hand-written tables, and prove it dynamically with
+fail-fast counting fakes.  That covers ordinary source edits; exotic runtime metaprogramming is
+left to the independent review and is not claimed.
 """
 
 from __future__ import annotations
@@ -138,9 +148,6 @@ class Outcome(enum.StrEnum):
     PREREQ_FILE_CONSOLE_ACTIVE = "prereq_file_console_active"
     INVALID_MODEL_OVERRIDE = "invalid_model_override"
     DESCENDANT_LEAK = "descendant_leak"
-    CANARY_LEAK = "canary_leak"
-    CANARY_SCAN_INCOMPLETE = "canary_scan_incomplete"
-    L2_L3_NOT_PAIRED = "l2_l3_not_paired"
     QUOTA_CEILING_EXCEEDED = "quota_ceiling_exceeded"
     ADAPTERS_NOT_WIRED = "adapters_not_wired"
     # Case-level failures.
@@ -157,21 +164,13 @@ class Outcome(enum.StrEnum):
     BILLING_AGGREGATE_MISMATCH = "billing_aggregate_mismatch"
     BILLING_LABEL_MISSING = "billing_label_missing"
     OUTPUT_MISSING = "output_missing"
-    CANARY_USED_IN_L2 = "canary_used_in_l2"
-    # L3 classifier results.
-    INVALID_KEY = "invalid_key"
-    FELL_BACK_TO_LOGIN = "fell_back_to_login"
-    MODEL_UNAVAILABLE = "model_unavailable"
+    # An inference case that raised, timed out or never completed an agent.
     INCONCLUSIVE = "inconclusive"
     # Descendant verdicts.
     NO_DESCENDANTS_REMAINING = "no_descendants_remaining"
     # Evidence data (never skips).
     NOT_EXECUTED_AFTER_SAFETY_FAILURE = "not_executed_after_safety_failure"
     NOT_EXECUTED_AFTER_L0_FAILURE = "not_executed_after_l0_failure"
-    NOT_EXECUTED_AFTER_L1_FAILURE = "not_executed_after_l1_failure"
-    NOT_EXECUTED_L3_FELL_BACK_TO_LOGIN = "not_executed_l3_fell_back_to_login"
-    NOT_EXECUTED_L3_INCONCLUSIVE = "not_executed_l3_inconclusive"
-    NOT_EXECUTED_L3_MODEL_UNAVAILABLE = "not_executed_l3_model_unavailable"
     NOT_EXECUTED_AFTER_INTERRUPT = "not_executed_after_interrupt"
 
 
@@ -182,22 +181,10 @@ NOT_EXECUTED_VALUES: Final = frozenset(v for v in _OUTCOME_VALUES if v.startswit
 # Evidence contract: allowlist and validators (shared by the emitter and the classifier)
 # ============================================================================
 
-# The eight streams scanned for the canary, in the order ``canary_scan`` reports them.
-REQUIRED_STREAMS: Final = (
-    "stdout_stderr",
-    "console",
-    "logs",
-    "exceptions",
-    "events",
-    "workflow_result",
-    "evidence",
-    "tmp_files",
-)
-SCAN_STATES: Final = ("clean", "leak", "not_available")
 INTERRUPT_KINDS: Final = ("none", "keyboard_interrupt", "cancelled", "other_base_exception")
-SECONDARY_FINDINGS: Final = ("canary_leak", "descendant_leak")
+SECONDARY_FINDINGS: Final = ("descendant_leak",)
 CLEANUP_STEPS: Final = ("descendants", "evidence")
-CASE_NAMES: Final = ("L0", "L1", "L3", "L2")
+CASE_NAMES: Final = ("L0", "L1")
 _REAL_CASES: Final = frozenset(CASE_NAMES)
 UNAVAILABLE: Final = "unavailable"
 MAX_PLUGINS: Final = 32
@@ -259,6 +246,16 @@ def _is_env_list(v: object) -> bool:
     )
 
 
+def _is_quota_attempts(v: object) -> bool:
+    """Exactly 0 or 1: the one designed inference attempt is the only one there can be."""
+    return _is_int(v) and v in (0, 1)
+
+
+def _is_quota_ceiling(v: object) -> bool:
+    """Exactly 1: the ceiling of the revised official sequence."""
+    return _is_int(v) and v == 1
+
+
 def _is_pid_row(row: Any) -> bool:
     return (
         isinstance(row, dict)
@@ -271,23 +268,6 @@ def _is_pid_row(row: Any) -> bool:
 
 def _is_pid_list(v: object) -> bool:
     return isinstance(v, list) and len(v) <= 256 and all(_is_pid_row(row) for row in v)
-
-
-def _is_canary_scan(v: object) -> bool:
-    """Exactly eight fixed ``<stream>:<state>`` strings, in :data:`REQUIRED_STREAMS` order."""
-    return (
-        isinstance(v, list)
-        and len(v) == len(REQUIRED_STREAMS)
-        and all(
-            isinstance(entry, str) and entry.split(":", 1)[0] == name and _scan_state(entry)
-            for entry, name in zip(v, REQUIRED_STREAMS, strict=True)
-        )
-    )
-
-
-def _scan_state(entry: str) -> bool:
-    parts = entry.split(":")
-    return len(parts) == 2 and parts[1] in SCAN_STATES
 
 
 def _is_cleanup_failed(v: object) -> bool:
@@ -396,63 +376,6 @@ def _member_of(values: frozenset[str]) -> Callable[[object], bool]:
     return lambda v: isinstance(v, str) and v in values
 
 
-# ``claude_agent_sdk.types.AssistantMessageError`` (pinned against the SDK by H12).  It lives in the
-# head so that the pure layer, the diagnostic sets below and the classifier share one object.
-ASSISTANT_ERRORS: Final = frozenset(
-    {
-        "authentication_failed",
-        "billing_error",
-        "rate_limit",
-        "invalid_request",
-        "server_error",
-        "unknown",
-    }
-)
-
-# The three L3 diagnostic keys (design section 9.4): closed literal sets, defined once.  Each set
-# holds ``absent`` (collected, nothing observed) and ``unavailable`` (classification completed, the
-# diagnostic reduction or validation then failed; always all three keys).  Omission of all three
-# keys means L3 classification was never reached.
-DIAG_PROVIDER_RETRYABILITY: Final = frozenset(
-    {"absent", "retryable", "non_retryable", "mixed", "unavailable"}
-)
-DIAG_ASSISTANT_ERROR: Final = ASSISTANT_ERRORS | frozenset({"other", "absent", "unavailable"})
-DIAG_API_STATUS: Final = frozenset(
-    {"401", "403", "404", "429", "other_4xx", "5xx", "other", "absent", "unavailable"}
-)
-DIAG_KEYS: Final = ("diag_provider_retryability", "diag_assistant_error", "diag_api_status")
-DIAG_VALIDATORS: Final[dict[str, Callable[[object], bool]]] = {
-    "diag_provider_retryability": _member_of(DIAG_PROVIDER_RETRYABILITY),
-    "diag_assistant_error": _member_of(DIAG_ASSISTANT_ERROR),
-    "diag_api_status": _member_of(DIAG_API_STATUS),
-}
-DIAG_UNAVAILABLE: Final[Mapping[str, str]] = dict.fromkeys(DIAG_KEYS, "unavailable")
-# First member present wins; each tuple is its closed set without ``absent`` and ``unavailable``.
-DIAG_ASSISTANT_ERROR_PRECEDENCE: Final = (
-    "authentication_failed",
-    "billing_error",
-    "invalid_request",
-    "rate_limit",
-    "server_error",
-    "unknown",
-    "other",
-)
-DIAG_API_STATUS_PRECEDENCE: Final = ("401", "404", "403", "429", "other_4xx", "5xx", "other")
-
-
-def diag_triple_valid(triple: object) -> bool:
-    """Exactly the three keys, each a member of its closed set, all ``unavailable`` or none."""
-    if not isinstance(triple, Mapping) or len(triple) != len(DIAG_KEYS):
-        return False
-    mapping = cast("Mapping[str, object]", triple)
-    values: list[object] = []
-    for key in DIAG_KEYS:
-        if key not in mapping or not DIAG_VALIDATORS[key](mapping[key]):
-            return False
-        values.append(mapping[key])
-    return sum(value == "unavailable" for value in values) in (0, len(DIAG_KEYS))
-
-
 # ``official``, ``skipped_reports`` and ``zero_skip_verdict`` are deliberately *not* keys: they are
 # the three G4 section lines written by the evidence plugin, the only place they appear.
 _EVIDENCE_SPECS: Final[dict[str, Callable[[object], bool]]] = {
@@ -494,17 +417,15 @@ _EVIDENCE_SPECS: Final[dict[str, Callable[[object], bool]]] = {
     "est_cost_usd": _is_float,
     "descendants": _is_outcome,
     "descendant_report": _is_pid_list,
-    "canary_scan": _is_canary_scan,
     "passed": _is_int,
     "failed": _is_int,
-    "quota_attempts_total": _is_int,
-    "quota_ceiling": _is_int,
+    "quota_attempts_total": _is_quota_attempts,
+    "quota_ceiling": _is_quota_ceiling,
     "not_executed": _is_not_executed,
     "primary_failure": _is_primary_failure,
     "pytest_version": _is_pytest_version,
     "plugins": _is_plugins,
     "exception_class": _matcher(_IDENT_RE),
-    **DIAG_VALIDATORS,
 }
 EVIDENCE_KEYS: Final = frozenset(_EVIDENCE_SPECS)
 
@@ -555,39 +476,20 @@ def evidence(**fields: object) -> dict[str, object]:
     """Build one sanitized evidence record.
 
     Fixed key allowlist; values restricted to bool/int/float, pattern-checked short strings,
-    enum literals, lists of environment *names*, lists of ``{"pid", "name"}``, bounded lists
-    drawn from fixed sets, or the eight fixed ``canary_scan`` strings.  Anything else raises
-    :class:`EvidenceError` without echoing the value.  A per-case record must carry
-    ``canary_scan``: a case that was never scanned cannot be reported.
+    enum literals, lists of environment *names*, lists of ``{"pid", "name"}`` or bounded lists
+    drawn from fixed sets.  Anything else raises :class:`EvidenceError` without echoing the
+    value.
     """
     validate_record(fields)
     record: dict[str, object] = {
         key: value.value if isinstance(value, Outcome) else value for key, value in fields.items()
     }
-    if record.get("case") in _REAL_CASES and "canary_scan" not in record:
-        raise EvidenceError("case record without canary_scan")
     return record
 
 
 def emit_evidence(record: Mapping[str, object]) -> str:
     """The one line retained for a record: ``EVIDENCE {json}`` (re-validated)."""
     return "EVIDENCE " + json.dumps(evidence(**dict(record)), sort_keys=True)
-
-
-def unavailable_allowed(case: object, stream: str) -> bool:
-    """``not_available`` is permitted only for a missing result, and for L0's console/events."""
-    return stream == "workflow_result" or (str(case) == "L0" and stream in ("console", "events"))
-
-
-def scan_is_clean_and_complete(entries: object, case: object) -> bool:
-    """A ``canary_scan`` with no leak and no ``not_available`` where it is not allowed."""
-    if not _is_canary_scan(entries):
-        return False
-    for entry, name in zip(cast("list[str]", entries), REQUIRED_STREAMS, strict=True):
-        state = entry.split(":", 1)[1]
-        if state == "leak" or (state == "not_available" and not unavailable_allowed(case, name)):
-            return False
-    return True
 
 
 # ============================================================================
@@ -636,8 +538,8 @@ _PCT: Final = r"\[ {0,2}[0-9]{1,3}%\]"
 _CNT: Final = r"[0-9]{1,9} (?:failed|passed|skipped|deselected|xfailed|xpassed|warnings?|errors?)"
 _OUTCOME_RE: Final = r"[a-z][a-z0-9_]{0,63}"
 _CLASS_RE: Final = r"[A-Za-z_][A-Za-z0-9_]{0,63}"
-_CASE_RE: Final = r"L0|L1|L3|L2"
-_LISTING: Final = rf"(?:{_CASE_RE}):{_OUTCOME_RE}(?:,(?:{_CASE_RE}):{_OUTCOME_RE}){{0,7}}"
+_CASE_RE: Final = r"L0|L1"
+_LISTING: Final = rf"(?:{_CASE_RE}):{_OUTCOME_RE}(?:,(?:{_CASE_RE}):{_OUTCOME_RE}){{0,1}}"
 # G1 (blank) is the empty string and is handled by equality.
 GRAMMAR: Final[dict[str, str]] = {
     "G2": r"[.sFExX]{1,512}(?: {1,512}" + _PCT + r")?",
@@ -646,7 +548,7 @@ GRAMMAR: Final[dict[str, str]] = {
     "G4b": r"zero_skip_verdict: (?:pass|fail)",
     "G4c": r"official: (?:true|false)",
     "G5": r"EVIDENCE \{[\x20-\x7e]{0,16000}\}",
-    "G6": r"evidence_fallback_failed: (?:L0|L1|L3|L2)",
+    "G6": r"evidence_fallback_failed: (?:L0|L1)",
     "G7a": r"!{1,200} KeyboardInterrupt !{1,200}",
     "G7b": r"interrupted: details withheld",
     "G7c": r"\(to show a full traceback on KeyboardInterrupt use --full-trace\)",
@@ -680,7 +582,7 @@ _COLLECTION_RE: Final = re.compile(
     r"Interrupted: ([0-9]{1,9}) (errors?) during collection", re.ASCII
 )
 _G9_OUTCOME_RE: Final = re.compile(
-    r"(?<![A-Za-z0-9_])(?:L0|L1|L3|L2|session|none):([a-z][a-z0-9_]{0,63})", re.ASCII
+    r"(?<![A-Za-z0-9_])(?:L0|L1|session|none):([a-z][a-z0-9_]{0,63})", re.ASCII
 )
 _NON_PRINTABLE_RE: Final = re.compile(r"[^\x20-\x7e\n]")
 _STATUS_RE: Final = re.compile(r"[0-9]{1,3}", re.ASCII)
@@ -704,18 +606,10 @@ _CASE_LEVEL: Final = frozenset(
     {
         Outcome.NOT_LOGGED_IN.value,
         Outcome.UNPRICED_MODEL_LABEL_UNEXERCISED.value,
-        Outcome.MODEL_UNAVAILABLE.value,
-        Outcome.L2_L3_NOT_PAIRED.value,
         Outcome.QUOTA_CEILING_EXCEEDED.value,
     }
 )
-_OFFICIAL_OUTCOMES: Final = (
-    Outcome.OK.value,
-    Outcome.OK.value,
-    Outcome.INVALID_KEY.value,
-    Outcome.OK.value,
-)
-_QUOTA_ATTEMPT_LIMIT: Final = 3
+_OFFICIAL_OUTCOMES: Final = (Outcome.OK.value, Outcome.OK.value)
 
 
 def _canonical(number: str, *, minimum: int) -> int | None:
@@ -825,7 +719,6 @@ def _safe_case_record(record: Mapping[str, object]) -> bool:
         and "cleanup_failed" not in record
         and record.get("interrupted") == "none"
         and record.get("descendants") == Outcome.NO_DESCENDANTS_REMAINING.value
-        and scan_is_clean_and_complete(record.get("canary_scan"), record.get("case"))
     )
 
 
@@ -835,39 +728,6 @@ def _success_count(counts: Mapping[str, int] | None) -> bool:
         counts is not None
         and counts.get("passed") == 1
         and set(counts) <= {"passed", "deselected", "warnings"}
-    )
-
-
-def _diag_problem(record: Mapping[str, object]) -> str | None:
-    """Record check 7 beyond grammar: placement, all-or-none and all-or-no ``unavailable``.
-
-    ``None`` when fine, else ``evidence_inconsistent``.  Reads no value except to tell
-    ``unavailable`` from the rest; never compares the triple with an outcome.
-    """
-    present = [key for key in DIAG_KEYS if key in record]
-    if not present:
-        return None
-    if record.get("case") != "L3" or len(present) != len(DIAG_KEYS):
-        return "evidence_inconsistent"
-    if not diag_triple_valid({key: record[key] for key in DIAG_KEYS}):  # only a mix remains
-        return "evidence_inconsistent"
-    return None
-
-
-def _qualifying_triple(record: Mapping[str, object]) -> bool:
-    """Official item 9: the triple ``classify_l3`` needs for ``invalid_key``, or all unavailable.
-
-    Restrict-only: it runs only inside the official step, which can end only in ``official`` or
-    ``discard``.  An omitted triple is not qualifying.
-    """
-    if not all(key in record for key in DIAG_KEYS):
-        return False
-    retryability = record["diag_provider_retryability"]
-    if retryability == "unavailable":
-        return True  # the guard's constant: diag_triple_valid already made it all-or-nothing
-    return retryability in ("non_retryable", "mixed") and (
-        record["diag_assistant_error"] == "authentication_failed"
-        or record["diag_api_status"] == "401"
     )
 
 
@@ -937,10 +797,29 @@ def _check_shape(
             return False
         if enum_value in _CASE_LEVEL and prefix == "session":
             return False
-        if enum_value == Outcome.L2_L3_NOT_PAIRED.value and prefix not in ("L3", "L2"):
-            return False
         if prefix == "session" and enum_value not in _SESSION_ONLY | {Outcome.CASE_FAILED.value}:
             return False
+    return True
+
+
+def _check_quota(
+    session: dict[str, object] | None,
+    cases: list[dict[str, object]],
+    run: dict[str, object],
+) -> bool:
+    """Record check 8 (c)-(e): the attempt flags and the run-level total agree.
+
+    No L0 record ever carries ``attempted_quota_execution: true`` (a fallback record may omit the
+    key and that omission is never an attempt).  A per-case record with ``true`` requires a total
+    of 1, and a total of 1 requires a per-case L1 record in shape O.  A capture of a failed L1
+    fallback emission (a G6 marker and no L1 record) therefore never passes.
+    """
+    total = run.get("quota_attempts_total")
+    attempted = [r["case"] for r in cases if r.get("attempted_quota_execution") is True]
+    if "L0" in attempted or (attempted and total != 1):
+        return False
+    if total == 1:
+        return session is not None and any(r["case"] == "L1" for r in cases)
     return True
 
 
@@ -1044,15 +923,12 @@ def _classify(text: str, status: int) -> tuple[str, str]:
             validate_record(parsed)
         except EvidenceError:
             return _discard("evidence_record_invalid")
-        diag_problem = _diag_problem(parsed)
-        if diag_problem is not None:
-            return _discard(diag_problem)
         kind = parsed.get("case")
         keys = set(parsed)
         if kind == "session":
             valid = keys == SESSION_KEYS
         elif kind in _REAL_CASES:
-            valid = keys <= CASE_KEYS and "outcome" in keys and "canary_scan" in keys
+            valid = keys <= CASE_KEYS and "outcome" in keys
         else:
             valid = "case" not in keys and keys <= RUN_KEYS
         if not valid:
@@ -1079,7 +955,7 @@ def _classify(text: str, status: int) -> tuple[str, str]:
         return _discard("evidence_inconsistent")
     if interrupted and status == 0:
         return _discard("evidence_inconsistent")  # an interrupted run cannot have succeeded
-    if not _check_shape(session, cases, run):
+    if not _check_shape(session, cases, run) or not _check_quota(session, cases, run):
         return _discard("evidence_inconsistent")
 
     clean_extras = not (fallback or interrupted or collection)
@@ -1093,8 +969,10 @@ def _classify(text: str, status: int) -> tuple[str, str]:
         and [r["case"] for r in cases] == list(CASE_NAMES)
         and "primary_failure" not in run
         and "not_executed" not in run
-        and _is_int(quota)
-        and 0 <= cast("int", quota) <= _QUOTA_ATTEMPT_LIMIT
+        and quota == 1
+        and run.get("quota_ceiling") == 1
+        and cases[0].get("attempted_quota_execution") is False
+        and cases[1].get("attempted_quota_execution") is True
         and all(_safe_case_record(r) for r in cases)
     )
     readiness_records = (
@@ -1104,15 +982,15 @@ def _classify(text: str, status: int) -> tuple[str, str]:
         and cases[0].get("outcome") == Outcome.OK.value
         and "primary_failure" not in run
         and "not_executed" not in run
+        and run.get("quota_attempts_total") == 0
+        and run.get("quota_ceiling") == 1
+        and cases[0].get("attempted_quota_execution") is False
         and _safe_case_record(cases[0])
     )
     if g4["official"]:
         if status != 0:
             return _discard("pipeline_status_nonzero")
         if official_records and g4["skipped"] == 0 and clean_extras and _success_count(counts):
-            # Item 9 (restrict-only): it can only turn ``official`` into a discard.
-            if not _qualifying_triple(next(r for r in cases if r["case"] == "L3")):
-                return _discard("evidence_inconsistent")
             return VERDICT_OFFICIAL, "ok"
         return _discard("evidence_inconsistent")
     if official_records and g4["skipped"] == 0:
@@ -1192,7 +1070,6 @@ if __name__ == "__main__":
 # ============================================================================
 
 import asyncio
-import collections
 import contextlib
 import dataclasses
 import importlib
@@ -1211,8 +1088,6 @@ from typing import NoReturn, Protocol
 
 import pytest
 
-from conductor.exceptions import ProviderError
-
 pytestmark = [
     pytest.mark.real_api,
     pytest.mark.skipif(
@@ -1226,7 +1101,7 @@ MODEL_ENV: Final = "CONDUCTOR_REAL_CLAUDE_MODEL"
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
 EXAMPLE_PATH: Final = REPO_ROOT / "examples" / "claude-agent-sdk-subscription.yaml"
 DEFAULT_MODEL: Final = "claude-haiku-4-5"
-DEFAULT_QUOTA_CEILING: Final = 3
+DEFAULT_QUOTA_CEILING: Final = 1
 
 # Names a sandbox needs to re-export so the *real* live tests run under pytester.
 SANDBOX_EXPORTS: Final = (
@@ -1253,12 +1128,8 @@ SAFETY_OUTCOMES: Final = frozenset(
         Outcome.PREREQ_FILE_CONSOLE_ACTIVE,
         Outcome.INVALID_MODEL_OVERRIDE,
         Outcome.DESCENDANT_LEAK,
-        Outcome.CANARY_LEAK,
-        Outcome.CANARY_SCAN_INCOMPLETE,
-        Outcome.L2_L3_NOT_PAIRED,
         Outcome.QUOTA_CEILING_EXCEEDED,
         Outcome.ADAPTERS_NOT_WIRED,
-        Outcome.CANARY_USED_IN_L2,
     }
 )
 
@@ -1548,207 +1419,7 @@ def read_git_state(
 
 
 # ============================================================================
-# Pure layer: canary
-# ============================================================================
-
-_CANARY_RE: Final = re.compile(r"sk-ant-api03-CANARY-([0-9a-f]{32})-DO-NOT-USE")
-_MIN_FRAGMENT: Final = 12
-
-
-class _NotAvailable:
-    """Marks a stream that cannot exist for a case (no engine result, no console in L0)."""
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "NOT_AVAILABLE"
-
-
-NOT_AVAILABLE: Final = _NotAvailable()
-
-
-def make_canary(uuid_hex: str | None = None) -> str:
-    """A per-session invalid key; never sourced from the environment."""
-    if uuid_hex is None:
-        import uuid
-
-        uuid_hex = uuid.uuid4().hex
-    canary = f"sk-ant-api03-CANARY-{uuid_hex}-DO-NOT-USE"
-    validate_canary(canary)
-    return canary
-
-
-def validate_canary(canary: str) -> None:
-    if not isinstance(canary, str) or _CANARY_RE.fullmatch(canary) is None:
-        raise HarnessFailure(Outcome.CANARY_SCAN_INCOMPLETE, "canary malformed")
-
-
-def canary_fragments(canary: str) -> tuple[str, ...]:
-    """The canary plus every 12-character window that overlaps its random part."""
-    validate_canary(canary)
-    match = _CANARY_RE.fullmatch(canary)
-    assert match is not None
-    start, end = match.span(1)
-    fragments = {canary}
-    for i in range(len(canary) - _MIN_FRAGMENT + 1):
-        if i < end and i + _MIN_FRAGMENT > start:
-            fragments.add(canary[i : i + _MIN_FRAGMENT])
-    return tuple(sorted(fragments))
-
-
-def exception_chain(exc: BaseException | None) -> list[BaseException]:
-    """``exc`` plus everything reachable through ``__cause__``, ``__context__`` and groups."""
-    seen: set[int] = set()
-    out: list[BaseException] = []
-    stack: list[BaseException] = [exc] if exc is not None else []
-    while stack:
-        current = stack.pop()
-        if id(current) in seen:
-            continue
-        seen.add(id(current))
-        out.append(current)
-        for nxt in (current.__cause__, current.__context__):
-            if nxt is not None:
-                stack.append(nxt)
-        stack.extend(getattr(current, "exceptions", ()) or ())
-    return out
-
-
-def render_exception_chain(exc: BaseException | None) -> str:
-    """``str`` and ``repr`` of every exception in the chain, for scanning only.
-
-    An exception that can be rendered neither way cannot be scanned: that raises, so the caller
-    reports an incomplete scan instead of a clean one.
-    """
-    parts: list[str] = []
-    for item in exception_chain(exc):
-        rendered = False
-        for fn in (str, repr):
-            try:
-                parts.append(fn(item))
-                rendered = True
-            except Exception:
-                parts.append("")
-        if not rendered:
-            raise ValueError("exception cannot be rendered")
-    return "\n".join(parts)
-
-
-def _stream_text(value: object) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, bytes | bytearray):
-        return bytes(value).decode("utf-8", "replace")
-    if isinstance(value, BaseException):
-        return render_exception_chain(value)
-    try:
-        return json.dumps(value, default=repr, sort_keys=True)
-    except Exception:
-        return repr(value)  # raises when the value cannot be rendered: the scan is then incomplete
-
-
-def read_tmp_files(tmp_path: Path, *, max_bytes: int = 2_000_000) -> str:
-    """All readable file contents under ``tmp_path`` (bounded), for the canary scan."""
-    chunks: list[str] = []
-    budget = max_bytes
-    for path in sorted(tmp_path.rglob("*")):
-        if budget <= 0:
-            break
-        try:
-            if path.is_file() and not path.is_symlink():
-                data = path.read_bytes()[:budget]
-                budget -= len(data)
-                chunks.append(data.decode("utf-8", "replace"))
-        except OSError:
-            continue
-    return "\n".join(chunks)
-
-
-def scan_streams(canary: str, streams: Mapping[str, object]) -> list[str]:
-    """Names of the streams that contain the canary or any fragment (>= 12 chars) of it."""
-    fragments = canary_fragments(canary)
-    hits: list[str] = []
-    for name, value in streams.items():
-        text = _stream_text(value)
-        if any(fragment in text for fragment in fragments):
-            hits.append(name)
-    return hits
-
-
-@dataclasses.dataclass(frozen=True)
-class ScanReport:
-    """The result of scanning the eight required streams: fixed strings and names only."""
-
-    entries: tuple[str, ...]  # eight ``<stream>:<clean|leak|not_available>`` strings
-    leaks: tuple[str, ...]  # names of the streams holding the canary
-    incomplete: bool  # a stream was missing, unscannable or unavailable where not allowed
-
-
-# A case that never reached its adapter produced no stream content, so nothing can have leaked.
-EMPTY_SCAN: Final = tuple(
-    f"{name}:{'not_available' if name == 'workflow_result' else 'clean'}"
-    for name in REQUIRED_STREAMS
-)
-
-
-def scan_report(
-    canary: str,
-    streams: Mapping[str, object],
-    *,
-    case: object = None,
-    forced_leaks: Iterable[str] = (),
-) -> ScanReport:
-    """Scan every required stream.  Never raises for a leak and never echoes matched text.
-
-    A stream that is absent from ``streams`` is incomplete (the caller omitted it); one marked
-    :data:`NOT_AVAILABLE` is incomplete unless :func:`unavailable_allowed`.  ``forced_leaks``
-    names streams where a leak was already seen at emit time (a bounded buffer may have evicted
-    the record).
-    """
-    fragments = canary_fragments(canary)
-    forced = set(forced_leaks)
-    entries: list[str] = []
-    leaks: list[str] = []
-    incomplete = False
-    for name in REQUIRED_STREAMS:
-        state = "clean"
-        if name not in streams or streams[name] is NOT_AVAILABLE:
-            state = "not_available"
-            incomplete = incomplete or name not in streams or not unavailable_allowed(case, name)
-        else:
-            try:
-                text = _stream_text(streams[name])
-            except Exception:
-                state = "not_available"
-                incomplete = True
-            else:
-                if any(fragment in text for fragment in fragments):
-                    state = "leak"
-        if name in forced:
-            state = "leak"
-        if state == "leak":
-            leaks.append(name)
-        entries.append(f"{name}:{state}")
-    return ScanReport(tuple(entries), tuple(leaks), incomplete)
-
-
-def assert_no_canary(canary: str, streams: Mapping[str, object], *, case: object = None) -> None:
-    """Fail closed if any retained stream holds the canary, or a category is missing.
-
-    Every category in :data:`REQUIRED_STREAMS` must be supplied (a scan over fewer streams
-    always "passes" and proves nothing).  Only fixed stream names are ever reported.
-    """
-    report = scan_report(canary, streams, case=case)
-    if report.leaks:
-        raise HarnessFailure(Outcome.CANARY_LEAK, "canary present in " + ",".join(report.leaks))
-    if report.incomplete:
-        raise HarnessFailure(Outcome.CANARY_SCAN_INCOMPLETE, "canary scan streams missing")
-
-
-# ============================================================================
-# Private log capture
+# Private log sink
 # ============================================================================
 
 # The only loggers the harness touches.  ``claude_agent_sdk`` covers every child logger through
@@ -1756,58 +1427,44 @@ def assert_no_canary(canary: str, streams: Mapping[str, object], *, case: object
 PRIVATE_LOGGERS: Final = ("claude_agent_sdk", "conductor.providers.claude_agent_sdk")
 
 
-class _BufferHandler(logging.Handler):
-    """Bounded in-memory buffer; checks every record for the canary at emit time."""
+class _CountingDiscardHandler(logging.Handler):
+    """Discards every record; only counts arrivals.  It never reads, formats or keeps a record."""
 
-    def __init__(self, canary: str, *, max_records: int = 2000, max_chars: int = 2000) -> None:
-        super().__init__(level=logging.DEBUG)
-        self._fragments = canary_fragments(canary)
-        self._max_chars = max_chars
-        self.records: collections.deque[str] = collections.deque(maxlen=max_records)
-        self.leaked = False
+    def __init__(self) -> None:
+        super().__init__()
+        self.arrivals = 0
 
     def emit(self, record: logging.LogRecord) -> None:
-        try:
-            text = self.format(record)
-        except Exception:
-            text = ""
-        if any(fragment in text for fragment in self._fragments):
-            self.leaked = True  # recorded now: the bounded buffer may evict the record later
-        self.records.append(text[: self._max_chars])
+        self.arrivals += 1
 
 
-class PrivateLogCapture:
-    """Capture SDK and provider log records privately, for one case.
+class PrivateLogSink:
+    """Keep SDK and provider log records away from every handler of the run.
 
-    While active, each logger of :data:`PRIVATE_LOGGERS` is set to ``DEBUG``, stops propagating
-    and writes to a private buffer, so nothing reaches the root logger or pytest's report
-    handlers.  Level, handlers, ``propagate`` and ``disabled`` are restored exactly on exit
-    (success, failure, timeout and cancellation).  The root logger is never touched.
+    While active, each logger of :data:`PRIVATE_LOGGERS` stops propagating and has one private
+    discarding handler, so no record reaches the root logger, pytest's report handlers or Python's
+    last-resort handler.  No level is changed and no text is retained.  Level, handlers,
+    ``propagate`` and ``disabled`` are restored exactly on exit (success, failure, timeout and
+    cancellation).  Only the real adapters enter it, and only through the exact ``with`` of their
+    pinned execution chain.
     """
 
-    def __init__(self, canary: str, *, loggers: Sequence[str] = PRIVATE_LOGGERS) -> None:
-        self._names = tuple(loggers)
-        self._handler = _BufferHandler(canary)
-        self._saved: list[tuple[logging.Logger, int, list[logging.Handler], bool, bool]] = []
+    def __init__(self) -> None:
+        self._handler = _CountingDiscardHandler()
+        self._saved: list[tuple[logging.Logger, int, list[Any], bool, bool]] = []
 
     @property
-    def leaked(self) -> bool:
-        return self._handler.leaked
+    def arrivals(self) -> int:
+        return self._handler.arrivals
 
-    @property
-    def text(self) -> str:
-        return "\n".join(self._handler.records)
-
-    def __enter__(self) -> PrivateLogCapture:
+    def __enter__(self) -> PrivateLogSink:
         try:
-            for name in self._names:
+            for name in PRIVATE_LOGGERS:
                 logger = logging.getLogger(name)
                 self._saved.append(
                     (logger, logger.level, list(logger.handlers), logger.propagate, logger.disabled)
                 )
-                logger.setLevel(logging.DEBUG)
                 logger.propagate = False
-                logger.disabled = False
                 logger.addHandler(self._handler)
         except BaseException:
             self.__exit__(None, None, None)
@@ -2088,211 +1745,9 @@ async def observe_descendants(
 
 
 # ============================================================================
-# Pure layer: typed observations and the L3 classifier
+# Pure layer: the cases
 # ============================================================================
 
-
-@dataclasses.dataclass(frozen=True)
-class Observation:
-    """Typed fields only: never text, content or usage."""
-
-    type_name: str
-    assistant_error: str | None
-    api_error_status: int | None
-    is_error: bool | None
-
-
-def record_observation(message: object) -> Observation:
-    """Total: reduces any message to its typed signals (never raises, never stores content)."""
-    raw_error = getattr(message, "error", None)
-    assistant_error: str | None
-    if raw_error is None:
-        assistant_error = None
-    elif isinstance(raw_error, str) and raw_error in ASSISTANT_ERRORS:
-        assistant_error = raw_error
-    else:
-        assistant_error = "other"
-    status = getattr(message, "api_error_status", None)
-    api_status = (
-        status
-        if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599
-        else None
-    )
-    raw_is_error = getattr(message, "is_error", None)
-    is_error = raw_is_error if isinstance(raw_is_error, bool) else None
-    return Observation(type(message).__name__[:64], assistant_error, api_status, is_error)
-
-
-def _event_type(event: Any) -> object:
-    if isinstance(event, Mapping):
-        return event.get("type")
-    return getattr(event, "type", None)
-
-
-def _has_completed(events: Sequence[object]) -> bool:
-    return any(_event_type(e) == "agent_completed" for e in events)
-
-
-def classify_l3(
-    observations: Sequence[Observation],
-    exc_chain: Sequence[BaseException],
-    events: Sequence[object],
-) -> Outcome:
-    """Exactly one fixed enum from typed signals; never from message text."""
-    if _has_completed(events):
-        return Outcome.FELL_BACK_TO_LOGIN
-    non_retryable = any(
-        isinstance(exc, ProviderError) and exc.is_retryable is False for exc in exc_chain
-    )
-    if non_retryable:
-        if any(
-            o.assistant_error == "authentication_failed" or o.api_error_status == 401
-            for o in observations
-        ):
-            return Outcome.INVALID_KEY
-        if any(o.api_error_status == 404 for o in observations):
-            return Outcome.MODEL_UNAVAILABLE
-    return Outcome.INCONCLUSIVE
-
-
-# ============================================================================
-# Pure layer: L3 diagnostic reducers (strictly diagnostic; never an input to classification)
-# ============================================================================
-
-
-def assistant_error_of(value: object) -> str | None:
-    """Total single-value reducer: ``None`` adds nothing, an SDK literal is itself, else ``other``.
-
-    Exact type test then literal comparison only: a foreign object is never hashed, compared or
-    called.
-    """
-    if value is None:
-        return None
-    if type(value) is str and value in ASSISTANT_ERRORS:
-        return value
-    return "other"
-
-
-def api_status_of(value: object) -> str | None:
-    """Total single-value reducer: ``None`` contributes nothing, an exact ``int`` in 100-599 is its
-    bucket, any other value (a bool, a float, a string, an out-of-range number) is ``other``."""
-    if value is None:
-        return None
-    if type(value) is int and 100 <= value <= 599:
-        if value == 401:
-            return "401"
-        if value == 403:
-            return "403"
-        if value == 404:
-            return "404"
-        if value == 429:
-            return "429"
-        if value < 400:
-            return "other"
-        if value < 500:
-            return "other_4xx"
-        return "5xx"
-    return "other"
-
-
-def provider_retryability_of(chain: Iterable[BaseException]) -> str:
-    """The retryability of the ``ProviderError`` instances of ``chain`` (the gate's own predicate).
-
-    ``N`` (non-retryable) is exactly ``exc.is_retryable is False``, verbatim from
-    :func:`classify_l3`; any other value counts on the retryable side.  Raises if ``chain`` cannot
-    be iterated or an attribute access raises (the guard turns that into ``unavailable``).
-    """
-    providers = [exc for exc in chain if isinstance(exc, ProviderError)]
-    if not providers:
-        return "absent"
-    non_retryable = [exc for exc in providers if exc.is_retryable is False]
-    if not non_retryable:
-        return "retryable"
-    return "non_retryable" if len(non_retryable) == len(providers) else "mixed"
-
-
-def _first_present(precedence: Sequence[str], present: set[str]) -> str:
-    return next((member for member in precedence if member in present), "absent")
-
-
-def l3_diagnostics(
-    observations: Sequence[Observation], exc_chain: Iterable[BaseException]
-) -> dict[str, str]:
-    """The three closed-set diagnostic values, an exact function of the signals that occurred.
-
-    Reads only ``Observation.assistant_error`` and ``Observation.api_error_status`` and
-    ``ProviderError.is_retryable``; never a message.  Never returns ``unavailable``.
-    """
-    assistant: set[str] = set()
-    status: set[str] = set()
-    for observation in observations:
-        reduced_error = assistant_error_of(getattr(observation, "assistant_error", None))
-        if reduced_error is not None:
-            assistant.add(reduced_error)
-        reduced_status = api_status_of(getattr(observation, "api_error_status", None))
-        if reduced_status is not None:
-            status.add(reduced_status)
-    return {
-        "diag_provider_retryability": provider_retryability_of(exc_chain),
-        "diag_assistant_error": _first_present(DIAG_ASSISTANT_ERROR_PRECEDENCE, assistant),
-        "diag_api_status": _first_present(DIAG_API_STATUS_PRECEDENCE, status),
-    }
-
-
-def guarded_diagnostics(
-    observations: Sequence[Observation], exc_chain: Iterable[BaseException]
-) -> dict[str, str]:
-    """Reduce and validate the complete triple inside the guard (``Exception`` only).
-
-    Any reducer or validation failure yields the constant all-``unavailable`` triple, so no
-    diagnostic fault can change the already-fixed L3 outcome; a ``BaseException`` propagates.
-    """
-    try:
-        triple = l3_diagnostics(observations, exc_chain)
-        if not diag_triple_valid(triple):
-            return dict(DIAG_UNAVAILABLE)
-        return dict(triple)
-    except Exception:
-        return dict(DIAG_UNAVAILABLE)
-
-
-# ============================================================================
-# Pure layer: passive observer
-# ============================================================================
-
-
-async def _observe(inner: Any, sink: list[Observation]) -> Any:
-    """Re-yield ``inner`` unchanged, recording typed signals; always close ``inner`` explicitly."""
-    try:
-        async for message in inner:
-            sink.append(record_observation(message))
-            yield message
-    finally:
-        aclose = getattr(inner, "aclose", None)
-        if aclose is not None:
-            await aclose()
-
-
-def make_spy(original: Callable[..., Any], sink: list[Observation]) -> Callable[..., Any]:
-    """A plain function that calls ``original`` exactly once and wraps its iterator."""
-
-    def spy(self: Any, *args: Any, **kwargs: Any) -> Any:
-        inner = original(self, *args, **kwargs)
-        return _observe(inner, sink)
-
-    return spy
-
-
-def install_spy(monkeypatch: pytest.MonkeyPatch, cls: Any, sink: list[Observation]) -> None:
-    """Install the spy on ``cls.receive_response`` (call inside ``monkeypatch.context()``)."""
-    monkeypatch.setattr(cls, "receive_response", make_spy(cls.receive_response, sink))
-
-
-# ============================================================================
-# Pure layer: variants and pairing
-# ============================================================================
-
-_AUTH_MODE_PATH: Final = "workflow.runtime.provider.auth_mode"
 _SELECTOR_NAMES: Final = ("CLAUDE_CODE_OAUTH_TOKEN",) + tuple(
     f"CLAUDE_CODE_USE_{name}" for name in ("BEDROCK", "VERTEX", "FOUNDRY")
 )
@@ -2301,35 +1756,14 @@ _SELECTOR_NAMES: Final = ("CLAUDE_CODE_OAUTH_TOKEN",) + tuple(
 class Case(enum.StrEnum):
     L0 = "L0"
     L1 = "L1"
-    L3 = "L3"
-    L2 = "L2"
 
 
-ORDER: Final = (Case.L0, Case.L1, Case.L3, Case.L2)
-INFERENCE_CASES: Final = frozenset({Case.L1, Case.L3, Case.L2})
+ORDER: Final = (Case.L0, Case.L1)
+INFERENCE_CASES: Final = frozenset({Case.L1})
 EXPECTED_OUTCOME: Final = {
     Case.L0: Outcome.OK,
     Case.L1: Outcome.OK,
-    Case.L3: Outcome.INVALID_KEY,
-    Case.L2: Outcome.OK,
 }
-
-
-@dataclasses.dataclass(frozen=True)
-class EnvPlan:
-    """Environment names (and hidden values) for one case; values never appear in ``repr``."""
-
-    set_names: tuple[str, ...]
-    removed_names: tuple[str, ...]
-    values: Mapping[str, str] = dataclasses.field(default_factory=dict, repr=False, compare=False)
-
-
-@dataclasses.dataclass(frozen=True)
-class CaseVariant:
-    case: Case
-    auth_mode: str
-    config: Mapping[str, Any]
-    env: EnvPlan
 
 
 def scrub_route_names(environ: Mapping[str, str]) -> tuple[str, ...]:
@@ -2337,90 +1771,6 @@ def scrub_route_names(environ: Mapping[str, str]) -> tuple[str, ...]:
     names = {n for n in environ if n.startswith("ANTHROPIC_")}
     names |= {n for n in _SELECTOR_NAMES if n in environ}
     return tuple(sorted(names))
-
-
-def build_env_plan(environ: Mapping[str, str], canary: str) -> EnvPlan:
-    return EnvPlan(
-        set_names=("ANTHROPIC_API_KEY",),
-        removed_names=scrub_route_names(environ),
-        values={"ANTHROPIC_API_KEY": canary},
-    )
-
-
-def _with_auth_mode(
-    base: Mapping[str, Any], auth_mode: str, model: str | None = None
-) -> dict[str, Any]:
-    import copy
-
-    doc = copy.deepcopy(dict(base))
-    doc["workflow"]["runtime"]["provider"]["auth_mode"] = auth_mode
-    if model is not None:
-        doc["workflow"]["runtime"]["default_model"] = model
-    return doc
-
-
-def build_variants(
-    yaml_text: str, canary: str, environ: Mapping[str, str], model: str | None = None
-) -> dict[Case, CaseVariant]:
-    """L1 (clean baseline), L3 (``auto``) and L2 (``subscription``) from one document.
-
-    L3 and L2 share the canary environment and differ only in ``auth_mode``; L1 runs the
-    shipped ``subscription`` document with the route variables scrubbed and no canary.
-    ``model`` (the validated override, if any) is applied identically to all three.
-    """
-    import yaml
-
-    base = yaml.safe_load(yaml_text)
-    canary_env = build_env_plan(environ, canary)
-    clean_env = EnvPlan((), scrub_route_names(environ), {})
-    return {
-        Case.L1: CaseVariant(
-            Case.L1, "subscription", _with_auth_mode(base, "subscription", model), clean_env
-        ),
-        Case.L3: CaseVariant(Case.L3, "auto", _with_auth_mode(base, "auto", model), canary_env),
-        Case.L2: CaseVariant(
-            Case.L2, "subscription", _with_auth_mode(base, "subscription", model), canary_env
-        ),
-    }
-
-
-def config_diff_paths(a: Any, b: Any, prefix: str = "") -> list[str]:
-    """Dotted paths at which two nested structures differ."""
-    if isinstance(a, Mapping) and isinstance(b, Mapping):
-        paths: list[str] = []
-        for key in sorted(set(a) | set(b), key=str):
-            child = f"{prefix}.{key}" if prefix else str(key)
-            if key not in a or key not in b:
-                paths.append(child)
-            else:
-                paths.extend(config_diff_paths(a[key], b[key], child))
-        return paths
-    if isinstance(a, list | tuple) and isinstance(b, list | tuple):
-        if len(a) != len(b):
-            return [prefix]
-        paths = []
-        for i, (x, y) in enumerate(zip(a, b, strict=True)):
-            paths.extend(config_diff_paths(x, y, f"{prefix}[{i}]"))
-        return paths
-    return [] if a == b else [prefix]
-
-
-def assert_config_paired(l3: CaseVariant, l2: CaseVariant) -> None:
-    """L3 and L2 configurations may differ only in ``auth_mode`` (``auto`` vs ``subscription``)."""
-    if config_diff_paths(l3.config, l2.config) != [_AUTH_MODE_PATH]:
-        raise HarnessFailure(Outcome.L2_L3_NOT_PAIRED, "configuration differs beyond auth_mode")
-    if (l3.auth_mode, l2.auth_mode) != ("auto", "subscription"):
-        raise HarnessFailure(Outcome.L2_L3_NOT_PAIRED, "auth modes are not auto/subscription")
-
-
-def assert_env_paired(l3: CaseVariant, l2: CaseVariant) -> None:
-    """Environment names (set and removed) must be identical sets; values must match."""
-    if set(l3.env.set_names) != set(l2.env.set_names):
-        raise HarnessFailure(Outcome.L2_L3_NOT_PAIRED, "environment names set differ")
-    if set(l3.env.removed_names) != set(l2.env.removed_names):
-        raise HarnessFailure(Outcome.L2_L3_NOT_PAIRED, "environment names removed differ")
-    if dict(l3.env.values) != dict(l2.env.values):
-        raise HarnessFailure(Outcome.L2_L3_NOT_PAIRED, "environment values differ")
 
 
 # ============================================================================
@@ -2437,58 +1787,18 @@ def interrupt_kind(exc: BaseException) -> str:
     return "other_base_exception"
 
 
-_SCAN_RANK: Final = {"not_available": 0, "clean": 1, "leak": 2}
-
-
 @dataclasses.dataclass
 class CaseFindings:
-    """What one case's scan, descendant observation and cleanup found (fixed values only).
+    """What one case's descendant observation and cleanup found (fixed values only).
 
-    The adapter, the descendant check and the case wrapper all write here, so a finding survives
-    whichever of them is unwound by a cancellation.
+    The descendant check and the case wrapper both write here, so a finding survives whichever of
+    them is unwound by a cancellation.
     """
 
     case: Case
-    scan: dict[str, str] = dataclasses.field(default_factory=dict)  # stream -> state
-    incomplete: bool = False
     descendants: Outcome | None = None
     descendant_report: list[dict[str, object]] = dataclasses.field(default_factory=list)
     cleanup_failed: list[str] = dataclasses.field(default_factory=list)
-
-    def _merge(self, name: str, state: str) -> None:
-        if _SCAN_RANK[state] >= _SCAN_RANK[self.scan.get(name, "not_available")]:
-            self.scan[name] = state
-
-    def record_streams(
-        self, canary: str, streams: Mapping[str, object], *, forced_leaks: Iterable[str] = ()
-    ) -> None:
-        """Scan ``streams``; a leak, once seen, is never overwritten by a later clean scan."""
-        report = scan_report(canary, streams, case=self.case, forced_leaks=forced_leaks)
-        for entry in report.entries:
-            name, state = entry.split(":")
-            self._merge(name, state)
-        self.incomplete = self.incomplete or report.incomplete
-
-    def record_evidence(self, canary: str, record: Mapping[str, object]) -> None:
-        """Scan the evidence about to be retained (the ``evidence`` stream)."""
-        try:
-            text = _stream_text(dict(record))
-        except Exception:
-            self.incomplete = True
-            return
-        state = "leak" if any(f in text for f in canary_fragments(canary)) else "clean"
-        self._merge("evidence", state)
-
-    @property
-    def entries(self) -> tuple[str, ...]:
-        """The eight ``canary_scan`` strings; a case that never ran has produced nothing."""
-        base = dict(entry.split(":") for entry in EMPTY_SCAN)
-        base.update(self.scan)
-        return tuple(f"{name}:{base[name]}" for name in REQUIRED_STREAMS)
-
-    @property
-    def canary_leak(self) -> bool:
-        return "leak" in self.scan.values()
 
     @property
     def descendant_leak(self) -> bool:
@@ -2496,10 +1806,9 @@ class CaseFindings:
 
 
 class FindingsBoard:
-    """One :class:`CaseFindings` per case; ``canary`` lets the case wrapper scan the evidence."""
+    """One :class:`CaseFindings` per case."""
 
-    def __init__(self, canary: str | None = None) -> None:
-        self.canary = canary
+    def __init__(self) -> None:
         self._cases: dict[Case, CaseFindings] = {}
 
     def begin(self, case: Case) -> CaseFindings:
@@ -2517,28 +1826,14 @@ class Resolution:
     adapter_outcome: Outcome
 
 
-def resolve_outcome(
-    adapter_outcome: Outcome,
-    *,
-    canary_leak: bool,
-    descendant_leak: bool,
-    scan_incomplete: bool,
-) -> Resolution:
-    """Ordinary outcomes, highest first: canary leak, descendant leak, incomplete scan, adapter.
+def resolve_outcome(adapter_outcome: Outcome, *, descendant_leak: bool) -> Resolution:
+    """Ordinary outcomes, highest first: a descendant leak, then the adapter outcome.
 
-    Neither leak is ever lost: the primary is one fixed enum, the other leak is secondary, and
-    the adapter outcome is always retained.  Cancellation never comes here: it is always
-    primary and is re-raised unchanged.
+    The finding is never lost: the primary is one fixed enum and the adapter outcome is always
+    retained.  Cancellation never comes here: it is always primary and is re-raised unchanged.
     """
-    canary = canary_leak or adapter_outcome is Outcome.CANARY_LEAK
-    descendant = descendant_leak or adapter_outcome is Outcome.DESCENDANT_LEAK
-    if canary:
-        secondary = (Outcome.DESCENDANT_LEAK,) if descendant else ()
-        return Resolution(Outcome.CANARY_LEAK, secondary, adapter_outcome)
-    if descendant:
+    if descendant_leak or adapter_outcome is Outcome.DESCENDANT_LEAK:
         return Resolution(Outcome.DESCENDANT_LEAK, (), adapter_outcome)
-    if scan_incomplete or adapter_outcome is Outcome.CANARY_SCAN_INCOMPLETE:
-        return Resolution(Outcome.CANARY_SCAN_INCOMPLETE, (), adapter_outcome)
     return Resolution(adapter_outcome, (), adapter_outcome)
 
 
@@ -2605,29 +1900,14 @@ def not_executed_value(case: Case, outcome: Outcome) -> Outcome | None:
     """The transition function: ``None`` proceeds, otherwise the value recorded for later cases."""
     if outcome in SAFETY_OUTCOMES:
         return Outcome.NOT_EXECUTED_AFTER_SAFETY_FAILURE
-    if case is Case.L0:
-        return None if outcome is Outcome.OK else Outcome.NOT_EXECUTED_AFTER_L0_FAILURE
-    if case is Case.L1:
-        return None if outcome is Outcome.OK else Outcome.NOT_EXECUTED_AFTER_L1_FAILURE
-    if case is Case.L3:
-        return {
-            Outcome.INVALID_KEY: None,
-            Outcome.FELL_BACK_TO_LOGIN: Outcome.NOT_EXECUTED_L3_FELL_BACK_TO_LOGIN,
-            Outcome.MODEL_UNAVAILABLE: Outcome.NOT_EXECUTED_L3_MODEL_UNAVAILABLE,
-        }.get(outcome, Outcome.NOT_EXECUTED_L3_INCONCLUSIVE)
+    if case is Case.L0 and outcome is not Outcome.OK:
+        return Outcome.NOT_EXECUTED_AFTER_L0_FAILURE
     return None
 
 
 def secondary_findings_of(findings: CaseFindings) -> tuple[Outcome, ...]:
     """The safety findings a cancelled case reports as secondary evidence (fixed values only)."""
-    return tuple(
-        finding
-        for finding, present in (
-            (Outcome.CANARY_LEAK, findings.canary_leak),
-            (Outcome.DESCENDANT_LEAK, findings.descendant_leak),
-        )
-        if present
-    )
+    return (Outcome.DESCENDANT_LEAK,) if findings.descendant_leak else ()
 
 
 def fallback_failure_marker(case: Case) -> str:
@@ -2636,12 +1916,13 @@ def fallback_failure_marker(case: Case) -> str:
 
 
 def _fallback_record(
-    findings: CaseFindings, canary: str | None, *, case: Case, interrupt: BaseException
+    findings: CaseFindings, *, case: Case, interrupt: BaseException
 ) -> dict[str, object]:
     """The record for a cancelled case whose normal record could not be assembled.
 
     Built only from the findings already collected (never from the failed normal record), so a
-    canary or descendant finding is never lost; the cancellation stays primary.  May raise
+    descendant finding is never lost; the cancellation stays primary.  Carries no
+    ``attempted_quota_execution`` key: omission is never an attempt.  May raise
     :class:`EvidenceError`: the caller then reports the fixed marker only.
     """
     record: dict[str, object] = {
@@ -2656,16 +1937,12 @@ def _fallback_record(
         record["descendants"] = findings.descendants
         if findings.descendant_leak:
             record["descendant_report"] = list(findings.descendant_report)
-    if canary is not None:
-        findings.record_evidence(canary, record)
     record["secondary_findings"] = [o.value for o in secondary_findings_of(findings)]
-    record["canary_scan"] = list(findings.entries)
     return evidence(**record)
 
 
 def _case_record(
     findings: CaseFindings,
-    canary: str | None,
     *,
     case: Case,
     started: float,
@@ -2693,20 +1970,13 @@ def _case_record(
             record["descendant_report"] = list(findings.descendant_report)
     if findings.cleanup_failed:
         record["cleanup_failed"] = ordered_cleanup(findings.cleanup_failed)
-    if canary is not None:
-        findings.record_evidence(canary, record)
     if interrupt is not None:
         resolution = Resolution(
             Outcome.INTERRUPTED, secondary_findings_of(findings), Outcome.INTERRUPTED
         )
         kind = interrupt_kind(interrupt)
     else:
-        resolution = resolve_outcome(
-            adapter_outcome,
-            canary_leak=findings.canary_leak,
-            descendant_leak=findings.descendant_leak,
-            scan_incomplete=findings.incomplete,
-        )
+        resolution = resolve_outcome(adapter_outcome, descendant_leak=findings.descendant_leak)
         kind = "none"
         if exc_class is None and resolution.primary is not adapter_outcome:
             exc_class = "HarnessFailure"  # the harness would have raised the safety outcome
@@ -2716,7 +1986,6 @@ def _case_record(
         adapter_outcome=resolution.adapter_outcome,
         secondary_findings=[o.value for o in resolution.secondary],
         interrupted=kind,
-        canary_scan=list(findings.entries),
     )
     return record, resolution, exc_class
 
@@ -2727,7 +1996,6 @@ async def run_ordered_cases(
     quota: QuotaCounter,
     emit: Callable[[dict[str, object]], None],
     cases: Sequence[Case] = ORDER,
-    pre_hooks: Mapping[Case, Callable[[], None]] | None = None,
     clock: Callable[[], float] = time.monotonic,
     board: FindingsBoard | None = None,
     mark: Callable[[str], None] | None = None,
@@ -2735,9 +2003,9 @@ async def run_ordered_cases(
     """Run ``cases`` in order with injected runners; nothing is ever skipped.
 
     This is the case wrapper: after every case, whatever happened, the findings on ``board`` are
-    resolved by :func:`resolve_outcome` and one sanitized record (with its ``canary_scan``) is
-    emitted.  ``KeyboardInterrupt``, ``CancelledError`` and any other non-``Exception``
-    ``BaseException`` are recorded (findings are secondary), every later case is marked
+    resolved by :func:`resolve_outcome` and one sanitized record is emitted.
+    ``KeyboardInterrupt``, ``CancelledError`` and any other non-``Exception`` ``BaseException`` are
+    recorded (findings are secondary), every later case is marked
     ``not_executed_after_interrupt``, and the *original exception object* is re-raised.
     """
     findings_board = board if board is not None else FindingsBoard()
@@ -2759,8 +2027,6 @@ async def run_ordered_cases(
         attempted = False
         interrupt: BaseException | None = None
         try:
-            if pre_hooks and case in pre_hooks:
-                pre_hooks[case]()
             if case in INFERENCE_CASES:
                 quota.begin_attempt()
                 attempted = True
@@ -2770,21 +2036,17 @@ async def run_ordered_cases(
             fields = dict(case_outcome.fields)
         except HarnessFailure as exc:
             adapter_outcome, exc_class = exc.outcome, exception_class_of(exc)
-            # An escaping ``HarnessFailure.extra`` is the second adapter-controlled source of case
-            # fields (the first is ``_safe_fields``): it never carries the L3 diagnostic keys.
-            fields = {k: v for k, v in exc.extra.items() if k not in DIAG_KEYS}
+            fields = dict(exc.extra)
         except Exception as exc:
-            adapter_outcome = Outcome.INCONCLUSIVE if case is Case.L3 else Outcome.CASE_FAILED
+            adapter_outcome = Outcome.CASE_FAILED
             exc_class = exception_class_of(exc)
         except BaseException as exc:  # cancellation / interrupt: recorded, never converted
             interrupt, adapter_outcome = exc, Outcome.INTERRUPTED
             exc_class = exception_class_of(exc)
 
-        canary = findings_board.canary
         try:
             record, resolution, exc_class = _case_record(
                 findings,
-                canary,
                 case=case,
                 started=started,
                 clock=clock,
@@ -2805,7 +2067,7 @@ async def run_ordered_cases(
                 Outcome.INTERRUPTED, secondary_findings_of(findings), Outcome.INTERRUPTED
             )
             try:
-                _emit(_fallback_record(findings, canary, case=case, interrupt=interrupt))
+                _emit(_fallback_record(findings, case=case, interrupt=interrupt))
             except Exception:
                 with contextlib.suppress(Exception):
                     if mark is not None:
@@ -2841,7 +2103,6 @@ async def run_session(
     quota: QuotaCounter,
     emit: Callable[[dict[str, object]], None],
     cases: Sequence[Case] = ORDER,
-    pre_hooks: Mapping[Case, Callable[[], None]] | None = None,
     board: FindingsBoard | None = None,
     mark: Callable[[str], None] | None = None,
 ) -> SessionResult:
@@ -2861,7 +2122,7 @@ async def run_session(
             session_failure=(exc.outcome, exception_class_of(exc)),
         )
     return await run_ordered_cases(
-        runners, quota=quota, emit=emit, cases=cases, pre_hooks=pre_hooks, board=board, mark=mark
+        runners, quota=quota, emit=emit, cases=cases, board=board, mark=mark
     )
 
 
@@ -2972,7 +2233,7 @@ INTERRUPT_BANNER: Final = "KeyboardInterrupt"
 INTERRUPT_LINE: Final = "interrupted: details withheld"
 
 _OUTCOME_ALT: Final = "|".join(sorted(o.value for o in Outcome))
-_CASE_ALT: Final = "L0|L1|L3|L2"
+_CASE_ALT: Final = "L0|L1"
 _CLASS_PATTERN: Final = "[A-Za-z_][A-Za-z0-9_]{0,63}"
 _CASE_OUTCOME: Final = f"(?:{_CASE_ALT}):(?:{_OUTCOME_ALT})"
 # The fixed texts the harness itself fails with: a prerequisite (``<outcome>:<Class>``) and the
@@ -3116,8 +2377,8 @@ READINESS_TEST_NAME: Final = "test_readiness_probe_only"
 def selected_cases_of(items: Iterable[object]) -> tuple[str, ...]:
     """The cases of the selected run, from the collected items (``request.session.items``).
 
-    ``test_official_live_evidence`` selects L0, L1, L3, L2; ``test_readiness_probe_only`` alone
-    selects L0; both, or neither (fail safe), give the superset L0, L1, L3, L2.
+    ``test_official_live_evidence`` selects L0, L1; ``test_readiness_probe_only`` alone selects
+    L0; both, or neither (fail safe), give the superset L0, L1.
     """
     names = {getattr(item, "name", None) for item in items}
     if OFFICIAL_TEST_NAME not in names and READINESS_TEST_NAME in names:
@@ -3182,7 +2443,6 @@ class ZeroSkipPlugin:
         self.evidence_lines: list[str] = []
         self.ordered_test_passed = False
         self.git_dirty = True
-        self.canary_scans_complete = False
         self.selected_cases: tuple[str, ...] = tuple(selected_cases)
         self.run_record_emitted = False
         self.diagnostics: dict[str, object] = (
@@ -3195,12 +2455,7 @@ class ZeroSkipPlugin:
 
     @property
     def official(self) -> bool:
-        return (
-            self.ordered_test_passed
-            and self.skipped_reports == 0
-            and not self.git_dirty
-            and self.canary_scans_complete
-        )
+        return self.ordered_test_passed and self.skipped_reports == 0 and not self.git_dirty
 
     def hand_over(self, record: Mapping[str, object]) -> bool:
         """Append the run-level record (with the diagnostics); refused if one was already handed."""
@@ -3293,7 +2548,6 @@ def _stub_claude_auth_readiness() -> None:
 class ReadinessObservation:
     ready: bool
     fields: Mapping[str, object] = dataclasses.field(default_factory=dict)
-    streams: Mapping[str, object] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3302,7 +2556,6 @@ class RunObservation:
 
     events: Sequence[object]
     exception: BaseException | None
-    streams: Mapping[str, object]
     total_cost_usd: float | None = None
     effective_model: str | None = None
     fields: Mapping[str, object] = dataclasses.field(default_factory=dict)
@@ -3322,7 +2575,7 @@ class ReadinessAdapter(Protocol):
 
 
 class WorkflowExecutionAdapter(Protocol):
-    async def execute(self, variant: CaseVariant) -> RunObservation: ...
+    async def execute(self, config: Mapping[str, Any]) -> RunObservation: ...
 
 
 class CliEvidenceAdapter(Protocol):
@@ -3333,17 +2586,12 @@ class DescendantSnapshotAdapter(Protocol):
     def snapshot(self) -> Mapping[int, tuple[int, str]]: ...
 
 
-class ObserverInstaller(Protocol):
-    def observing(self) -> contextlib.AbstractContextManager[list[Observation]]: ...
-
-
 @dataclasses.dataclass(frozen=True)
 class AdapterSet:
     readiness: ReadinessAdapter
     workflow: WorkflowExecutionAdapter
     cli: CliEvidenceAdapter
     descendants: DescendantSnapshotAdapter
-    observer: ObserverInstaller
     board: FindingsBoard = dataclasses.field(default_factory=FindingsBoard)
 
 
@@ -3351,13 +2599,14 @@ class AdapterSet:
 # Real adapters: the production paths behind the seams
 # ============================================================================
 #
-# Every adapter enforces the gate and the isolation prerequisite as its first two statements,
-# creates its environment / patch scope with an *independent* ``monkeypatch.context()`` per
-# case, and records its scan on the case's findings for success, failure *and* cancellation.
-# Nothing here reads a credential, an auth payload value, ``~/.claude`` or a Keychain entry.
+# Every adapter enforces the gate and the isolation prerequisite as its first two statements and
+# creates its environment / patch scope with an *independent* ``monkeypatch.context()`` per case.
+# The two adapters that can reach production code enter exactly one private log sink, in one exact
+# ``with`` statement each.  Nothing here reads a credential, an auth payload value, ``~/.claude``
+# or a Keychain entry.
 
 LIVE_QUESTION: Final = "In one short sentence, what is a workflow?"
-CASE_TIMEOUTS_S: Final = {Case.L1: 120.0, Case.L3: 90.0, Case.L2: 120.0}
+CASE_TIMEOUTS_S: Final = {Case.L1: 120.0}
 
 
 def reportable_names(names: Iterable[str]) -> list[str]:
@@ -3365,12 +2614,29 @@ def reportable_names(names: Iterable[str]) -> list[str]:
     return sorted({n for n in names if _ENV_NAME_RE.fullmatch(n)})
 
 
-def apply_env_plan(mp: pytest.MonkeyPatch, plan: EnvPlan) -> None:
-    """Remove the route variables, then set the plan's variables (canary only, L3 and L2)."""
-    for name in plan.removed_names:
+def scrub_routes(mp: pytest.MonkeyPatch, environ: Mapping[str, str]) -> tuple[str, ...]:
+    """Remove the route variables inside the caller's ``monkeypatch`` context; return their names.
+
+    It never sets a variable: no case sets a credential or any other variable.
+    """
+    removed = scrub_route_names(environ)
+    for name in removed:
         mp.delenv(name, raising=False)
-    for name in plan.set_names:
-        mp.setenv(name, plan.values[name])
+    return removed
+
+
+def build_l1_config(yaml_text: str, model: str | None) -> dict[str, Any]:
+    """The one configuration L1 runs: the shipped ``subscription`` example, parsed.
+
+    Only when a validated model override exists is ``workflow.runtime.default_model`` replaced;
+    nothing else is ever changed (``auth_mode`` stays ``subscription``).
+    """
+    import yaml
+
+    doc = dict(yaml.safe_load(yaml_text))
+    if model is not None:
+        doc["workflow"]["runtime"]["default_model"] = model
+    return doc
 
 
 def first_party_constant(api_provider: object, constant: str) -> str:
@@ -3395,51 +2661,6 @@ def readiness_fields(status: Any, billing: tuple[str, str], first_party: str) ->
     }
 
 
-def build_streams(
-    *,
-    stdout_stderr: str,
-    console: object,
-    logs: str,
-    exception: BaseException | None,
-    events: object,
-    workflow_result: object,
-    tmp_path: Path,
-    evidence_fields: Mapping[str, object],
-) -> dict[str, object]:
-    """One entry per :data:`REQUIRED_STREAMS` name (the canary scan needs every category)."""
-    return {
-        "stdout_stderr": stdout_stderr,
-        "console": console,
-        "logs": logs,
-        "exceptions": exception,
-        "events": events,
-        "workflow_result": workflow_result,
-        "evidence": dict(evidence_fields),
-        "tmp_files": read_tmp_files(tmp_path),
-    }
-
-
-def _drain(capture: Any) -> str:
-    """Everything ``capfd`` captured on file descriptors 1 and 2 since the last drain."""
-    if capture is None:
-        return ""
-    out, err = capture.readouterr()
-    return f"{out}\n{err}"
-
-
-def record_case_scan(
-    board: FindingsBoard,
-    case: Case,
-    canary: str,
-    logs: PrivateLogCapture,
-    streams: Mapping[str, object],
-) -> None:
-    """Scan ``streams`` onto the case's findings; a leak seen at log-emit time is kept."""
-    board.for_case(case).record_streams(
-        canary, streams, forced_leaks=("logs",) if logs.leaked else ()
-    )
-
-
 class RealReadinessAdapter:
     """L0: provider built as the factory builds it, real readiness, real billing derivation."""
 
@@ -3449,17 +2670,11 @@ class RealReadinessAdapter:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         *,
-        capfd: Any,
-        canary: str,
-        board: FindingsBoard,
         example_path: Path = EXAMPLE_PATH,
     ) -> None:
         self._config = config
         self._tmp_path = tmp_path
         self._monkeypatch = monkeypatch
-        self._capfd = capfd
-        self._canary = canary
-        self._board = board
         self._example_path = example_path
 
     async def probe(self) -> ReadinessObservation:
@@ -3470,53 +2685,31 @@ class RealReadinessAdapter:
         from conductor.providers.factory import create_provider
 
         runtime = load_config(self._example_path).workflow.runtime
-        removed = scrub_route_names(os.environ)
-        fields: dict[str, object] = {}
-        status: Any = None
-        failure: BaseException | None = None
-        streams: dict[str, object] = {}
-        with self._monkeypatch.context() as mp, PrivateLogCapture(self._canary) as logs:
-            for name in removed:
-                mp.delenv(name, raising=False)
+        with self._monkeypatch.context() as mp, PrivateLogSink():
+            removed = scrub_routes(mp, os.environ)
+            provider = cast(
+                Any,
+                await create_provider(
+                    provider_type="claude-agent-sdk",
+                    validate=False,
+                    default_model=runtime.default_model,
+                    max_session_seconds=runtime.max_session_seconds,
+                    provider_settings=runtime.provider,
+                ),
+            )
             try:
-                provider = cast(
-                    Any,
-                    await create_provider(
-                        provider_type="claude-agent-sdk",
-                        validate=False,
-                        default_model=runtime.default_model,
-                        max_session_seconds=runtime.max_session_seconds,
-                        provider_settings=runtime.provider,
-                    ),
-                )
-                try:
-                    context = provider._capture_auth_context(str(self._tmp_path))
-                    status = await provider._check_auth_readiness(context=context)
-                    billing = sdk._derive_billing(context, status)
-                finally:
-                    await provider.close()
-                fields = readiness_fields(status, billing, sdk._FIRST_PARTY_API_PROVIDER)
-                fields["env_names_removed"] = reportable_names(removed)
-            except BaseException as exc:  # scanned below, then propagates unchanged
-                failure = exc
-                raise
+                context = provider._capture_auth_context(str(self._tmp_path))
+                status = await provider._check_auth_readiness(context=context)
+                billing = sdk._derive_billing(context, status)
             finally:
-                streams = build_streams(
-                    stdout_stderr=_drain(self._capfd),
-                    console=NOT_AVAILABLE,
-                    logs=logs.text,
-                    exception=failure,
-                    events=NOT_AVAILABLE,
-                    workflow_result=NOT_AVAILABLE,
-                    tmp_path=self._tmp_path,
-                    evidence_fields=fields,
-                )
-                record_case_scan(self._board, Case.L0, self._canary, logs, streams)
-        return ReadinessObservation(bool(status.ready), fields, streams)
+                await provider.close()
+            fields = readiness_fields(status, billing, sdk._FIRST_PARTY_API_PROVIDER)
+            fields["env_names_removed"] = reportable_names(removed)
+        return ReadinessObservation(bool(status.ready), fields)
 
 
 class RealWorkflowAdapter:
-    """L1 / L3 / L2 through ``load_config``, ``ProviderRegistry`` and ``WorkflowEngine``."""
+    """L1 through ``load_config``, ``ProviderRegistry`` and ``WorkflowEngine``."""
 
     def __init__(
         self,
@@ -3524,27 +2717,19 @@ class RealWorkflowAdapter:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         *,
-        capfd: Any,
-        canary: str,
-        board: FindingsBoard,
-        timeouts: Mapping[Case, float] = CASE_TIMEOUTS_S,
         question: str = LIVE_QUESTION,
     ) -> None:
         self._config = config
         self._tmp_path = tmp_path
         self._monkeypatch = monkeypatch
-        self._capfd = capfd
-        self._canary = canary
-        self._board = board
-        self._timeouts = dict(timeouts)
         self._question = question
 
     def _fields(
-        self, variant: CaseVariant, usage: Mapping[str, object] | None, started: float
+        self, removed: Iterable[str], usage: Mapping[str, object] | None, started: float
     ) -> dict[str, object]:
         fields: dict[str, object] = {
-            "env_names_set": reportable_names(variant.env.set_names),
-            "env_names_removed": reportable_names(variant.env.removed_names),
+            "env_names_set": [],
+            "env_names_removed": reportable_names(removed),
             "elapsed_s": round(time.monotonic() - started, 3),
         }
         for key, source in (
@@ -3556,7 +2741,7 @@ class RealWorkflowAdapter:
                 fields[key] = value
         return fields
 
-    async def execute(self, variant: CaseVariant) -> RunObservation:
+    async def execute(self, config: Mapping[str, Any]) -> RunObservation:
         require_live_optin(self._config)
         assert_live_isolation(self._tmp_path)
         import io
@@ -3570,18 +2755,16 @@ class RealWorkflowAdapter:
         from conductor.events import WorkflowEventEmitter
         from conductor.providers.registry import ProviderRegistry
 
-        path = self._tmp_path / f"workflow-{variant.case.value}.yaml"
-        path.write_text(yaml.safe_dump(dict(variant.config)))
+        path = self._tmp_path / "workflow-L1.yaml"
+        path.write_text(yaml.safe_dump(dict(config)))
         events: list[dict[str, Any]] = []
         console_buffer = io.StringIO()
         result: Mapping[str, object] | None = None
         usage: Mapping[str, object] | None = None
-        failure: BaseException | None = None
-        fields: dict[str, object] = {}
-        streams: dict[str, object] = {}
+        failure: Exception | None = None
         started = time.monotonic()
-        with self._monkeypatch.context() as mp, PrivateLogCapture(self._canary) as logs:
-            apply_env_plan(mp, variant.env)
+        with self._monkeypatch.context() as mp, PrivateLogSink():
+            removed = scrub_routes(mp, os.environ)
             try:
                 cfg = load_config(path)
                 async with ProviderRegistry(cfg) as registry:
@@ -3592,7 +2775,7 @@ class RealWorkflowAdapter:
                     )
                     result = await asyncio.wait_for(
                         engine.run({"question": self._question}),
-                        self._timeouts[variant.case],
+                        CASE_TIMEOUTS_S[Case.L1],
                     )
                 usage = engine.get_execution_summary()["usage"]
                 display_usage_summary(
@@ -3601,22 +2784,8 @@ class RealWorkflowAdapter:
                 )
             except Exception as exc:  # returned as an observation; the state machine decides
                 failure = exc
-            except BaseException as exc:  # cancellation / interrupt: scanned below, then re-raised
-                failure = exc
-                raise
             finally:
-                fields = self._fields(variant, usage, started)
-                streams = build_streams(
-                    stdout_stderr=_drain(self._capfd),
-                    console=console_buffer.getvalue(),
-                    logs=logs.text,
-                    exception=failure,
-                    events=events,
-                    workflow_result=result if result is not None else NOT_AVAILABLE,
-                    tmp_path=self._tmp_path,
-                    evidence_fields=fields,
-                )
-                record_case_scan(self._board, variant.case, self._canary, logs, streams)
+                fields = self._fields(removed, usage, started)
         completed = [e for e in events if e.get("type") == "agent_completed"]
         data = _event_data(completed[-1]) if completed else {}
         model = data.get("model")
@@ -3624,7 +2793,6 @@ class RealWorkflowAdapter:
         return RunObservation(
             events=events,
             exception=failure,
-            streams=streams,
             total_cost_usd=float(cost)
             if isinstance(cost, int | float) and _is_float(cost)
             else None,
@@ -3634,31 +2802,6 @@ class RealWorkflowAdapter:
             usage=usage,
             console_text=console_buffer.getvalue(),
         )
-
-
-class RealObserverInstaller:
-    """The passive spy on the real ``ClaudeSDKClient.receive_response``, one case at a time."""
-
-    def __init__(self, config: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        self._config = config
-        self._tmp_path = tmp_path
-        self._monkeypatch = monkeypatch
-
-    @contextlib.contextmanager
-    def observing(self) -> Iterator[list[Observation]]:
-        require_live_optin(self._config)
-        assert_live_isolation(self._tmp_path)
-        try:
-            client_class = importlib.import_module("claude_agent_sdk").ClaudeSDKClient
-        except Exception as exc:
-            raise HarnessFailure(Outcome.PREREQ_SDK_MISSING) from exc
-        original = client_class.receive_response
-        sink: list[Observation] = []
-        with self._monkeypatch.context() as mp:
-            install_spy(mp, client_class, sink)
-            yield sink
-        if client_class.receive_response is not original:
-            raise HarnessFailure(Outcome.CASE_FAILED, "observer patch not restored")
 
 
 class RealDescendantAdapter:
@@ -3702,32 +2845,16 @@ def configured_adapters(
     pytestconfig: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capfd: Any,
-    *,
-    canary: str,
 ) -> AdapterSet:
-    """The production adapter set; any construction failure is ``adapters_not_wired``.
-
-    ``capfd`` supplies the ``stdout_stderr`` stream: pytest refuses ``capfd`` and ``capsys`` in
-    one test, and ``capfd`` also captures everything written to ``sys.stdout`` / ``sys.stderr``.
-    One :class:`FindingsBoard` is shared by every adapter and the case wrapper.
-    """
+    """The production adapter set; any construction failure is ``adapters_not_wired``."""
     require_live_optin(pytestconfig)
     assert_live_isolation(tmp_path)
     try:
-        validate_canary(canary)
-        board = FindingsBoard(canary)
         return AdapterSet(
-            readiness=RealReadinessAdapter(
-                pytestconfig, tmp_path, monkeypatch, capfd=capfd, canary=canary, board=board
-            ),
-            workflow=RealWorkflowAdapter(
-                pytestconfig, tmp_path, monkeypatch, capfd=capfd, canary=canary, board=board
-            ),
+            readiness=RealReadinessAdapter(pytestconfig, tmp_path, monkeypatch),
+            workflow=RealWorkflowAdapter(pytestconfig, tmp_path, monkeypatch),
             cli=RealCliEvidenceAdapter(pytestconfig, tmp_path),
             descendants=RealDescendantAdapter(pytestconfig, tmp_path),
-            observer=RealObserverInstaller(pytestconfig, tmp_path, monkeypatch),
-            board=board,
         )
     except HarnessFailure:
         raise
@@ -3752,12 +2879,8 @@ _L0_BOOLEANS: Final = (
 
 
 def _safe_fields(fields: Mapping[str, object]) -> dict[str, object]:
-    """Only allowlisted evidence keys, for attaching to a record.
-
-    The three L3 diagnostic keys are always removed, whatever the case, value or adapter: only the
-    L3 runner assigns them (after ``classify_l3``), so an adapter can never supply them.
-    """
-    return {k: v for k, v in fields.items() if k in EVIDENCE_KEYS and k not in DIAG_KEYS}
+    """Only allowlisted evidence keys, for attaching to a record."""
+    return {k: v for k, v in fields.items() if k in EVIDENCE_KEYS}
 
 
 def assert_l0_success(ready: bool, fields: Mapping[str, object]) -> dict[str, object]:
@@ -3790,16 +2913,20 @@ def assert_l0_success(ready: bool, fields: Mapping[str, object]) -> dict[str, ob
     return safe
 
 
-def _l0_runner(adapters: AdapterSet, canary: str) -> CaseRunner:
+def _l0_runner(adapters: AdapterSet) -> CaseRunner:
     async def run(case: Case) -> CaseOutcome | Outcome:
         observation = await adapters.readiness.probe()
-        if observation.streams is not None:
-            adapters.board.for_case(case).record_streams(canary, observation.streams)
         return CaseOutcome(
             Outcome.OK, assert_l0_success(observation.ready, dict(observation.fields))
         )
 
     return run
+
+
+def _event_type(event: Any) -> object:
+    if isinstance(event, Mapping):
+        return event.get("type")
+    return getattr(event, "type", None)
 
 
 def _event_data(event: object) -> Mapping[str, object]:
@@ -3812,7 +2939,7 @@ def _event_data(event: object) -> Mapping[str, object]:
 
 
 def assert_inference_success(observed: RunObservation, requested_model: str) -> dict[str, object]:
-    """The L1 / L2 success predicate; every failure is one fixed outcome.
+    """The L1 success predicate; every failure is one fixed outcome.
 
     Requires: structured output, ``agent_completed`` with ``billing_mode == "subscription"``,
     an aggregate billing state of ``subscription``, requested and effective models, a priced
@@ -3850,33 +2977,14 @@ def assert_inference_success(observed: RunObservation, requested_model: str) -> 
 
 def _inference_runner(
     adapters: AdapterSet,
-    variants: Mapping[Case, CaseVariant],
-    canary: str,
+    l1_config: Mapping[str, Any],
     requested_model: str,
-) -> Callable[[Case], Awaitable[CaseOutcome | Outcome]]:
+) -> CaseRunner:
     async def run(case: Case) -> CaseOutcome | Outcome:
-        variant = variants[case]
-        with adapters.observer.observing() as sink:
-            observed = await adapters.workflow.execute(variant)
-        # Scan first, also when the execution raised or timed out (the adapter returns an
-        # observation for those).  A leak or an incomplete scan is recorded on the case's
-        # findings; the case wrapper ranks it above the outcome computed below.
-        adapters.board.for_case(case).record_streams(canary, observed.streams)
-        chain = exception_chain(observed.exception)
+        observed = await adapters.workflow.execute(l1_config)
         fields = _safe_fields(observed.fields)
         if observed.exception is not None:
             fields["exception_class"] = exception_class_of(observed.exception)
-        if case is Case.L3:
-            fields["requested_model"] = requested_model
-            # Execution order (design 8.3.1): classification completes and its outcome is fixed
-            # first; only then are the diagnostics reduced and validated, inside the guard, from
-            # the very same ``sink`` and ``chain`` list objects; the complete triple is merged in
-            # one step, after ``_safe_fields``.  The diagnostics never touch the outcome.
-            outcome = classify_l3(sink, chain, observed.events)
-            fields.update(guarded_diagnostics(sink, chain))
-            return CaseOutcome(outcome, fields)
-        if case is Case.L2 and any(o.assistant_error == "authentication_failed" for o in sink):
-            raise HarnessFailure(Outcome.CANARY_USED_IN_L2, extra=fields)
         return CaseOutcome(
             Outcome.OK,
             assert_inference_success(dataclasses.replace(observed, fields=fields), requested_model),
@@ -3888,23 +2996,19 @@ def _inference_runner(
 def build_case_runners(
     adapters: AdapterSet | None,
     *,
-    variants: Mapping[Case, CaseVariant],
-    canary: str,
+    l1_config: Mapping[str, Any],
     requested_model: str,
 ) -> dict[Case, CaseRunner]:
-    """Compose the four case runners from the adapter seams (fail closed if none are supplied)."""
+    """Compose the two case runners from the adapter seams (fail closed if none are supplied)."""
     if adapters is None:
 
         async def unwired(case: Case) -> CaseOutcome | Outcome:
             raise HarnessFailure(Outcome.ADAPTERS_NOT_WIRED)
 
         return dict.fromkeys(ORDER, unwired)
-    inference = _inference_runner(adapters, variants, canary, requested_model)
     return {
-        Case.L0: _l0_runner(adapters, canary),
-        Case.L1: inference,
-        Case.L3: inference,
-        Case.L2: inference,
+        Case.L0: _l0_runner(adapters),
+        Case.L1: _inference_runner(adapters, l1_config, requested_model),
     }
 
 
@@ -3964,9 +3068,7 @@ async def run_official_session(
     prereq_check: Callable[[], str] = check_prerequisites,
     quota: QuotaCounter | None = None,
     emit: Callable[[dict[str, object]], None] | None = None,
-    canary: str | None = None,
     yaml_text: str | None = None,
-    environ: Mapping[str, str] | None = None,
     read_table: Callable[[], Mapping[int, tuple[int, str]]] | None = None,
     sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
     grace_s: float = 10.0,
@@ -3974,25 +3076,20 @@ async def run_official_session(
     facts: Callable[[], dict[str, object]] = environment_facts,
     mark: Callable[[str], None] | None = None,
 ) -> SessionResult:
-    """L0 -> L1 -> L3 -> L2 through the state machine; preflight failures run no case."""
+    """L0 -> L1 through the state machine; preflight failures run no case."""
     require_live_optin(config)
     assert_live_isolation(tmp_path)
     sink = emit or _default_emit(config)
     if mark is None and emit is None:
         mark = _default_marker(config)
     counter = quota or QuotaCounter()
-    secret = canary or make_canary()
-    board = adapters.board if adapters is not None else FindingsBoard(secret)
-    if board.canary is None:
-        board.canary = secret
+    board = adapters.board if adapters is not None else FindingsBoard()
     text = yaml_text if yaml_text is not None else EXAMPLE_PATH.read_text()
     try:
         requested = validate_model(os.environ.get(MODEL_ENV))
     except HarnessFailure:
         requested = DEFAULT_MODEL  # the preflight reports the invalid override
-    variants = build_variants(
-        text, secret, os.environ if environ is None else environ, model=requested
-    )
+    l1_config = build_l1_config(text, requested)
     session_records: list[dict[str, object]] = []
     tree: dict[str, bool] = {"dirty": True}  # official evidence requires a clean tree (D12)
 
@@ -4020,22 +3117,17 @@ async def run_official_session(
         config,
         tmp_path,
         adapters,
-        build_case_runners(adapters, variants=variants, canary=secret, requested_model=requested),
+        build_case_runners(adapters, l1_config=l1_config, requested_model=requested),
         read_table=read_table,
         sleep=sleep,
         grace_s=grace_s,
         board=board,
     )
-    hooks = {
-        Case.L3: lambda: assert_config_paired(variants[Case.L3], variants[Case.L2]),
-        Case.L2: lambda: assert_env_paired(variants[Case.L3], variants[Case.L2]),
-    }
     result = await run_session(
         preflight=preflight,
         runners=runners,
         quota=counter,
         emit=sink,
-        pre_hooks=hooks,
         board=board,
         mark=mark,
     )
@@ -4043,12 +3135,8 @@ async def run_official_session(
     sink(run_level_record(result))
     plugin = config.pluginmanager.get_plugin(ZERO_SKIP_PLUGIN_NAME)
     if plugin is not None:
-        case_records = [r for r in result.evidence if r.get("case") in _REAL_CASES]
         plugin.ordered_test_passed = result.succeeded
         plugin.git_dirty = tree["dirty"]
-        plugin.canary_scans_complete = bool(case_records) and all(
-            scan_is_clean_and_complete(r.get("canary_scan"), r.get("case")) for r in case_records
-        )
     return result
 
 
@@ -4090,7 +3178,7 @@ def _protected_runners(
 async def probe_readiness(
     config: Any,
     tmp_path: Path,
-    adapters: AdapterSet | None,
+    adapters: AdapterSet,
     *,
     readiness_check: Callable[[], None] = assert_real_readiness,
     prereq_check: Callable[[], str] = check_prerequisites,
@@ -4098,7 +3186,6 @@ async def probe_readiness(
     read_table: Callable[[], Mapping[int, tuple[int, str]]] | None = None,
     sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
     grace_s: float = 10.0,
-    canary: str | None = None,
     mark: Callable[[str], None] | None = None,
 ) -> SessionResult:
     """L0 alone (the readiness-only check): not official evidence."""
@@ -4107,11 +3194,7 @@ async def probe_readiness(
     sink = emit or _default_emit(config)
     if mark is None and emit is None:
         mark = _default_marker(config)
-    secret = canary or make_canary()
-    board = adapters.board if adapters is not None else FindingsBoard(secret)
-    if board.canary is None:
-        board.canary = secret
-    runners = build_case_runners(adapters, variants={}, canary=secret, requested_model="")
+    board = adapters.board
 
     def preflight() -> None:
         common_preflight(
@@ -4122,7 +3205,7 @@ async def probe_readiness(
         config,
         tmp_path,
         adapters,
-        {Case.L0: runners[Case.L0]},
+        {Case.L0: _l0_runner(adapters)},
         read_table=read_table,
         sleep=sleep,
         grace_s=grace_s,
@@ -4283,17 +3366,11 @@ def test_readiness_probe_only(
     pytestconfig: pytest.Config,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capfd: pytest.CaptureFixture[str],
 ) -> None:
-    """L0 alone: the readiness-only check.  Not official evidence.
-
-    ``capfd`` is requested without ``capsys``: pytest refuses both in one test, and ``capfd``
-    also captures ``sys.stdout`` / ``sys.stderr`` writes.
-    """
-    canary = make_canary()
+    """L0 alone: the readiness-only check.  Not official evidence."""
     try:
-        adapters = configured_adapters(pytestconfig, tmp_path, monkeypatch, capfd, canary=canary)
-        result = asyncio.run(probe_readiness(pytestconfig, tmp_path, adapters, canary=canary))
+        adapters = configured_adapters(pytestconfig, tmp_path, monkeypatch)
+        result = asyncio.run(probe_readiness(pytestconfig, tmp_path, adapters))
     except HarnessFailure as exc:
         fail_closed(exc, pytestconfig)
     finalize(result)
@@ -4303,13 +3380,11 @@ def test_official_live_evidence(
     pytestconfig: pytest.Config,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capfd: pytest.CaptureFixture[str],
 ) -> None:
-    """L0 -> L1 -> L3 -> L2 in one function: the only way to guarantee order and shared state."""
-    canary = make_canary()
+    """L0 -> L1 in one function: the only way to guarantee order and shared state."""
     try:
-        adapters = configured_adapters(pytestconfig, tmp_path, monkeypatch, capfd, canary=canary)
-        result = asyncio.run(run_official_session(pytestconfig, tmp_path, adapters, canary=canary))
+        adapters = configured_adapters(pytestconfig, tmp_path, monkeypatch)
+        result = asyncio.run(run_official_session(pytestconfig, tmp_path, adapters))
     except HarnessFailure as exc:
         fail_closed(exc, pytestconfig)
     finalize(result)
@@ -4334,7 +3409,6 @@ def iter_adapter_process_methods() -> Iterator[tuple[str, str]]:
     yield from (
         ("RealReadinessAdapter", "probe"),
         ("RealWorkflowAdapter", "execute"),
-        ("RealObserverInstaller", "observing"),
         ("RealDescendantAdapter", "snapshot"),
         ("RealCliEvidenceAdapter", "resolve"),
     )

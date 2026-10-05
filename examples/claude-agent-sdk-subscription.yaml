@@ -6,8 +6,8 @@
 #   - Running with explicit subscription auth_mode (not auto)
 #
 # This example demonstrates a basic workflow using Claude's subscription billing mode.
-# It uses the bundled Claude CLI to authenticate and will display usage information
-# with the label "API-equivalent estimate" (not a real invoice or quota measurement).
+# It uses the bundled Claude CLI to authenticate. The label "API-equivalent estimate" (not a
+# real invoice or quota measurement) appears in the usage information only for priced runs.
 #
 # See docs/providers/claude-subscription.md for the operator runbook.
 #

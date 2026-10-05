@@ -5,11 +5,12 @@
 Claude subscription login, and for the maintainer-only live validation harness.
 
 **No passing official evidence exists yet. The readiness-only check passed once during development.
-The first official validation attempt was retained as a non-official failure record, which authorizes
-nothing. Any future readiness or official operation requires fresh explicit human approval, and no
-retry is ever automatic.** Every *live-proven* cell in the [status table](#status-table) reads
-*not yet*. Nothing on this page claims that a real Claude CLI, login or inference has been exercised
-by the automated harness.
+Two earlier official validation attempts were retained as non-official failure records; in both, the
+readiness and subscription-inference steps were observed to succeed before a later
+credential-precedence step, since retired, failed without a typed authentication signal. These records are not
+evidence: they are never reclassified, authorize nothing and support no claim. Any future readiness
+or official operation requires fresh explicit human approval, and no retry is ever automatic.**
+Live-proven cells change only from official evidence.
 
 ## What this is, and what it is not
 
@@ -70,6 +71,12 @@ conductor validate examples/claude-agent-sdk-subscription.yaml
 configured the child environment. `ANTHROPIC_BASE_URL`, custom headers and proxies are **not**
 neutralized by an explicit mode; they make the billing source `unknown`.
 
+Under explicit `subscription` mode, Conductor blanks `ANTHROPIC_API_KEY` and the other competing
+credential variables in the environment it gives the Claude child process. That is an offline
+property of Conductor's own environment construction, covered by the production provider's tests,
+not something the live harness observes. Auto-mode credential precedence is unproven and out of
+scope.
+
 ## Run the minimal example
 
 This is ordinary product use: it makes **one real inference** on your subscription and writes run
@@ -116,27 +123,29 @@ Each entry is keyed on a message the code can produce.
 
 *Implemented* means the code exists. *Hermetically tested* means the offline test suite covers it
 with test doubles and no real CLI, login or network. *Live-proven* means it was observed against a
-real Claude CLI and login: **nothing is live-proven yet**. *Unverified* lists what only a real run
-can settle.
+real Claude CLI and login. *Unverified* lists what only a real run can settle.
 
 | Capability | Implemented | Hermetically tested | Live-proven | Unverified |
 |---|---|---|---|---|
-| `auth_mode` resolution and env blanking | yes | yes | *not yet* | live blanking (L2) |
+| `auth_mode` resolution and env blanking | yes | yes | not applicable (offline property, R2b′) | — |
 | Readiness (`claude auth status --json`) | yes | yes (fixtures) | *not yet* | real field values (L0) |
-| `billing_mode == subscription` derivation | yes | yes (fixtures) | *not yet* | the `"firstParty"` constant; `subscriptionType` presence |
+| `billing_mode == subscription` derivation | yes | yes (fixtures) | *not yet* | `"firstParty"` constant, `subscriptionType` presence |
 | `API-equivalent estimate` label | yes | yes | *not yet* | real console output |
-| `auto` + API key gives `metered_api` | yes (by construction) | yes | *not yet* (the harness tests an *invalid* key only) | that a valid key wins |
-| Cloud-selector / `setting_sources` refusal | yes | yes | not applicable | managed / enterprise settings |
-| Hard session timeout / interrupt | yes | yes | not in this PR | real-CLI timing |
-| Bundled CLI reads the user's login | none | no | *not yet* (L0, L1) | cross-version compatibility |
-| `conductor run` on a real login | yes | yes (mocked) | *manual step only* | none |
-| Live harness (L0, L1, L3, L2) | yes | yes (all boundaries replaced) | *not yet* | every real-CLI behavior above |
+| `auto` + API key ⇒ `metered_api` | yes (by construction) | yes | out of scope | auto-mode credential precedence (unproven, R2′) |
+| Cloud-selector / `setting_sources` refusal | yes | yes | not applicable | managed/enterprise settings |
+| Hard session timeout / interrupt | yes (#570) | yes | not in this PR | real-CLI timing |
+| Bundled CLI reads the user's login | — | no | *not yet* | cross-version compatibility |
+| Live harness (L0, L1) | yes | yes (all boundaries replaced) | *not yet* | every real-CLI behavior above |
+| `conductor run` entry point on a real login | yes | yes (mocked) | *manual step only* | — |
 
-The *live-proven* column changes only from official evidence, never from expectation. No passing
-official evidence exists yet. The readiness-only check passed once during development. The first
-official validation attempt was retained as a non-official failure record, which authorizes nothing.
-Any future readiness or official operation requires fresh explicit human approval, and no retry is
-ever automatic.
+Live-proven cells change only from official evidence, never from expectation.
+
+No passing official evidence exists yet. The readiness-only check passed once during development.
+Two earlier official validation attempts were retained as non-official failure records; in both, the
+readiness and subscription-inference steps were observed to succeed before a later
+credential-precedence step, since retired, failed without a typed authentication signal. These records are not
+evidence: they are never reclassified, authorize nothing and support no claim. Any future readiness
+or official operation requires fresh explicit human approval, and no retry is ever automatic.
 
 ## Live validation (maintainers)
 
@@ -144,19 +153,34 @@ The harness is `tests/test_integration/test_claude_agent_sdk_subscription_real.p
 safety tests in `tests/test_config/test_claude_subscription_real_gate.py`. It is experimental,
 POSIX-only and never runs in CI, on untrusted pull requests or on shared accounts.
 
-There are two live operations. No passing official evidence exists yet. The readiness-only check
-passed once during development. The first official validation attempt was retained as a non-official
-failure record, which authorizes nothing. Any future readiness or official operation requires fresh
-explicit human approval, and no retry is ever automatic. The two operations are:
+The harness claims exactly four things: (1) readiness reports a usable first-party subscription
+login; (2) one real inference completes through the subscription path and carries the expected
+billing provenance; (3) explicit `subscription` mode neutralizes competing API-key variables in
+Conductor's finalized child environment, an offline property proven by the production provider's
+tests; and (4) auto-mode credential precedence is unproven and out of scope.
+
+No passing official evidence exists yet. The readiness-only check passed once during development.
+Two earlier official validation attempts were retained as non-official failure records; in both, the
+readiness and subscription-inference steps were observed to succeed before a later
+credential-precedence step, since retired, failed without a typed authentication signal. These records are not
+evidence: they are never reclassified, authorize nothing and support no claim. Any future readiness
+or official operation requires fresh explicit human approval, and no retry is ever automatic.
+
+There are two live operations:
 
 - the **readiness-only check** (`-k readiness_probe_only`) runs case L0 alone. It makes **one**
-  authentication probe and no inference. It is **not official end-to-end evidence**.
-- the **official live validation** (`-k official_live_evidence`) runs L0, L1, L3 and L2 in one
-  ordered test. It makes **five** authentication probes and at most three inference-capable
-  attempts.
+  authentication probe and no inference. It is **not official end-to-end evidence**. It is
+  historical: repeating it is neither required nor authorized, and no official run depends on it.
+- the **official live validation** (`-k official_live_evidence`) runs L0 and then L1 in one ordered
+  test. It makes **three** authentication probes and at most **one** inference attempt.
 
 The **optional manual example** is a separate, separately approved step: one ordinary
-`conductor run` of the shipped example (see [Run the minimal example](#run-the-minimal-example)).
+`conductor run` of the shipped example (see [Run the minimal example](#run-the-minimal-example)),
+which adds one inference attempt (two in all).
+
+Each official live validation needs a fresh, explicit human approval that names the exact tested commit, with the human present.
+The approval covers one readiness-plus-inference session only; the inference step is the only one
+that can consume quota, and nothing is retried automatically.
 
 ### The two gates
 
@@ -181,8 +205,7 @@ directory.
    **Untracked files make the tree dirty.** On a dirty tree the run still executes, reports
    `official: false`, and has spent subscription usage for evidence that cannot be used.
 2. The tested Git SHA is recorded in the evidence (`git_sha`, with `git_dirty`), so a result maps to
-   exactly one commit. The readiness-only check does not read the Git state and could run on a
-   dirty tree; run it after the commit anyway, so that its evidence maps to a SHA.
+   exactly one commit.
 3. Use an interpreter that already has the project dependencies. No command on this page installs
    or synchronizes anything. `uv run` and `make` targets are not used because they may synchronize
    an environment.
@@ -195,10 +218,12 @@ the machine throughout **both** the readiness-only check and the official live v
 
 ### Commands
 
-No passing official evidence exists yet. The readiness-only check passed once during development. The
-first official validation attempt was retained as a non-official failure record, which authorizes
-nothing. Any future readiness or official operation requires fresh explicit human approval, and no
-retry is ever automatic.
+No passing official evidence exists yet. The readiness-only check passed once during development.
+Two earlier official validation attempts were retained as non-official failure records; in both, the
+readiness and subscription-inference steps were observed to succeed before a later
+credential-precedence step, since retired, failed without a typed authentication signal. These records are not
+evidence: they are never reclassified, authorize nothing and support no claim. Any future readiness
+or official operation requires fresh explicit human approval, and no retry is ever automatic.
 
 Run both operations in **Bash or Zsh** (zsh on macOS, bash on Linux), from a **plain terminal
 session**, never from inside a Claude Code session shell or another agent shell. Write the steps
@@ -258,11 +283,11 @@ esac
 ```
 
 For the official live validation, run a **separate script** with `EXPECTED=official`, a fresh
-`EVIDENCE_FILE` and the same pre-gate, classifier and matrix around this command, on the same clean
-commit:
+`EVIDENCE_FILE` and the same pre-gate, classifier and matrix around this command, on the exact
+clean commit named in the approval:
 
 ```bash
-# official live validation (L0, L1, L3, L2)
+# official live validation (L0, L1)
 env -u PYTEST_ADDOPTS -u PYTEST_PLUGINS -u PYTEST_DEBUG -u PYTHONWARNINGS -u PYTHONDEVMODE -u PYTHONVERBOSE -u PYTHONPROFILEIMPORTTIME \
   CONDUCTOR_REAL_CLAUDE_SUBSCRIPTION=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/src" \
   "$PY" -m pytest -m real_api \
@@ -373,50 +398,63 @@ any live validation.
 
 ### Sequence
 
-1. Commit the change and confirm the tree is clean, untracked files included.
-2. Run the readiness-only check through the shell gate. Only a capture the classifier prints
-   `readiness_only` for (exit 0) is reviewed, and the next step is approved, separately, only from
-   such a capture; a `failure_record` is kept and approves nothing, and every other combination
-   deletes the capture.
-3. Run the official live validation on the **same clean commit**, through the shell gate with
-   `EXPECTED=official`.
-4. Review the sanitized evidence of an `official` capture **before changing any documentation
-   claim**.
-5. Documentation claims (the [status table](#status-table) and the sentence in
-   [Experimental Providers](experimental.md)) change only after that review and explicit approval,
-   in a **later commit**. Until then every live-proven cell reads *not yet*. The evidence records
-   the tested SHA, so that later commit does not make the evidence circular.
-6. If the evidence contradicts how billing is derived, stop and ask for a separate approval; any
+There is exactly one procedure, and each step needs the previous one:
+
+1. Implement and test offline: the full offline safety tests and the focused falsification checks
+   pass, and nothing live, no readiness probe, no authentication, inference or network operation is
+   run.
+2. An independent reviewer accepts the implementation, offline.
+3. Commit on the feature branch and confirm the tree is clean, untracked files included. The new
+   commit's full SHA is the one the official run must record.
+4. Only then may the human consider a fresh, separate, explicit approval of the official live
+   validation. It names the exact clean tested commit, is given with the human present, covers one
+   session and is not implied by the review, the commit or this page.
+5. Run the official live validation once through the shell gate with `EXPECTED=official` and a
+   fresh `EVIDENCE_FILE`.
+6. Read the verdict through the decision table below. An `official` capture is reviewed by the human
+   and then independently reviewed offline against the recorded `git_sha`, before anything is
+   pushed to a personal fork or any documentation claim changes.
+7. Review the sanitized evidence of an `official` capture **before changing any documentation
+   claim**. The status table and the sentence in [Experimental Providers](experimental.md) change
+   only in a **later commit** that names the tested commit's full SHA in its commit message, and
+   only the five live-proven cells, the history statement and that one sentence may change. Any
+   other change after the tested commit invalidates the official result: it then needs a new clean
+   commit, an independent review, a fresh approval and a new run.
+8. If the evidence contradicts how billing is derived, stop and ask for a separate approval; any
    change to the derivation is a new commit and needs a new official live validation.
+
+After a failure record or a discarded capture, nothing is pushed and no documentation commit is made.
+
+If you check whether the upstream branch moved with `git ls-remote upstream main`, treat the output
+as informational only; it is never followed by an automatic update of this branch.
 
 ### What the official live validation does
 
-The cases run in a fixed order and each one's route environment is scrubbed (every `ANTHROPIC_*`
-variable, `CLAUDE_CODE_OAUTH_TOKEN` and the three cloud selectors are removed for that case only;
-your real `HOME` is kept).
+The two cases run in a fixed order and each one's route environment is scrubbed (every
+`ANTHROPIC_*` variable, `CLAUDE_CODE_OAUTH_TOKEN` and the three cloud selectors are removed for that
+case only; your real `HOME` is kept). The harness sets no credential variable.
 
 | Case | What runs | Passes only if |
 |---|---|---|
 | L0 | The provider is built as the factory builds it for `auth_mode: subscription`; the real readiness check runs; the real billing derivation runs. | Readiness succeeded; billing is `subscription` with reason `first_party_login`; `subscriptionType` is present and `apiKeySource` is absent; the `apiProvider` constant is `validated` or `unexercised` (a mismatch fails). |
-| L1 | The shipped example, loaded with `load_config` and run through `ProviderRegistry` and `WorkflowEngine`. | Structured `answer` output; a real `agent_completed` event with `billing_mode == "subscription"`; aggregate billing state `subscription`; requested and effective model present; a non-zero estimated cost; the label appears in the real usage summary. |
-| L3 | The same workflow with only `auth_mode: auto`, with an **invalid** canary `ANTHROPIC_API_KEY` set. | Classified `invalid_key` from typed SDK signals (never from message text). `fell_back_to_login`, `model_unavailable` and `inconclusive` all fail the run. |
-| L2 | The same workflow and the same environment names as L3, with only `auth_mode: subscription`. Runs only after L3 is `invalid_key`. | The same conditions as L1, and the canary appears in no retained stream. |
+| L1 | The shipped example, loaded with `load_config` and run through `ProviderRegistry` and `WorkflowEngine`, once. | Structured `answer` output; a real `agent_completed` event with `billing_mode == "subscription"`; aggregate billing state `subscription`; requested and effective model present; a non-zero estimated cost; the label appears in the real usage summary. |
 
-The canary is generated per run, is never read from your environment and is never a real key.
+L1 starts only after L0 is `ok`, so a login that readiness cannot report never spends an inference
+attempt. No other case exists, and no step ever sets an API key.
 
 ### Authentication probes and quota
 
 - **Probes.** In the current implementation the production path runs the readiness probe
-  (`claude auth status --json`) once for L0, **twice** for each of L1 and L2 (once when the
-  provider registry validates the provider, once when the agent executes) and not at all for L3
-  (an `auto` run with an API key skips the probe). The readiness-only check is therefore **one**
-  probe and the official live validation is **five** probes (1 + 2 + 0 + 2). Neither duplicate is
-  avoided, because avoiding it would change normal product behavior. This count was observed with
-  test doubles; the real CLI's behavior is unverified. The SDK's own transport can also run
-  `<cli> --version`, and the harness runs it once for evidence. Probes are not inference.
-- **Quota.** At most **three** potentially quota-consuming attempts are allowed (L1, L3, L2); a
-  fourth is refused. The designed flow needs at most two. There is no `retry:` block, so retries
-  cannot multiply attempts. The optional manual example adds one, for a total ceiling of four.
+  (`claude auth status --json`) once for L0 and **twice** for L1 (once when the provider registry
+  validates the provider, once when the agent executes). The readiness-only check is therefore
+  **one** authentication probe and the official live validation is **three** authentication probes
+  (1 + 2). Neither duplicate is avoided, because avoiding it would change normal product behavior.
+  This count was observed with test doubles; the real CLI's behavior is unverified. The SDK's own
+  transport can also run `<cli> --version`, and the harness runs it once for evidence. Probes are
+  not inference.
+- **Quota.** At most **one** potentially quota-consuming attempt is allowed (L1); a second is
+  refused. There is no `retry:` block, so retries cannot multiply attempts. The optional manual
+  example adds one, for a total ceiling of two.
 - **Cost figures** are API-equivalent estimates, never quota, invoices or charges.
 
 ### Reading the evidence
@@ -426,8 +464,8 @@ section of the terminal summary, in three kinds:
 
 - one **session-facts** record (`case: "session"`) after the official path's preflight succeeded;
   the readiness-only check emits **none**;
-- one **per-case** record for each case that ran (L0, L1, L3, L2, in that order), also for a failed,
-  timed-out or interrupted case;
+- one **per-case** record for each case that ran (L0, then L1), also for a failed, timed-out or
+  interrupted case;
 - exactly **one run-level** record (no `case` key), last. A failure that escapes before the ordered
   session returns (the opt-in gate, the isolation prerequisite, unwired adapters, an unavailable
   sanitizer) is recorded by `fail_closed` with `primary_failure: session:<enum>:<Class>`; every
@@ -436,124 +474,77 @@ section of the terminal summary, in three kinds:
 The run-level record carries `primary_failure` (`<prefix>:<enum>:<Class>`: the prefix is `session`
 when no case was active and the case otherwise; the class may be `none`), `not_executed`
 (`<case>:<value>,...` in case order, only for cases that have no record; a completed case is never
-listed), `quota_attempts_total`, `quota_ceiling`, `pytest_version` and `plugins` (the sorted
-distribution plugins, or `unavailable`). `skipped_reports`, `zero_skip_verdict` and `official` are
-**not** record fields: they are the three lines written first under the section heading, and
-`official: true` requires that the ordered test passed, that no test was skipped, that the Git
-working tree was clean and that every case's canary scan was complete and clean. A run that was
-interrupted before any run-level record exists is discarded as `run_record_missing`.
+listed), `quota_attempts_total` (0 or 1), `quota_ceiling` (always 1), `pytest_version` and `plugins`
+(the sorted distribution plugins, or `unavailable`). `skipped_reports`, `zero_skip_verdict` and
+`official` are **not** record fields: they are the three lines written first under the section
+heading, and `official: true` requires that the ordered test passed, that no test was skipped and
+that the Git working tree was clean. A run that was interrupted before any run-level record exists
+is discarded as `run_record_missing`.
 
 Each case record carries:
 
 - `outcome`, the primary outcome, and `adapter_outcome`, what the case itself produced. When a
   safety finding outranks the case, they differ.
-- `secondary_findings`, drawn only from `canary_leak` and `descendant_leak`. The precedence is
-  `canary_leak`, then `descendant_leak`, then an incomplete scan, then the case's own outcome; both
-  leaks are always recorded.
-- `interrupted`: `none`, `keyboard_interrupt`, `cancelled` or `other_base_exception`, and, for an
-  interrupted case only, `exception_class`: the ASCII class name, or `unknown_exception`.
+- `secondary_findings`, drawn only from `descendant_leak`. The precedence is `descendant_leak`, then
+  the case's own outcome; the finding is always recorded.
+- `interrupted`: `none`, `keyboard_interrupt`, `cancelled` or `other_base_exception`.
+- `exception_class`, present when the case raised an exception: the ASCII class name, or
+  `unknown_exception`. This includes interrupted cases but is not limited to them, so a
+  non-interrupted L0 or L1 failure may carry it too. Its presence and value follow the sanitized
+  evidence schema.
 - `cleanup_failed`: a bounded, fixed list drawn only from `descendants` and `evidence`, in that
   order and never repeated; present only when a real cleanup or evidence step failed. It never
   carries free text and never replaces the cancellation or hides a finding.
-- `canary_scan`: exactly eight fixed entries of the form `<stream>:<clean|leak|not_available>`, in
-  this order: `stdout_stderr`, `console`, `logs`, `exceptions`, `events`, `workflow_result`,
-  `evidence`, `tmp_files`. It is emitted on success, failure, timeout and cancellation. The entries
-  never contain matched text, a canary value or a path.
+- `attempted_quota_execution`: whether the case started the one inference attempt (an attempt, not
+  consumption). L0 never does.
 
-The eight streams are what each case scans for the canary:
-
-- `stdout_stderr` is what pytest's file-descriptor capture saw on stdout and stderr.
-- `logs` is a private buffer of the SDK's and the provider's log records only; it never reaches
-  pytest's report handlers, and the root logger is never changed.
-- `workflow_result` is the structured result the engine returned. The engine does not expose the
-  provider's raw response, so that is not scanned separately.
-- `not_available` is allowed only for `workflow_result` (no result), and for `console` and `events`
-  in L0 (no engine); any other gap makes the scan incomplete.
+SDK and provider log records go to a private discarding sink that counts arrivals and keeps no text;
+it never reaches pytest's report handlers, the root logger or Python's last-resort handler.
 
 **Cancellation.** An interrupt (Ctrl-C) or a cancellation is never turned into a test failure and
-never continues to a later case. The harness scans, observes descendants, restores its patches and
-records the findings as secondary evidence, then re-raises the original exception: a cancellation
-remains the primary outcome while its terminal rendering is sanitized. If assembling the normal
-record fails during a cancellation, a fallback record is built from the findings already collected
-(never empty, never without `canary_scan`); if even that cannot be emitted, the only output is the
-fixed line `evidence_fallback_failed: <case>`. The guarantee covers the harness's own steps: a
-production cleanup exception raised while unwinding can still replace a `CancelledError`, and is
-then rendered as `unexpected exception: <ClassName>`.
+never continues to a later case. The harness observes descendants, restores its patches and records
+the findings as secondary evidence, then re-raises the original exception: a cancellation remains
+the primary outcome while its terminal rendering is sanitized. If assembling the normal record
+fails during a cancellation, a fallback record is built from the findings already collected (never
+empty); if even that cannot be emitted, the only output is the fixed line
+`evidence_fallback_failed: <case>`. The guarantee covers the harness's own steps: a production
+cleanup exception raised while unwinding can still replace a `CancelledError`, and is then rendered
+as `unexpected exception: <ClassName>`.
 
 Only allowlisted fields are ever retained: versions, model names, environment variable **names**,
 booleans, fixed outcome codes, token counts and estimated cost. Never retained: account identity,
-raw `auth status` output, credential or canary values, the raw subscription type, home paths,
-Keychain data, raw stdout/stderr, raw log text, exception arguments or matched text.
+raw `auth status` output, credential values, the raw subscription type, home paths, Keychain data,
+raw stdout/stderr, raw log text, exception arguments or matched text.
 
-### Reading the L3 diagnostic fields
+### Reading an official run
 
-The L3 case record (the invalid-key case) may carry three closed-enum **diagnostic fields**:
-`diag_provider_retryability`, `diag_assistant_error` and `diag_api_status`. They **only describe**
-what the harness observed. They never classify, never change an outcome and never authorize a
-step: `invalid_key` still requires typed, non-retryable authentication evidence from the
-provider error and the observed signals, and message text is never used.
+The verdict of the classifier and the records select exactly one row. `I` means some per-case
+record has `interrupted` other than `none`, and `P` is the prefix of the run-level `primary_failure`
+(`session`, `L0` or `L1`), or `none` when it is absent.
 
-The three states are exact:
+| Row | Predicate | Reading | Next action |
+|---|---|---|---|
+| **V1** | `CLASSIFY_STATUS = 0 ∧ VERDICT = official` | a candidate: L0 and L1 both `ok`, one inference attempt, clean committed tree; eligible for the human review of the sequence above; approves nothing by itself | `human_review` |
+| **V2** | `CLASSIFY_STATUS = 0 ∧ VERDICT = readiness_only` | readiness reported a usable login; never official evidence | `human_review` |
+| **V3** | `CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ I` | a cancellation or interrupt; the original exception was primary; read `interrupted`, `descendants` and `secondary_findings` of the interrupted case | `operator_review` |
+| **V4** | `CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ ¬I ∧ P = session` | a prerequisite or session preflight failed; no case ran and no inference was attempted | `prerequisite_investigation` |
+| **V5** | `CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ ¬I ∧ P = L0` | readiness did not report a usable first-party subscription login, or L0 had a safety finding; L1 did not run; no inference attempt | `login_investigation` |
+| **V6** | `CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ ¬I ∧ P = L1` | L1 did not complete a subscription inference with the expected billing provenance (read `outcome`, `exception_class`, `descendants`); one inference attempt may have been spent | `inference_investigation` |
+| **V7** | `CLASSIFY_STATUS = 3 ∧ VERDICT = failure_record ∧ ¬I ∧ P = none` | no interrupt and no case-level or session failure was recorded and the L0/L1 records are otherwise valid, yet the run is not official because of a non-case condition: for example a skip elsewhere in the session (zero-skip), a dirty working tree, or another nonzero pipeline status; read the G4 lines and the session-facts record; no cause is presumed | `not_official_no_case_failure` |
+| **V8** | any other combination of `CLASSIFY_STATUS` and `VERDICT` (every `discard <code>`, an unexpected token, a classifier that failed to start) | not a candidate; the matrix has deleted the capture | `delete_and_stop` |
 
-- `absent` (one field) means the harness collected the signal and saw nothing of that kind.
-- `unavailable` (always all three fields) means the outcome was already fixed and the diagnostic
-  collection or validation then failed.
-- **Omission of all three fields** means L3 classification was never reached, or the capture
-  predates the diagnostic fields. An omitted triple on a `failure_record` is **not itself proof**
-  that classification was never reached: it may be a pre-amendment capture; it remains
-  non-authorizing, and an `official` capture rejects omission (§5.8 item 9).
+Every row ends with the same rule: **no automatic retry; any new run needs a fresh, explicit human
+approval with the human present.** A `failure_record` (V3 to V7) is kept locally, authorizes nothing
+and blocks publication.
 
-An `official` capture is accepted only if its L3 record carries a qualifying triple (a
-non-retryable or `mixed` retryability **and** a typed 401) or the complete all-`unavailable`
-triple; the check can only reject, never create an `official` verdict.
+**The earlier records.** The two earlier official attempts left retained non-official failure
+records, and the earlier readiness-only capture is historical. They are never reclassified, never
+passed to the classifier or the shell gate (whose matrix would delete them), never promoted, shared,
+committed or quoted as evidence, and no file of this change calls any of them a pass or a partial
+pass. They authorize nothing.
 
-The table below is read on the record's **`adapter_outcome`** (what the unchanged classification
-produced), **not** on `outcome`, which a canary or descendant finding can replace. `AO` is the
-`adapter_outcome`, `R` is `diag_provider_retryability`, `A` is `diag_assistant_error` and `S` is
-`diag_api_status`. `T` (typed 401) means `A = authentication_failed` or `S = "401"`. `Q` (the
-gate's non-retryable condition) means `R ∈ {non_retryable, mixed}`. `X` (transient-looking signal)
-means `A ∈ {rate_limit, server_error}` or `S ∈ {"429", 5xx}`. The state of the triple is **C**
-(complete, valid, none `unavailable`), **U** (all three `unavailable`), **O** (omitted) or **M**
-(present but neither C nor U). `K` is {`invalid_key`, `inconclusive`}. Rows 1 to 6 apply only to
-`AO ∈ K` and state C; rows 7a to 7d are the complement. Every row ends with the same rule: **no
-further run and no automatic retry**.
-
-| Row | Predicate | Conclusion | Cannot be concluded | Next action |
-|---|---|---|---|---|
-| **1. Retryable error** | `AO = inconclusive ∧ C ∧ R = retryable ∧ ¬T` | the provider classified the failure as retry-eligible; `rate_limit` or `"429"` points to rate limiting, `server_error` or `5xx` to the provider side | whether an invalid key is rejected with a typed 401 | `environment_investigation` |
-| **2. Non-retryable typed 401** | `AO = invalid_key ∧ C ∧ Q ∧ T` | the fake key was rejected with typed, non-retryable authentication evidence; for `mixed`, a qualifying non-retryable error existed **and** a retryable `ProviderError` was also observed in the same chain, and the conclusion holds for the non-retryable error only | a failure elsewhere in the capture; for `mixed`, which error ended the run | `read_failing_case` |
-| **3. Non-retryable other 4xx** | `AO = inconclusive ∧ C ∧ R = non_retryable ∧ ¬T ∧ S ≠ "404" ∧ ¬X ∧ (S ∈ {"403", other_4xx} ∨ A ∈ {billing_error, invalid_request})` | the provider rejected the request non-retryably with a status or error the harness does not treat as authentication | whether the key was or was not the cause | `environment_investigation` |
-| **4a. No typed signal (non-retryable)** | `AO = inconclusive ∧ C ∧ R = non_retryable ∧ ¬T ∧ S ≠ "404" ∧ ¬X ∧ S ∈ {absent, other} ∧ A ∈ {unknown, other, absent}` | the provider declared the failure non-retryable but no typed signal reached the observer | whether the key was rejected | `harness_investigation` |
-| **4b. No `ProviderError`** | `AO = inconclusive ∧ C ∧ R = absent ∧ ¬T` | the failure was not a `ProviderError` (read `exception_class`) | whether the key was rejected | `environment_investigation` |
-| **5a. Contradictory: retryable with a typed 401** | `AO = inconclusive ∧ C ∧ R = retryable ∧ T` | the observed signals do not describe one failure | which signal is the truth | `product_investigation_offline` |
-| **5b. Contradictory: typed 401 without a `ProviderError`** | `AO = inconclusive ∧ C ∧ R = absent ∧ T` | the observation and the exception do not describe one failure | which signal is the truth | `harness_investigation` |
-| **5c. Contradictory: mixed chain, no typed 401** | `AO = inconclusive ∧ C ∧ R = mixed ∧ ¬T ∧ S ≠ "404"` | the chain held both a retryable and a non-retryable `ProviderError` and no typed signal explains either | which error ended the run | `harness_investigation` |
-| **5d. Contradictory: transient signal on a non-retryable error** | `AO = inconclusive ∧ C ∧ R = non_retryable ∧ ¬T ∧ S ≠ "404" ∧ X` | a non-retryable error carries a transient-looking signal | which signal is the truth | `harness_investigation` |
-| **6a. Impossible: `invalid_key` without qualifying evidence** | `AO = invalid_key ∧ C ∧ ¬(Q ∧ T)` | the diagnostics and the unchanged classification disagree: a harness defect | the diagnostics never re-derive the outcome | `harness_defect_review` |
-| **6b. Impossible: `inconclusive` with qualifying evidence** | `AO = inconclusive ∧ C ∧ Q ∧ T` | the classification would have returned `invalid_key`: a harness defect | as row 6a | `harness_defect_review` |
-| **6c. Impossible: `inconclusive` with a 404 and no typed 401** | `AO = inconclusive ∧ C ∧ Q ∧ ¬T ∧ S = "404"` | the classification would have returned `model_unavailable`: a harness defect | as row 6a | `harness_defect_review` |
-| **7a. Uninterpretable: another outcome** | `AO ∉ K` | nothing from this table | anything about the invalid-key result from the diagnostics | `no_diagnostic_reading` |
-| **7b. Uninterpretable: diagnostics unavailable** | `AO ∈ K ∧ U` | the classification completed and the outcome stands; the collection or validation failed afterwards | anything the diagnostics would have said | `harness_investigation` |
-| **7c. Uninterpretable: diagnostics omitted** | `AO ∈ K ∧ O` | classification was not reached on the diagnostic path, or the capture predates the diagnostic fields | anything from the diagnostics | `no_diagnostic_reading` |
-| **7d. Uninterpretable: malformed triple** | `AO ∈ K ∧ M` | the triple is not valid; the offline classifier discards such a capture | anything | `harness_defect_review` |
-
-Read `AO` first, then the state of the triple, then `R`, `T`, `S` and `A`, and always together
-with `exception_class`, `elapsed_s`, `quota_attempts_total` and `interrupted`. A diagnostic reading
-is a reason to investigate offline, never a reason to run again and never a reason to change the
-classification. `uninterpretable` describes the evidence, not a verdict.
-
-**The first official live validation.** Its capture is a **retained local failure record**: it is
-never shared, committed, quoted as successful or official evidence or used to authorize another
-step, it has no diagnostic fields and it receives no retroactive interpretation. The official live
-validation has **not** passed, and nothing on this page calls that run a pass, a partial pass or
-evidence of subscription inference.
-
-**No step is ever retried automatically.** A new official live validation is considered only after
-the offline correction is implemented, the full offline safety tests and the focused
-falsification checks pass, an independent reviewer accepts it and it is committed on the same feature branch. It
-then needs a **fresh, separate human approval** with the human present: the review, the commit and
-this page do not imply it. Repeating the readiness-only check first is the human's separate
-decision; nothing here requires or authorizes it.
+**No step is ever retried automatically.** Repeating the readiness-only check before the official
+run is neither required nor authorized.
 
 ### Descendant processes
 
@@ -575,9 +566,9 @@ deletes anything under `~/.claude`.
   `claude auth status` performs a network call or raises a Keychain prompt.
 - The real `apiProvider`, `subscriptionType` and `apiKeySource` values; the validated plan class
   would be one plan, one host and one date.
-- How the CLI treats an invalid key under `auto`, and whether the typed signals the harness reads
-  are emitted; without them L3 is `inconclusive`.
-- That a **valid** API key wins over a login (this page makes no such claim).
+- Which credential the CLI uses under `auto` when an API key and a login are both present:
+  auto-mode credential precedence is unproven and out of scope, and nothing here claims that a key
+  was rejected or honored.
 - Managed or enterprise settings and `apiKeyHelper`.
 
 ### Offline safety tests
