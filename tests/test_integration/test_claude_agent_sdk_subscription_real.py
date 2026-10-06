@@ -2796,7 +2796,7 @@ class RealWorkflowAdapter:
         dumper.default_flow_style = False
         dumped = io.StringIO()
         dumper.dump(dict(config), dumped)
-        path.write_text(dumped.getvalue())
+        path.write_text(dumped.getvalue(), encoding="utf-8")
         events: list[dict[str, Any]] = []
         console_buffer = io.StringIO()
         result: Mapping[str, object] | None = None
@@ -3124,7 +3124,7 @@ async def run_official_session(
         mark = _default_marker(config)
     counter = quota or QuotaCounter()
     board = adapters.board if adapters is not None else FindingsBoard()
-    text = yaml_text if yaml_text is not None else EXAMPLE_PATH.read_text()
+    text = yaml_text if yaml_text is not None else EXAMPLE_PATH.read_text(encoding="utf-8")
     try:
         requested = validate_model(os.environ.get(MODEL_ENV))
     except HarnessFailure:

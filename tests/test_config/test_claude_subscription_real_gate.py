@@ -120,7 +120,7 @@ import tokenize
 import types
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -242,6 +242,40 @@ def windows_base_env(platform: str, environ: Mapping[str, str]) -> dict[str, str
     return {name: environ[name] for name in ("SYSTEMROOT",) if name in environ}
 
 
+def home_environment(platform: str, home: Path) -> dict[str, str]:
+    """The isolated home: ``HOME``, plus ``USERPROFILE`` (what ``Path.home()`` reads) on Windows."""
+    env = {"HOME": str(home)}
+    if platform == "win32":
+        env["USERPROFILE"] = str(home)
+    return env
+
+
+def is_absolute_for(platform: str, value: str) -> bool:
+    """Whether ``value`` is an absolute path in ``platform``'s own syntax (not just ``/``-led)."""
+    flavour = PureWindowsPath if platform == "win32" else PurePosixPath
+    return flavour(value).is_absolute()
+
+
+def is_rooted_for(platform: str, value: str) -> bool:
+    """Absolute, or (Windows only) rooted without a drive: ``/Users/x`` and ``\\Windows`` point
+    into the *current* drive there, so they are as foreign to a sandbox as ``C:\\Users\\x``."""
+    if is_absolute_for(platform, value):
+        return True
+    return platform == "win32" and bool(PureWindowsPath(value).root)
+
+
+def is_unc_for(platform: str, value: str) -> bool:
+    return platform == "win32" and PureWindowsPath(value).drive.startswith("\\\\")
+
+
+def inside_root(platform: str, value: str, root: Path) -> bool:
+    """Whether ``value`` resolves inside ``root``.  A UNC path is judged lexically, before any
+    ``resolve()``: resolving ``\\\\server\\share`` on Windows would open it (a network lookup)."""
+    if is_unc_for(platform, value):
+        return False  # a share is never inside a local sandbox
+    return Path(value).resolve().is_relative_to(root)
+
+
 def raises_outcome(outcome: lm.Outcome) -> Any:
     return pytest.raises(lm.HarnessFailure, check=lambda exc: exc.outcome == outcome)
 
@@ -339,12 +373,13 @@ import sys
 
 HITS = os.path.join(os.getcwd(), "tripwire_hits.txt")
 AUDIT = os.path.join(os.getcwd(), "modules_audit.txt")
+PAIR = []  # (original socket.socketpair, its guard); restored at session finish
 ORIGINALS = {}  # identifier -> [owner, attribute, original]; held only to restore, never called
 FORBIDDEN = ("live_module_under_test", "tests.", "claude_agent_sdk", "conductor")
 
 
 def _record(name):
-    with open(HITS, "a") as handle:
+    with open(HITS, "a", encoding="utf-8") as handle:
         handle.write(name + "\\n")
 
 
@@ -379,6 +414,28 @@ def _arm_all():
     _arm(socket.socket, "connect_ex", "socket.connect_ex")
     _arm(socket, "create_connection", "socket.create_connection")
     _arm(socket, "getaddrinfo", "socket.getaddrinfo")
+    _guard_socketpair()
+
+
+def _guard_socketpair():
+    """Windows ``socket.socketpair`` connects to loopback internally (asyncio's self-pipe).
+
+    Only while the original ``socketpair`` runs is the ``connect`` tripwire stood down; it is put
+    back immediately, even on an error, so no other connect is ever permitted.
+    """
+    real_pair = socket.socketpair
+    owner, attr, real_connect = ORIGINALS["socket.connect"]
+    tripwire = getattr(owner, attr)
+
+    def socketpair(*args, **kwargs):
+        setattr(owner, attr, real_connect)
+        try:
+            return real_pair(*args, **kwargs)
+        finally:
+            setattr(owner, attr, tripwire)
+
+    PAIR.append((real_pair, socketpair))
+    socket.socketpair = socketpair
 
 
 _arm_all()  # at import: before any scratch module, conftest, plugin or entry-point plugin
@@ -386,11 +443,13 @@ _arm_all()  # at import: before any scratch module, conftest, plugin or entry-po
 
 def pytest_sessionfinish(session, exitstatus):
     seen = sorted(m for m in sys.modules if m == "tests" or m.startswith(FORBIDDEN))
-    with open(AUDIT, "w") as handle:
+    with open(AUDIT, "w", encoding="utf-8") as handle:
         handle.write("\\n".join(seen))
     while ORIGINALS:
         _name, (owner, attr, original) = ORIGINALS.popitem()
         setattr(owner, attr, original)
+    while PAIR:
+        socket.socketpair = PAIR.pop()[0]
 '''
 
 SEAM_PLUGIN = '''
@@ -407,7 +466,7 @@ def _arm(owner, attr, name):
 
     @functools.wraps(original)
     def recorder(*args, **kwargs):
-        with open(HITS, "a") as handle:
+        with open(HITS, "a", encoding="utf-8") as handle:
             handle.write(name + "\\n")
         raise AssertionError("tripwire: " + name)
 
@@ -556,7 +615,7 @@ def pytest_collection_finish(session):
         if namespace is not None and "read_git_state" in namespace:
             def fake_git_state(config, tmp_path, *, run=None, _pair=pair, _ns=namespace):
                 GIT_SEAM_CALLS.append("read_git_state")
-                with open("git_seam_calls.txt", "a") as handle:
+                with open("git_seam_calls.txt", "a", encoding="utf-8") as handle:
                     handle.write("read_git_state\\n")
                 if fail:  # a Git failure the preflight reports as ``case_failed``
                     raise _ns["HarnessFailure"](_ns["Outcome"].CASE_FAILED, "git unavailable")
@@ -616,6 +675,7 @@ class Sandbox:
         self.pytester = pytester
         self.monkeypatch = monkeypatch
         self.klass = klass
+        self.platform = sys.platform  # a test may set another to exercise the other rules
         self.last_argv: list[str] = []
         pytester.makepyfile(tripwires=LAYER1_PLUGIN)
         if klass == "R":
@@ -629,14 +689,14 @@ class Sandbox:
         assert self.klass == "R", "a Class S sandbox never loads the repository conftest"
         text = CONFTEST_TEMPLATE.format(root=str(ROOT_CONFTEST), extra=extra + GIT_SEAM_CONFTEST)
         target = (where or self.pytester.path) / "conftest.py"
-        target.write_text(text)
+        target.write_text(text, encoding="utf-8")
 
     def write(self, relpath: str, source: str) -> Path:
         if self.klass == "S":
             assert scratch_import_problems(source) == [], relpath
         target = self.pytester.path / relpath
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(source)
+        target.write_text(source, encoding="utf-8")
         return target
 
     def live_tests(self, relpath: str = "test_live_sandbox.py", *, override: bool = True) -> Path:
@@ -650,7 +710,7 @@ class Sandbox:
         """The environment of the child: constructed, never filtered from the parent's."""
         root = self.pytester.path / "_sbx"
         env = {
-            "HOME": str(root / "home"),
+            **home_environment(self.platform, root / "home"),
             "TMPDIR": str(root / "tmp"),
             "TEMP": str(root / "tmp"),
             "TMP": str(root / "tmp"),
@@ -662,7 +722,7 @@ class Sandbox:
         }
         if self.klass == "R":
             env["PYTHONPATH"] = str(REPO_ROOT / "src")
-        env.update(windows_base_env(sys.platform, os.environ))  # never a broken Windows child
+        env.update(windows_base_env(self.platform, os.environ))  # never a broken Windows child
         self.assert_isolated(env)  # the constructed base: no declared extra is in it yet
         for key, value in (extra or {}).items():  # a control's own declared variables only (S8)
             env[key] = value
@@ -676,14 +736,22 @@ class Sandbox:
         for name in env:
             assert not name.startswith(("ANTHROPIC_", "CLAUDE_")), name
         for name in ("HOME", "TMPDIR", "TEMP", "TMP", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):
-            assert Path(env[name]).resolve().is_relative_to(root), name
-        assert Path(env["XDG_CACHE_HOME"]).resolve().is_relative_to(root)
+            assert inside_root(self.platform, env[name], root), name
+        assert inside_root(self.platform, env["XDG_CACHE_HOME"], root)
+        if self.platform == "win32":  # ``Path.home()`` reads USERPROFILE, never HOME, on Windows
+            assert env.get("USERPROFILE") == env["HOME"], "USERPROFILE"
         for name, value in env.items():
-            if name in ("PATH", "PYTHONPATH") or not value.startswith("/"):
+            if name in ("PATH", "PYTHONPATH") or not is_rooted_for(self.platform, value):
                 continue
+            if name == "SYSTEMROOT" and value == os.environ.get("SYSTEMROOT"):
+                continue  # the one variable a Windows child cannot start without, as inherited
             if name.startswith("TRIPWIRE"):
                 continue
-            assert Path(value).resolve().is_relative_to(root), name
+            assert not is_unc_for(self.platform, value), name  # lexical: never resolved
+            # a path that is not native here (the other platform's syntax, or a Windows path
+            # with a root but no drive) is never inside
+            assert Path(value).is_absolute(), name
+            assert inside_root(self.platform, value, root), name
 
     # -- running -----------------------------------------------------------------------------
 
@@ -718,11 +786,13 @@ class Sandbox:
         if self.klass == "S":
             audit = self.pytester.path / "modules_audit.txt"
             if audit.exists():
-                assert audit.read_text().split() == [], "a live module was imported in Class S"
+                assert audit.read_text(encoding="utf-8").split() == [], (
+                    "a live module was imported in Class S"
+                )
 
     def hits(self) -> list[str]:
         path = self.pytester.path / "tripwire_hits.txt"
-        return path.read_text().split() if path.exists() else []
+        return path.read_text(encoding="utf-8").split() if path.exists() else []
 
 
 @pytest.fixture
@@ -945,7 +1015,7 @@ class TestSandboxIsolation:
         self, sandbox: Sandbox, tmp_path_factory: pytest.TempPathFactory
     ) -> None:
         other = tmp_path_factory.mktemp("other-root")
-        (other / "test_live_sandbox.py").write_text(prelude())
+        (other / "test_live_sandbox.py").write_text(prelude(), encoding="utf-8")
         result = sandbox.run("-m", "real_api", f"--rootdir={other}", str(other))
         result.assert_outcomes(failed=2)
         assert "isolation_fixtures_missing" in result.stdout.str()
@@ -1118,7 +1188,9 @@ class TestZeroSkipSandbox:
         )
         result = sandbox.run("test_z.py", *ALL_MARKERS, "-p", "no:terminal", "--junitxml=out.xml")
         assert result.ret != 0
-        assert "prereq_terminalreporter_missing" in (sandbox.pytester.path / "out.xml").read_text()
+        assert "prereq_terminalreporter_missing" in (sandbox.pytester.path / "out.xml").read_text(
+            encoding="utf-8"
+        )
         assert sandbox.hits() == []
 
     def test_h10_v_reports_before_and_after_registration_counted_once(
@@ -1544,7 +1616,7 @@ class _ReportLog:
             longrepr = "\\n".join(entries[-1].lines) if entries else ""
         elif not isinstance(longrepr, str):
             longrepr = repr(longrepr)
-        with open("report_log.jsonl", "a") as handle:
+        with open("report_log.jsonl", "a", encoding="utf-8") as handle:
             row = {"nodeid": report.nodeid, "when": report.when, "outcome": report.outcome}
             handle.write(_rl_json.dumps({**row, "longrepr": longrepr if report.failed else None}))
             handle.write("\\n")
@@ -1593,7 +1665,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     path = os.path.join(os.getcwd(), "replay_data.json")
     if not os.path.exists(path):
         return
-    with open(path) as handle:
+    with open(path, encoding="utf-8") as handle:
         data = json.load(handle)
     terminalreporter.section("claude subscription live evidence")
     for line in data["g4"]:
@@ -1790,7 +1862,7 @@ class Exact:
             assert "readiness_probe_only" not in selector
             for path in self.sandbox.pytester.path.rglob("*.py"):
                 if path.name not in ("tripwires.py", "seams.py"):
-                    text = path.read_text()
+                    text = path.read_text(encoding="utf-8")
                     assert "official_live_evidence" not in text
                     assert "readiness_probe_only" not in text
         else:  # R4: one real test, selected by a ``-k`` that cannot match the other one
@@ -1823,8 +1895,12 @@ class Exact:
         )
         self.sandbox.assert_clean_run(expect_hits=expect_hits)
         log = self.sandbox.pytester.path / "report_log.jsonl"
-        reports = tuple(json.loads(x) for x in log.read_text().splitlines()) if log.exists() else ()
-        saved = self.evidence_file.read_text()
+        reports = (
+            tuple(json.loads(x) for x in log.read_text(encoding="utf-8").splitlines())
+            if log.exists()
+            else ()
+        )
+        saved = self.evidence_file.read_text(encoding="utf-8")
         if not positive_control:
             problems = self.vacuous(
                 saved,
@@ -2110,7 +2186,7 @@ def pytest_sessionfinish(session, exitstatus):
         "args": exc.args == module.ARGS,
         "type": type(exc) is type(module.ORIGINAL),
     }
-    with open("spy.json", "w") as handle:
+    with open("spy.json", "w", encoding="utf-8") as handle:
         json.dump(
             {
                 "same": same,
@@ -2217,7 +2293,7 @@ def pytest_sessionfinish(session, exitstatus):
 
 
 def spy_of(sandbox: Sandbox) -> dict[str, Any]:
-    return json.loads((sandbox.pytester.path / "spy.json").read_text())
+    return json.loads((sandbox.pytester.path / "spy.json").read_text(encoding="utf-8"))
 
 
 @needs_bash
@@ -2312,7 +2388,7 @@ class TestReportSanitizer:
             "test_surface.py::test_pass", "-m", "real_api", "-p", "no:terminal", "--junitxml=o.xml"
         )
         assert result.ret != 0
-        text = (sandbox.pytester.path / "o.xml").read_text()
+        text = (sandbox.pytester.path / "o.xml").read_text(encoding="utf-8")
         assert "prereq_terminalreporter_missing:HarnessFailure" in text
         assert sandbox.hits() == []
 
@@ -2403,7 +2479,7 @@ class TestReportSanitizer:
         """No per-test or per-exception-type carve-out in the module, these tests or the checker."""
         banned = ("allow_" + "traceback", "TRACEBACK" + "_LINE")
         for path in (LIVE_MODULE, Path(__file__)):
-            tree = ast.parse(path.read_text())
+            tree = ast.parse(path.read_text(encoding="utf-8"))
             names: set[str] = set()
             for node in ast.walk(tree):
                 for attr in ("id", "arg", "name", "attr"):
@@ -2835,7 +2911,7 @@ class TestReporterPins:
 
     def test_the_fixture_registers_the_evidence_plugin_then_the_sanitizer(self) -> None:
         """AST: in the gate fixture the sanitizer registration precedes every other call."""
-        tree = ast.parse(LIVE_MODULE.read_text())
+        tree = ast.parse(LIVE_MODULE.read_text(encoding="utf-8"))
         fixture = next(
             n
             for n in ast.walk(tree)
@@ -3221,8 +3297,8 @@ class TestSourceTree:
         src = root / "src" / "conductor"
         test_file.parent.mkdir(parents=True)
         src.mkdir(parents=True)
-        test_file.write_text("")
-        (src / "__init__.py").write_text("")
+        test_file.write_text("", encoding="utf-8")
+        (src / "__init__.py").write_text("", encoding="utf-8")
         return test_file, src / "__init__.py"
 
     def test_inside(self, tmp_path: Path) -> None:
@@ -3486,6 +3562,12 @@ class TestQuota:
 class TestCliClass:
     bundled = Path("/venv/site-packages/claude_agent_sdk/_bundled/claude")
 
+    def test_a_windows_bundled_executable_is_the_bundled_class(self) -> None:
+        exe = Path("C:/venv/Lib/site-packages/claude_agent_sdk/_bundled/claude.exe")
+        assert lm.classify_cli(exe, bundled=exe, bundled_exists=True, on_path=None) == "bundled"
+        with raises_outcome(lm.Outcome.PREREQ_CLI_NOT_BUNDLED):  # the POSIX name is not it
+            lm.classify_cli(exe.with_name("claude"), bundled=exe, bundled_exists=True, on_path=None)
+
     def test_bundled(self) -> None:
         got = lm.classify_cli(self.bundled, bundled=self.bundled, bundled_exists=True, on_path=None)
         assert got == "bundled"
@@ -3524,11 +3606,12 @@ class TestCliClass:
     def test_check_prerequisites_order_and_fixed_enums(self, tmp_path: Path) -> None:
         sdk = tmp_path / "claude_agent_sdk"
         (sdk / "_bundled").mkdir(parents=True)
-        (sdk / "_bundled" / "claude").write_text("")
+        bundled_name = "claude.exe" if sys.platform == "win32" else "claude"  # as the SDK names it
+        (sdk / "_bundled" / bundled_name).write_text("", encoding="utf-8")
         spec = SimpleNamespace(
             submodule_search_locations=[str(sdk)], origin=str(sdk / "__init__.py")
         )
-        bundled = sdk / "_bundled" / "claude"
+        bundled = sdk / "_bundled" / bundled_name
 
         def go(**overrides: Any) -> str:
             base: dict[str, Any] = {
@@ -3819,7 +3902,7 @@ class TestStateMachine:
         assert result.session_failure == (O.LIVE_OPT_IN_ERROR, "LiveOptInError")
 
     def test_the_l1_configuration_is_the_shipped_example(self) -> None:
-        text = lm.EXAMPLE_PATH.read_text()
+        text = lm.EXAMPLE_PATH.read_text(encoding="utf-8")
         parsed = yaml_safe_load(text)
         assert lm.build_l1_config(text, None) == parsed
         assert parsed["workflow"]["runtime"]["provider"]["auth_mode"] == "subscription"
@@ -3914,7 +3997,7 @@ class TestAggregation:
 
 
 def module_ast() -> ast.Module:
-    return ast.parse(LIVE_MODULE.read_text())
+    return ast.parse(LIVE_MODULE.read_text(encoding="utf-8"))
 
 
 def module_level_functions(tree: ast.Module) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
@@ -3948,7 +4031,9 @@ class TestPrivateApiPins:
         from conductor.providers import claude_agent_sdk as provider
 
         # Read from source: the repository's autouse fixture replaces the live attribute.
-        tree = ast.parse((REPO_ROOT / "src/conductor/providers/claude_agent_sdk.py").read_text())
+        tree = ast.parse(
+            (REPO_ROOT / "src/conductor/providers/claude_agent_sdk.py").read_text(encoding="utf-8")
+        )
         methods = {
             n.name: n
             for c in tree.body
@@ -3987,11 +4072,14 @@ class TestPrivateApiPins:
             "_isolated_runs_dir",
             "_stub_claude_auth_readiness",
         )
-        assert missing_module_level_fixtures(ROOT_CONFTEST.read_text(), conftest_names) == []
-        assert "pytest_collection_modifyitems" in module_level_functions(
-            ast.parse(ROOT_CONFTEST.read_text())
+        assert (
+            missing_module_level_fixtures(ROOT_CONFTEST.read_text(encoding="utf-8"), conftest_names)
+            == []
         )
-        live_source = LIVE_MODULE.read_text()
+        assert "pytest_collection_modifyitems" in module_level_functions(
+            ast.parse(ROOT_CONFTEST.read_text(encoding="utf-8"))
+        )
+        live_source = LIVE_MODULE.read_text(encoding="utf-8")
         # The same-name override and the zero-skip registration are module-level fixtures.
         assert (
             missing_module_level_fixtures(
@@ -4200,7 +4288,7 @@ class TestExamplePin:
     example = REPO_ROOT / "examples" / "claude-agent-sdk-subscription.yaml"
 
     def _raw(self) -> dict[str, Any]:
-        return yaml_safe_load(self.example.read_text())
+        return yaml_safe_load(self.example.read_text(encoding="utf-8"))
 
     def test_intended_policy_entry_exists(self) -> None:
         from tests.test_integration.test_examples import TestClaudeAgentSdkExamplesNativeTools
@@ -4281,7 +4369,7 @@ class TestExamplePin:
     def test_the_l1_configuration_is_the_example_and_validates(self) -> None:
         from conductor.config.loader import load_config_string
 
-        text = self.example.read_text()
+        text = self.example.read_text(encoding="utf-8")
         assert lm.build_l1_config(text, None) == self._raw()  # unchanged, ``subscription``
         config = load_config_string(yaml_safe_dump(lm.build_l1_config(text, None)))
         assert config.workflow.runtime.provider.auth_mode == "subscription"
@@ -4622,11 +4710,11 @@ class TestRunbookReferences:
     # -- H14 applied to the REAL runbook ---------------------------------------------------
     def test_h14_the_real_runbook_has_no_drifting_reference(self) -> None:
         assert RUNBOOK_PATH.is_file()
-        text = RUNBOOK_PATH.read_text()
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
         assert runbook_reference_problems(text, REPO_ROOT) == []
 
     def test_h14_the_checker_actually_examined_the_real_runbook(self) -> None:
-        refs = runbook_references(RUNBOOK_PATH.read_text())
+        refs = runbook_references(RUNBOOK_PATH.read_text(encoding="utf-8"))
         assert {
             "examples/claude-agent-sdk-subscription.yaml",
             "tests/test_integration/test_claude_agent_sdk_subscription_real.py",
@@ -4638,11 +4726,11 @@ class TestRunbookReferences:
 
     def test_h14_the_real_runbook_is_about_this_module(self) -> None:
         """The runbook names the exact test selectors that exist in the live module."""
-        for selector in runbook_references(RUNBOOK_PATH.read_text())["selectors"]:
+        for selector in runbook_references(RUNBOOK_PATH.read_text(encoding="utf-8"))["selectors"]:
             assert f"test_{selector}" in dir(lm)
 
     def test_the_real_runbook_satisfies_the_contract(self) -> None:
-        text = RUNBOOK_PATH.read_text()
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
         assert runbook_contract_problems(text) == []
         flat = normalized(text)
         assert flat.count(RUNBOOK_STATUS_STATEMENT) == 4  # intro, status, operations, commands
@@ -4669,7 +4757,7 @@ class TestRunbookReferences:
         ],
     )
     def test_the_contradictory_harness_claim_is_rejected_in_any_wording(self, claim: str) -> None:
-        text = RUNBOOK_PATH.read_text()
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
         assert stale_claim_problems(text) == []
         assert stale_claim_problems(f"{text}\n{claim}\n")
 
@@ -4685,10 +4773,10 @@ class TestRunbookReferences:
     )
     def test_exception_class_is_not_described_as_interrupted_only(self, wording: str) -> None:
         assert stale_claim_problems(wording)
-        assert stale_claim_problems(RUNBOOK_PATH.read_text() + "\n" + wording)
+        assert stale_claim_problems(RUNBOOK_PATH.read_text(encoding="utf-8") + "\n" + wording)
 
     def test_the_runbook_commands_are_the_modules_authorized_commands(self) -> None:
-        text = RUNBOOK_PATH.read_text()
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
         assert lm.READINESS_ONLY_COMMAND in text and lm.OFFICIAL_COMMAND in text
         assert lm.PIPEFAIL_LINE in text
         assert text.index(lm.PIPEFAIL_LINE) < text.index(lm.READINESS_ONLY_COMMAND)
@@ -4809,7 +4897,7 @@ class TestRunbookReferences:
         ],
     )
     def test_h14_contract_drift_is_detected(self, old: str, new: str, expected: str) -> None:
-        text = RUNBOOK_PATH.read_text()
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
         # every occurrence, whatever the line wrapping: one mention is not the contract
         pattern = r"\s+".join(re.escape(word) for word in old.split())
         drifted = re.sub(pattern, lambda _match: new, text)
@@ -4822,12 +4910,12 @@ class TestRunbookReferences:
         assert runbook_contract_problems("readiness-only check") != []
 
     def test_the_runbook_does_not_name_the_retired_machinery(self) -> None:
-        text = RUNBOOK_PATH.read_text()
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
         for retired in ("capfd", "capsys", "caplog", "raw_response", "canary_scan", "diag_"):
             assert retired not in text, retired
 
     def test_the_runbook_does_not_overclaim_or_install(self) -> None:
-        text = RUNBOOK_PATH.read_text()
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
         lowered = text.lower()
         assert not re.search(r"^usage:", text, flags=re.MULTILINE)  # no unlabelled sample output
         assert "make test" not in lowered
@@ -4838,7 +4926,9 @@ class TestRunbookReferences:
         for installer in ("uv sync", "uv run ", "pip install", "npm install -g claude"):
             assert installer not in text.replace("Install with: npm install -g @anthropic-ai", "")
         assert "export CONDUCTOR" not in text
-        assert "384 passed" not in text and "384 passed" not in LIVE_MODULE.read_text()
+        assert "384 passed" not in text and "384 passed" not in LIVE_MODULE.read_text(
+            encoding="utf-8"
+        )
         assert not re.search(
             r"\b\d{3,5} passed, \d+ skipped\b", text
         )  # no fixed test-count baseline
@@ -4846,7 +4936,7 @@ class TestRunbookReferences:
     def test_the_runbook_status_table_separates_the_four_states(self) -> None:
         header = next(
             line
-            for line in RUNBOOK_PATH.read_text().splitlines()
+            for line in RUNBOOK_PATH.read_text(encoding="utf-8").splitlines()
             if line.startswith("| Capability")
         )
         assert [c.strip() for c in header.strip("|").split("|")] == [
@@ -5128,6 +5218,7 @@ class TestDescendants:
         assert await lm.with_descendant_check(fine, **kwargs)(lm.Case.L0) is lm.Outcome.OK
         assert board.for_case(lm.Case.L0).descendants is lm.Outcome.NO_DESCENDANTS_REMAINING
 
+    @requires_ps  # ``ps`` is a POSIX tool: the real positive control never runs on Windows
     def test_positive_control_real_ps_sees_an_owned_child(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -5888,7 +5979,7 @@ class TestCleanupSchema:
     def test_every_enum_value_has_a_real_emitting_path(self) -> None:
         """The code appends exactly the enum's values; a value without a path cannot exist."""
         appended: set[str] = set()
-        for node in ast.walk(ast.parse(LIVE_MODULE.read_text())):
+        for node in ast.walk(ast.parse(LIVE_MODULE.read_text(encoding="utf-8"))):
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
@@ -5957,7 +6048,7 @@ def stale_literals(source: str) -> list[str]:
 class TestStaleLiteralHygiene:
     def test_the_designs_grep_finds_nothing_in_the_two_modules(self) -> None:
         for path in TEST_MODULES:
-            assert stale_literals(path.read_text()) == [], path.name
+            assert stale_literals(path.read_text(encoding="utf-8")) == [], path.name
 
     @pytest.mark.skipif(shutil.which("grep") is None, reason="needs grep")
     def test_the_real_grep_finds_nothing_either(self) -> None:
@@ -6000,7 +6091,7 @@ class TestStaleLiteralHygiene:
 
     def test_the_drift_fixtures_build_their_labels_from_pieces(self) -> None:
         """The negative runbook and stale-comment fixtures never store the exact literal."""
-        source = Path(__file__).read_text()
+        source = Path(__file__).read_text(encoding="utf-8")
         for needle in ("## Phase " + "B: before either operation", '"X' + '2"', '"X' + '3"'):
             assert needle not in source
         # ... yet the fixtures still drive the detectors
@@ -6010,8 +6101,8 @@ class TestStaleLiteralHygiene:
 
     def test_a_directly_stored_label_in_a_test_module_is_caught(self, tmp_path: Path) -> None:
         bad = tmp_path / "test_bad.py"
-        bad.write_text(f'FIXTURE = "## {"Phase " + "B"}: before"\n')
-        assert stale_literals(bad.read_text())
+        bad.write_text(f'FIXTURE = "## {"Phase " + "B"}: before"\n', encoding="utf-8")
+        assert stale_literals(bad.read_text(encoding="utf-8"))
 
 
 def precedence_rows() -> list[Any]:
@@ -6354,7 +6445,7 @@ class TestAdapterSeams:
 
     def test_both_entry_points_pass_the_marker_channel_on(self) -> None:
         """AST: each session entry point hands ``mark`` to ``run_session``."""
-        tree = ast.parse(LIVE_MODULE.read_text())
+        tree = ast.parse(LIVE_MODULE.read_text(encoding="utf-8"))
         for name in ("probe_readiness", "run_official_session"):
             function = next(
                 n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == name
@@ -6447,6 +6538,27 @@ LOGIN_PAYLOAD: dict[str, object] = {
 ANSWER_TEXT = json.dumps({"answer": "A workflow is a sequence of steps."})
 
 
+def stand_down_connect_for_socketpair(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let only the original ``socket.socketpair`` run without the ``connect`` tripwire (Windows).
+
+    Call before the tripwire is armed.  The tripwire is read back and restored around each call.
+    """
+    import socket
+
+    real_pair = socket.socketpair
+    real_connect = socket.socket.connect
+
+    def socketpair(*args: Any, **kwargs: Any) -> Any:
+        tripwire = socket.socket.connect
+        socket.socket.connect = real_connect  # type: ignore[method-assign]
+        try:
+            return real_pair(*args, **kwargs)
+        finally:
+            socket.socket.connect = tripwire  # type: ignore[method-assign]
+
+    monkeypatch.setattr(socket, "socketpair", socketpair)
+
+
 def armed_boundaries(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Fail-closed tripwires on every process / network / SDK-process entry (zero hits expected)."""
     import socket
@@ -6467,6 +6579,7 @@ def armed_boundaries(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     arm(asyncio, "create_subprocess_exec", "create_subprocess_exec")
     arm(asyncio, "create_subprocess_shell", "create_subprocess_shell")
     arm(os, "posix_spawn", "posix_spawn")
+    stand_down_connect_for_socketpair(monkeypatch)  # captures the real ``connect``: arm it first
     arm(socket.socket, "connect", "socket.connect")
     arm(socket, "create_connection", "create_connection")
     try:  # the SDK-side entries exist only where the optional extra is installed
@@ -6635,7 +6748,7 @@ class Stack:
         return dataclasses.replace(adapters, cli=cli)
 
     def l1_config(self) -> dict[str, Any]:
-        return lm.build_l1_config(lm.EXAMPLE_PATH.read_text(), lm.DEFAULT_MODEL)
+        return lm.build_l1_config(lm.EXAMPLE_PATH.read_text(encoding="utf-8"), lm.DEFAULT_MODEL)
 
     def run_cases(
         self,
@@ -8117,7 +8230,7 @@ class TestStructuralTripwires:
         return problems
 
     def test_every_test_that_builds_a_real_adapter_arms_the_tripwires(self) -> None:
-        found = self.structural_tests(Path(__file__).read_text())
+        found = self.structural_tests(Path(__file__).read_text(encoding="utf-8"))
         assert set(found) >= self.EXPECTED, sorted(self.EXPECTED - set(found))
         offenders = {name: self.problems(fn) for name, fn in found.items() if self.problems(fn)}
         assert offenders == {}
@@ -8138,7 +8251,7 @@ class TestStructuralTripwires:
         assert not self.problems(found["test_c"]) and not self.problems(found["test_d"])
 
     def test_the_tripwire_fixture_arms_every_boundary(self) -> None:
-        tree = ast.parse(Path(__file__).read_text())
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
         fixture = module_level_functions(tree)["armed_boundaries"]
         armed = [
             ast.literal_eval(c.args[2])
@@ -8208,7 +8321,7 @@ class TestStaleStatusGuard:
 
     @pytest.mark.parametrize("path", [LIVE_MODULE, Path(__file__)], ids=["live", "gate"])
     def test_no_stale_comment_or_docstring(self, path: Path) -> None:
-        assert stale_status(path.read_text()) == []
+        assert stale_status(path.read_text(encoding="utf-8")) == []
 
     @pytest.mark.parametrize(
         "text",
@@ -8659,7 +8772,7 @@ class TestClassifierGrammar:
             locked.chmod(0o600)
 
     def test_the_removed_headings_are_not_in_the_grammar_constants(self) -> None:
-        source = LIVE_MODULE.read_text()
+        source = LIVE_MODULE.read_text(encoding="utf-8")
         head = source[: source.index('if __name__ == "__main__":')]
         for forbidden in ("FAILURES", "short test summary", "FAILED ", "ERROR "):
             assert forbidden not in "".join(lm.GRAMMAR.values()), forbidden
@@ -9463,10 +9576,10 @@ class TestClassifierHeadStatic:
     """H50."""
 
     def test_the_real_module_has_the_pinned_head(self) -> None:
-        assert head_problems(LIVE_MODULE.read_text()) == []
+        assert head_problems(LIVE_MODULE.read_text(encoding="utf-8")) == []
 
     def test_the_evidence_emitter_shares_the_heads_objects(self) -> None:
-        source = LIVE_MODULE.read_text()
+        source = LIVE_MODULE.read_text(encoding="utf-8")
         tree = ast.parse(source)
         evidence_fn = next(
             n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "evidence"
@@ -9522,14 +9635,14 @@ class TestClassifierHeadStatic:
     def test_positive_controls_each_fail_the_check(
         self, name: str, change: tuple[str, str], expected: str
     ) -> None:
-        source = LIVE_MODULE.read_text()
+        source = LIVE_MODULE.read_text(encoding="utf-8")
         old, new = change
         assert old in source, name
         mutated = source.replace(old, new, 1)
         assert any(expected in p for p in head_problems(mutated)), (name, head_problems(mutated))
 
     def test_the_dispatch_must_exit(self) -> None:
-        source = LIVE_MODULE.read_text().replace(
+        source = LIVE_MODULE.read_text(encoding="utf-8").replace(
             "sys.exit(classifier_main(sys.argv))", "classifier_main(sys.argv)", 1
         )
         assert "the dispatch does not exit" in head_problems(source)
@@ -9589,7 +9702,7 @@ except SystemExit as exc:
     code = exc.code
 except BaseException as exc:
     error = type(exc).__name__
-hits = open(trip.HITS).read().split() if os.path.exists(trip.HITS) else []
+hits = open(trip.HITS, encoding="utf-8").read().split() if os.path.exists(trip.HITS) else []
 result = {
     "stdout": buffer.getvalue(),
     "code": code,
@@ -9598,7 +9711,7 @@ result = {
     "flags": flags,
     "delta": sorted(set(sys.modules) - snapshot),
 }
-with open(out_path, "w") as handle:
+with open(out_path, "w", encoding="utf-8") as handle:
     json.dump(result, handle)
 """
 
@@ -9610,7 +9723,7 @@ class ClassC:
         self.root = root
         for sub in ("home", "tmp", "xdg-config", "xdg-data", "xdg-cache", "work"):
             (root / "_sbx" / sub).mkdir(parents=True, exist_ok=True)
-        (root / "tripwires.py").write_text(LAYER1_PLUGIN)
+        (root / "tripwires.py").write_text(LAYER1_PLUGIN, encoding="utf-8")
 
     @property
     def work(self) -> Path:
@@ -9619,7 +9732,7 @@ class ClassC:
     def environment(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
         base = self.root / "_sbx"
         env = {
-            "HOME": str(base / "home"),
+            **home_environment(sys.platform, base / "home"),
             "TMPDIR": str(base / "tmp"),
             "XDG_CONFIG_HOME": str(base / "xdg-config"),
             "XDG_DATA_HOME": str(base / "xdg-data"),
@@ -9771,11 +9884,12 @@ class TestClassifierEntryPoint:
             assert (done.stdout, done.returncode, done.stderr) == (f"discard {code}\n", 1, ""), argv
         broken = class_c.root / "broken_module.py"
         broken.write_text(
-            LIVE_MODULE.read_text().replace(
+            LIVE_MODULE.read_text(encoding="utf-8").replace(
                 "        return _classify(text, pipeline_status)",
                 '        raise RuntimeError("PLANTED-internal-4417")',
                 1,
-            )
+            ),
+            encoding="utf-8",
         )
         done = class_c.run(class_c.command(class_c.capture(valid, "x"), 0, module=broken))
         assert (done.stdout, done.returncode, done.stderr) == ("discard internal_error\n", 1, "")
@@ -9835,7 +9949,7 @@ class TestClassifierEntryPoint:
         ]
         done = class_c.run(argv)
         assert done.returncode == 0, done.stderr
-        return json.loads(out.read_text())
+        return json.loads(out.read_text(encoding="utf-8"))
 
     def test_the_driver_proves_zero_hits_the_flags_and_the_import_delta(
         self, class_c: ClassC
@@ -9889,10 +10003,10 @@ class TestClassifierEntryPoint:
         assert not names & FORBIDDEN_CLASSIFIER_MODULES
 
     def head_copy(self, class_c: ClassC, extra: str, name: str) -> Path:
-        source = LIVE_MODULE.read_text()
+        source = LIVE_MODULE.read_text(encoding="utf-8")
         marker = 'if __name__ == "__main__":\n    sys.exit(classifier_main(sys.argv))\n'
         copy = class_c.root / name
-        copy.write_text(source.replace(marker, extra + marker, 1))
+        copy.write_text(source.replace(marker, extra + marker, 1), encoding="utf-8")
         return copy
 
     def test_positive_controls_a_heavy_import_before_the_dispatch_is_caught(
@@ -9901,26 +10015,29 @@ class TestClassifierEntryPoint:
         capture = class_c.capture(VALID["readiness_only"][0])
         heavy = self.head_copy(class_c, "import subprocess\n", "heavy.py")
         assert "subprocess" in self.imported(class_c, heavy, capture)  # (c) sees it
-        assert any("subprocess" in p for p in head_problems(heavy.read_text()))  # H50 sees it
+        assert any(
+            "subprocess" in p for p in head_problems(heavy.read_text(encoding="utf-8"))
+        )  # H50 sees it
         # the driver's delta cannot see it (the tripwire already loaded subprocess): (c) and H50 do
         result = self.run_driver(class_c, heavy, capture, 0)
         assert "subprocess" not in {n.split(".")[0] for n in result["delta"]}
         with_pytest = self.head_copy(class_c, "import pytest\n", "withpytest.py")
         failed = self.run_driver(class_c, with_pytest, capture, 0)
         assert failed["error"] == "ModuleNotFoundError" or "pytest" in " ".join(failed["delta"])
-        assert any("pytest" in p for p in head_problems(with_pytest.read_text()))
+        assert any("pytest" in p for p in head_problems(with_pytest.read_text(encoding="utf-8")))
         # a forbidden standard-library module the tripwire did not already load IS in the delta
         network_copy = self.head_copy(class_c, "import urllib.request\n", "withurllib.py")
         loaded = self.run_driver(class_c, network_copy, capture, 0)
         assert "forbidden: urllib" in self.delta_problems(loaded)
-        assert any("urllib" in p for p in head_problems(network_copy.read_text()))
+        assert any("urllib" in p for p in head_problems(network_copy.read_text(encoding="utf-8")))
         noisy = class_c.root / "noisy.py"
         noisy.write_text(
-            LIVE_MODULE.read_text().replace(
+            LIVE_MODULE.read_text(encoding="utf-8").replace(
                 '    sys.stdout.write(line + "\\n")',
                 '    sys.stdout.write("extra\\n" + line + "\\n")',
                 1,
-            )
+            ),
+            encoding="utf-8",
         )
         done = class_c.run(class_c.command(capture, 0, module=noisy))
         assert done.stdout != "readiness_only\n"  # a copy that prints extra text fails (a)(iii)
@@ -9964,7 +10081,7 @@ class TestClassifierStartup:
         directory = class_c.root / "poison"
         directory.mkdir(exist_ok=True)
         for name, source in modules.items():
-            (directory / f"{name}.py").write_text(source)
+            (directory / f"{name}.py").write_text(source, encoding="utf-8")
         return directory
 
     @pytest.mark.parametrize("module", ["json", "re"])
@@ -10020,7 +10137,7 @@ class TestClassifierStartup:
     def test_startup_and_bytecode_variables_are_ignored(self, armed: Any) -> None:
         class_c, capture, before = armed
         startup = class_c.root / "startup.py"
-        startup.write_text(POISON_PRINTS)
+        startup.write_text(POISON_PRINTS, encoding="utf-8")
         env = {
             "PYTHONSTARTUP": str(startup),
             "PYTHONWARNINGS": "error",
@@ -10036,9 +10153,9 @@ class TestClassifierStartup:
         copy_dir = class_c.root / "copy"
         copy_dir.mkdir()
         module = copy_dir / LIVE_MODULE.name
-        module.write_text(LIVE_MODULE.read_text())
+        module.write_text(LIVE_MODULE.read_text(encoding="utf-8"), encoding="utf-8")
         for name in ("json", "re"):
-            (copy_dir / f"{name}.py").write_text(POISON_PRINTS)
+            (copy_dir / f"{name}.py").write_text(POISON_PRINTS, encoding="utf-8")
         done = class_c.run(class_c.command(capture, 0, module=module))
         self.check(done, class_c, before)
         # without ``-I`` the script directory comes first on ``sys.path`` and forges the verdict
@@ -10049,16 +10166,23 @@ class TestClassifierStartup:
         class_c, capture, before = armed
         base = Path(os.path.realpath(sys.executable))
         layout = class_c.root / "layout"
-        (layout / "bin").mkdir(parents=True)
-        interpreter = layout / "bin" / "python"
+        windows = sys.platform == "win32"
+        interpreter = layout / ("Scripts" if windows else "bin")
+        interpreter = interpreter / ("python.exe" if windows else "python")
+        interpreter.parent.mkdir(parents=True)
         symlink_or_skip(interpreter, base)
         (layout / "pyvenv.cfg").write_text(
-            f"home = {base.parent}\ninclude-system-site-packages = false\n"
+            f"home = {base.parent}\ninclude-system-site-packages = false\n", encoding="utf-8"
         )
         version = f"python{sys.version_info.major}.{sys.version_info.minor}"
-        site = layout / "lib" / version / "site-packages"
+        # a Windows venv keeps ``Lib/site-packages``; a POSIX one ``lib/pythonX.Y/site-packages``
+        site = layout / "Lib" / "site-packages"
+        if not windows:
+            site = layout / "lib" / version / "site-packages"
         site.mkdir(parents=True)
-        (site / "poison.pth").write_text("import sys; sys.stdout.write('official\\n')\n")
+        (site / "poison.pth").write_text(
+            "import sys; sys.stdout.write('official\\n')\n", encoding="utf-8"
+        )
         python = str(interpreter)
         done = class_c.run(class_c.command(capture, 0, python=python))
         self.check(done, class_c, before)
@@ -10116,7 +10240,7 @@ class GateRunner:
         self.ran = root / "pytest_ran"
         self.argv_log = root / "argv.log"
         self.standin = root / "standin.sh"
-        self.standin.write_text(STANDIN_CLASSIFIER)
+        self.standin.write_text(STANDIN_CLASSIFIER, encoding="utf-8")
         self.standin.chmod(0o755)
 
     def run(
@@ -10184,7 +10308,7 @@ class GateRunner:
             target.exists() or target.is_symlink(),
             target.read_bytes() if target.is_file() else None,
             self.ran.exists(),
-            self.argv_log.read_text().split() if self.argv_log.exists() else [],
+            self.argv_log.read_text(encoding="utf-8").split() if self.argv_log.exists() else [],
             status[-1] if status else "",
         )
 
@@ -10456,7 +10580,7 @@ class TestShellGate:
         stubs.mkdir(exist_ok=True)
         for name, body in scripts.items():
             stub = stubs / name
-            stub.write_text("#!/bin/sh\n" + body + "\n")
+            stub.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
             stub.chmod(0o755)
         return f"{stubs}:{SYSTEM_PATH}"
 
@@ -10602,7 +10726,7 @@ class TestShellGate:
         assert "capture deleted; stop" in done.stdout and gate.evidence.exists()  # the false claim
 
     def test_generic_posix_sh_is_documented_only(self) -> None:
-        text = RUNBOOK_PATH.read_text()
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
         assert "Bash or Zsh" in text and "not** generic POSIX `sh`" in text
         assert "dash" in text
 
@@ -10620,14 +10744,14 @@ class TestShellGate:
 
         pre = 'set -o pipefail\n: > "$EVIDENCE_FILE"\n'
         gate_status_zero = gate.root / "official.txt"
-        gate_status_zero.write_text(text)
+        gate_status_zero.write_text(text, encoding="utf-8")
         script_block = lm.CLASSIFY_BLOCK.replace(
             "tests/test_integration/test_claude_agent_sdk_subscription_real.py", str(LIVE_MODULE)
         )
 
         def real(status_line: str, classify: str) -> Gate:
             gate.evidence.unlink(missing_ok=True)
-            gate.evidence.write_text(text)
+            gate.evidence.write_text(text, encoding="utf-8")
             return gate.run(
                 shell,
                 python=sys.executable,
@@ -10900,7 +11024,7 @@ class TestPreReporterFailures:
         exact_scratch.module(self.SCRATCH_TEST)
         exact_scratch.sandbox.write("failing_plugin.py", FAILING_PLUGIN)
         for path in exact_scratch.sandbox.pytester.path.rglob("*.py"):
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
             assert str(REPO_ROOT) not in text, path.name  # no repository path is added
             if path.name == "tripwires.py":  # the stdlib-only Layer 1: it only names what it audits
                 assert "import conductor" not in text
@@ -11046,7 +11170,7 @@ class TestInheritedConfiguration:
         self.go(replay)
         assert replay.sandbox.hits() == []
         audit = replay.sandbox.pytester.path / "modules_audit.txt"
-        assert audit.read_text().split() == []
+        assert audit.read_text(encoding="utf-8").split() == []
 
 
 @needs_bash
@@ -11101,8 +11225,12 @@ class TestInheritedPythonColourAndEntryPoints:
         replay.sandbox.write("extplug_mod.py", EXTERNAL_PLUGIN)
         dist = sandbox_root / "extplug-1.0.dist-info"
         dist.mkdir()
-        (dist / "METADATA").write_text("Metadata-Version: 2.1\nName: extplug\nVersion: 1.0\n")
-        (dist / "entry_points.txt").write_text("[pytest11]\nextplug = extplug_mod\n")
+        (dist / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: extplug\nVersion: 1.0\n", encoding="utf-8"
+        )
+        (dist / "entry_points.txt").write_text(
+            "[pytest11]\nextplug = extplug_mod\n", encoding="utf-8"
+        )
         ran = self.go(replay)
         assert "EXT-IMPORT-MARKER-4417" in ran.saved  # genuinely auto-loaded (autoload stays on)
         assert "EXT-SUMMARY-MARKER-4417" in ran.saved
@@ -11624,7 +11752,7 @@ class TestTwoPathInvariant:
 
     def test_the_signature_and_every_call_site(self) -> None:
         assert list(inspect.signature(lm.fail_closed).parameters) == ["exc", "config"]
-        tree = ast.parse(LIVE_MODULE.read_text())
+        tree = ast.parse(LIVE_MODULE.read_text(encoding="utf-8"))
         calls = [
             n
             for n in ast.walk(tree)
@@ -11644,7 +11772,7 @@ class TestTwoPathInvariant:
     def test_no_gated_run_passes_adapters_none_and_the_branch_is_not_a_legal_record(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        tree = ast.parse(LIVE_MODULE.read_text())
+        tree = ast.parse(LIVE_MODULE.read_text(encoding="utf-8"))
         for fn in tree.body:
             if isinstance(fn, ast.FunctionDef) and fn.name in (
                 "test_official_live_evidence",
@@ -11681,6 +11809,7 @@ class TestTwoPathInvariant:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv(lm.GATE_ENV, "1")
+        monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
         monkeypatch.setattr(lm, "assert_live_isolation", lambda tmp: None)
         monkeypatch.setattr(lm, "assert_session_console_ready", lambda: None)
         config = make_config(reporter=None)
@@ -11699,7 +11828,7 @@ class TestTwoPathInvariant:
             not_executed="L0:not_executed_after_safety_failure",
         )
         assert classify(bad, 1) == ("discard", "evidence_inconsistent")
-        tree = ast.parse(LIVE_MODULE.read_text())
+        tree = ast.parse(LIVE_MODULE.read_text(encoding="utf-8"))
         fixture = next(
             n
             for n in ast.walk(tree)
@@ -11883,6 +12012,7 @@ def pytest_configure(config):
         assert done.returncode == 1
 
     def test_a_control_without_the_scratch_plugin_takes_the_normal_path(self, exact: Exact) -> None:
+        pytest.importorskip("claude_agent_sdk")  # the real prerequisite check runs in the child
         ran = self.scenario(exact, "")
         assert ran.returncode == 0 and ran.verdict == ("readiness_only", "ok"), ran.saved
 
@@ -11919,7 +12049,7 @@ def pytest_sessionfinish(session, exitstatus):
         )
         exact.run(READINESS_NODE, env={"SANDBOX_FAKE_SCRIPT": "{}"}, allow_warnings=True)
         order = exact.sandbox.pytester.path / "order.txt"
-        assert order.exists() is False or order.read_text().split(",")[:3] == [
+        assert order.exists() is False or order.read_text(encoding="utf-8").split(",")[:3] == [
             "evidence",
             "sanitizer",
             "prerequisite",
@@ -11968,7 +12098,7 @@ def pytest_sessionfinish(session, exitstatus):
     def test_neither_the_docstring_nor_the_runbook_claims_the_fixture_guarantees_fixed_lines(
         self,
     ) -> None:
-        for text in (lm.__doc__ or "", RUNBOOK_PATH.read_text()):
+        for text in (lm.__doc__ or "", RUNBOOK_PATH.read_text(encoding="utf-8")):
             flat = normalized(text)
             assert not re.search(r"reaching the (?:gate )?fixture guarantees (?:only )?fixed", flat)
             assert "sanitizer is registered first" not in flat.lower()
@@ -11998,6 +12128,7 @@ class TestEndToEnd:
         assert "official: false" in out.ran.saved and out.session[0]["git_dirty"] is True
 
     def test_a_passing_readiness_only_run_classifies_readiness_only(self, exact: Exact) -> None:
+        pytest.importorskip("claude_agent_sdk")  # the real prerequisite check runs in the child
         out = real_run(exact, READINESS_NODE)
         assert out.ran.returncode == 0 and out.ran.verdict == ("readiness_only", "ok"), (
             out.ran.saved
@@ -12009,11 +12140,15 @@ class TestEndToEnd:
         self, exact: Exact, tmp_path: Path
     ) -> None:
         sandbox_root = exact.sandbox.pytester.path
-        (sandbox_root / "extplug_mod.py").write_text("")
+        (sandbox_root / "extplug_mod.py").write_text("", encoding="utf-8")
         dist = sandbox_root / "extplug-1.0.dist-info"
         dist.mkdir()
-        (dist / "METADATA").write_text("Metadata-Version: 2.1\nName: extplug\nVersion: 1.0\n")
-        (dist / "entry_points.txt").write_text("[pytest11]\nextplug = extplug_mod\n")
+        (dist / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: extplug\nVersion: 1.0\n", encoding="utf-8"
+        )
+        (dist / "entry_points.txt").write_text(
+            "[pytest11]\nextplug = extplug_mod\n", encoding="utf-8"
+        )
         expected = sorted(
             {
                 f"{d.metadata['Name']}=={d.version}"
@@ -12082,7 +12217,7 @@ class TestEndToEnd:
         assert classify(parts, 0) == ("discard", "evidence_record_invalid")
 
     def test_no_private_pytest_or_pluggy_attribute_is_used_by_the_diagnostics(self) -> None:
-        tree = ast.parse(LIVE_MODULE.read_text())
+        tree = ast.parse(LIVE_MODULE.read_text(encoding="utf-8"))
         for name in ("pytest_version_text", "plugin_names_of", "run_diagnostics"):
             fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
             attrs = {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)}
@@ -12095,14 +12230,18 @@ class TestEndToEnd:
         out = real_run(
             exact, OFFICIAL_NODE, env={"SANDBOX_GIT_PAIR": json.dumps(["2" * 40, False])}
         )
-        calls = (exact.sandbox.pytester.path / "git_seam_calls.txt").read_text().split()
+        calls = (
+            (exact.sandbox.pytester.path / "git_seam_calls.txt").read_text(encoding="utf-8").split()
+        )
         assert calls == ["read_git_state"]  # the fake was called by ``run_official_session``
         assert out.session[0]["git_sha"] == "2" * 40  # ... and returned the scenario's pair
         # the control: without the replacement the real Git runs and the Popen tripwire fires
         sandbox = exact.sandbox
         exact.module(FAKE_WORLD, exports=LIVE_EXPORTS, filename="test_live.py")
-        text = (sandbox.pytester.path / "conftest.py").read_text()
-        (sandbox.pytester.path / "conftest.py").write_text(text.replace(GIT_SEAM_CONFTEST, ""))
+        text = (sandbox.pytester.path / "conftest.py").read_text(encoding="utf-8")
+        (sandbox.pytester.path / "conftest.py").write_text(
+            text.replace(GIT_SEAM_CONFTEST, ""), encoding="utf-8"
+        )
         control = exact.run(
             OFFICIAL_NODE,
             env={"SANDBOX_FAKE_SCRIPT": "{}"},
@@ -12156,7 +12295,7 @@ def test_a_replacement_never_calls_through():
         else:
             raise RuntimeError("not armed: " + name)
     assert called == []  # no sentinel was ever called: nothing is called through
-    hits = open(trip.HITS).read().split("\\n")[:-1]
+    hits = open(trip.HITS, encoding="utf-8").read().split("\\n")[:-1]
     assert hits == list(calls)  # exactly one fixed identifier per call, no argument text
     assert not any("PLANTED" in hit for hit in hits)
 """
@@ -12213,8 +12352,12 @@ class TestIsolationControls:
             scratch.write("ep_plugin.py", IMPORT_TIME_ATTEMPT)
             dist = root / "epx-1.0.dist-info"
             dist.mkdir()
-            (dist / "METADATA").write_text("Metadata-Version: 2.1\nName: epx\nVersion: 1.0\n")
-            (dist / "entry_points.txt").write_text("[pytest11]\nepx = ep_plugin\n")
+            (dist / "METADATA").write_text(
+                "Metadata-Version: 2.1\nName: epx\nVersion: 1.0\n", encoding="utf-8"
+            )
+            (dist / "entry_points.txt").write_text(
+                "[pytest11]\nepx = ep_plugin\n", encoding="utf-8"
+            )
             env["PYTHONPATH"] = str(root)
         result = scratch.run(*args, gate=False, env=env, expect_hits=True)
         assert "subprocess.Popen" in scratch.hits(), (
@@ -12267,12 +12410,36 @@ class TestIsolationControls:
         # a stub named claude on PATH
         stub_dir = tmp_path / "bin"
         stub_dir.mkdir()
-        stub = stub_dir / "claude"
-        stub.write_text("#!/bin/sh\n")
+        stub = stub_dir / ("claude.exe" if sys.platform == "win32" else "claude")
+        stub.write_text("#!/bin/sh\n", encoding="utf-8")
         stub.chmod(0o755)
-        monkeypatch.setattr(sys.modules[__name__], "SYSTEM_PATH", f"{stub_dir}:/usr/bin:/bin")
+        monkeypatch.setattr(
+            sys.modules[__name__], "SYSTEM_PATH", os.pathsep.join([str(stub_dir), SYSTEM_PATH])
+        )
+        assert shutil.which("claude", path=SYSTEM_PATH) is not None  # visible, so not vacuous
         with pytest.raises(AssertionError):
             scratch.assert_isolated(env)
+
+    @pytest.mark.parametrize("name", ["claude", "claude.exe"])
+    def test_a_stub_of_either_platform_shape_on_path_fails_closed(
+        self, scratch: Sandbox, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        if sys.platform == "win32" and name == "claude":
+            pytest.skip("Windows resolves claude through PATHEXT; the claude.exe case covers it")
+        env = scratch.child_environment()
+        stub_dir = tmp_path / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / name
+        stub.write_text("#!/bin/sh\n", encoding="utf-8")
+        stub.chmod(0o755)
+        monkeypatch.setattr(
+            sys.modules[__name__], "SYSTEM_PATH", os.pathsep.join([str(stub_dir), SYSTEM_PATH])
+        )
+        assert shutil.which(name, path=SYSTEM_PATH) is not None  # the stub is genuinely visible
+        with pytest.raises(AssertionError):
+            scratch.assert_isolated(env)
+        monkeypatch.undo()
+        scratch.assert_isolated(env)  # control: without the stub the same environment passes
 
     def test_a_tripwire_hit_without_the_declared_control_fails_the_builder(
         self, scratch: Sandbox
@@ -12431,6 +12598,8 @@ SCRATCH_SOURCES = {
 
 # The class every sandbox-using test class belongs to (design section 10).
 SANDBOX_CLASS = {
+    "TestWindowsChildIsolation": "S",
+    "TestPlatformCorrectAbsolutePaths": "S",
     "TestPlatformGuards": "S",
     "TestNoRetroactiveAcceptance": "R",
     "TestFailClosedConditions": "R",
@@ -12518,7 +12687,7 @@ class TestBuilderAudit:
             assert str(REPO_ROOT) not in value
 
     def test_every_sandbox_test_declares_its_class(self) -> None:
-        tree = ast.parse(Path(__file__).read_text())
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
         found: dict[str, set[str]] = {}
         for node in tree.body:
             if not isinstance(node, ast.ClassDef) or not node.name.startswith("Test"):
@@ -12553,7 +12722,7 @@ class TestBuilderAudit:
 class TestRunbookStatements:
     """H37: a pure-text test over the runbook (no sandbox, no subprocess)."""
 
-    TEXT = normalized(RUNBOOK_PATH.read_text())
+    TEXT = normalized(RUNBOOK_PATH.read_text(encoding="utf-8"))
 
     @pytest.mark.parametrize(
         "statement",
@@ -12608,7 +12777,7 @@ class TestRunbookStatements:
 
     def test_the_changelog_describes_a_harness_not_a_validation_that_ran(self) -> None:
         fragment = REPO_ROOT / "changelog.d" / "+claude-agent-sdk-subscription-validation.added.md"
-        text = fragment.read_text()
+        text = fragment.read_text(encoding="utf-8")
         assert len(text.strip().split("\n\n")) == 1  # one concise entry, wrapped
         assert max(len(line) for line in text.splitlines()) <= 80
         assert text.startswith("Opt-in live-validation harness and operator runbook")
@@ -13136,7 +13305,7 @@ class LiveSource:
 
 
 def live_source_text() -> str:
-    return LIVE_MODULE.read_text()
+    return LIVE_MODULE.read_text(encoding="utf-8")
 
 
 def conductor_imports(source: str) -> set[tuple[Any, ...]]:
@@ -15582,7 +15751,7 @@ class TestCountingFakes:
         loggers_before = private_logger_state()
         probe = RootProbe(monkeypatch)
         adapter = lm.RealWorkflowAdapter(make_config(), tmp_path, monkeypatch)
-        config = lm.build_l1_config(lm.EXAMPLE_PATH.read_text(), None)
+        config = lm.build_l1_config(lm.EXAMPLE_PATH.read_text(encoding="utf-8"), None)
         order: list[str] = []
 
         async def go() -> lm.RunObservation:
@@ -15628,7 +15797,7 @@ class TestCountingFakes:
         async def go() -> lm.RunObservation:
             async with scoped_tripwires(counts.violations, counts.n):
                 observation = await adapter.execute(
-                    lm.build_l1_config(lm.EXAMPLE_PATH.read_text(), None)
+                    lm.build_l1_config(lm.EXAMPLE_PATH.read_text(encoding="utf-8"), None)
                 )
             return observation
 
@@ -15659,7 +15828,7 @@ class TestCountingFakes:
         async def go() -> lm.RunObservation:
             async with scoped_tripwires(counts.violations, counts.n):
                 observation = await adapter.execute(
-                    lm.build_l1_config(lm.EXAMPLE_PATH.read_text(), None)
+                    lm.build_l1_config(lm.EXAMPLE_PATH.read_text(encoding="utf-8"), None)
                 )
             return observation
 
@@ -15691,7 +15860,9 @@ class TestCountingFakes:
 
         async def go() -> None:
             async with scoped_tripwires(counts.violations, counts.n):
-                await adapter.execute(lm.build_l1_config(lm.EXAMPLE_PATH.read_text(), None))
+                await adapter.execute(
+                    lm.build_l1_config(lm.EXAMPLE_PATH.read_text(encoding="utf-8"), None)
+                )
 
         asyncio.run(go())
         assert counts.n[FakeSite.registry] == 2
@@ -15787,7 +15958,7 @@ class TestCountingFakes:
             assert order == ["pending_checked", "restored"]
 
     def test_a_counting_fake_counts_and_records_before_it_raises(self) -> None:
-        tree = ast.parse(Path(__file__).read_text())
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
         counted = [
             node
             for node in ast.walk(tree)
@@ -15945,7 +16116,7 @@ class TestPlatformGuards:
 
     def test_the_tripwire_sources_never_invent_an_api(self) -> None:
         """No ``raising=False`` patch of an ``os`` attribute, anywhere in the gate module."""
-        tree = ast.parse(Path(__file__).read_text())
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
         offenders = [
             ast.unparse(call)
             for call in ast.walk(tree)
@@ -16051,7 +16222,7 @@ class TestPlatformGuards:
     @staticmethod
     def literal_arm_sites(function: str) -> list[tuple[str, str]]:
         """``(owner expression, attribute)`` of every literal ``arm(...)`` call in a helper."""
-        fn = module_level_functions(ast.parse(Path(__file__).read_text()))[function]
+        fn = module_level_functions(ast.parse(Path(__file__).read_text(encoding="utf-8")))[function]
         return [
             (ast.unparse(call.args[0]), ast.literal_eval(call.args[1]))
             for call in ast.walk(fn)
@@ -16537,10 +16708,10 @@ class TestOfficialSequence:
         with raises_outcome(O.QUOTA_CEILING_EXCEEDED):
             quota.begin_attempt()
         assert lm._CASE_ALT == "L0|L1" and lm._CASE_RE == "L0|L1"
-        assert 'lm._CASE_ALT: Final = "L0|L1"' not in LIVE_MODULE.read_text()
+        assert 'lm._CASE_ALT: Final = "L0|L1"' not in LIVE_MODULE.read_text(encoding="utf-8")
 
     def test_the_case_alternation_literal_is_in_the_source(self) -> None:
-        assert '_CASE_ALT: Final = "L0|L1"' in LIVE_MODULE.read_text()
+        assert '_CASE_ALT: Final = "L0|L1"' in LIVE_MODULE.read_text(encoding="utf-8")
 
     @pytest.mark.usefixtures("gates_on")
     def test_a_passing_session_calls_each_adapter_once_for_l1_only(self, tmp_path: Path) -> None:
@@ -16595,7 +16766,7 @@ class TestOfficialSequence:
         for record in result.evidence:
             if record.get("case") in {"L0", "L1"}:
                 assert not record.get("env_names_set")
-        text = LIVE_MODULE.read_text()
+        text = LIVE_MODULE.read_text(encoding="utf-8")
         assert (
             "receive_response" not in text
             and "ANTHROPIC_API_KEY" not in text.replace("ANTHROPIC_API_KEY", "", 0)
@@ -16604,7 +16775,7 @@ class TestOfficialSequence:
         assert "setenv" not in text and ".setenv(" not in text
 
     def test_the_live_module_has_no_retired_name_or_literal(self) -> None:
-        assert retired_machinery_problems(LIVE_MODULE.read_text()) == []
+        assert retired_machinery_problems(LIVE_MODULE.read_text(encoding="utf-8")) == []
 
     @pytest.mark.parametrize(
         "extra",
@@ -16621,7 +16792,9 @@ class TestOfficialSequence:
         ],
     )
     def test_retired_name_controls(self, extra: str) -> None:
-        assert retired_machinery_problems(LIVE_MODULE.read_text() + "\n" + extra) != []
+        assert (
+            retired_machinery_problems(LIVE_MODULE.read_text(encoding="utf-8") + "\n" + extra) != []
+        )
 
     def test_exactly_two_live_tests_and_the_pinned_log_classes(self) -> None:
         tree = module_ast()
@@ -16640,7 +16813,7 @@ class TestOfficialSequence:
         assert not handler.decorator_list and not handler.keywords
 
     def test_no_other_logging_implementation(self) -> None:
-        assert logging_implementation_problems(LIVE_MODULE.read_text()) == []
+        assert logging_implementation_problems(LIVE_MODULE.read_text(encoding="utf-8")) == []
 
     @pytest.mark.parametrize(
         "extra",
@@ -16653,7 +16826,10 @@ class TestOfficialSequence:
         ],
     )
     def test_logging_controls(self, extra: str) -> None:
-        assert logging_implementation_problems(LIVE_MODULE.read_text() + "\n" + extra) != []
+        assert (
+            logging_implementation_problems(LIVE_MODULE.read_text(encoding="utf-8") + "\n" + extra)
+            != []
+        )
 
 
 # ============================================================================
@@ -17055,7 +17231,7 @@ class TestNoRetroactiveAcceptance:
         assert len(lm.REASON_CODES) == 20 == len(set(lm.REASON_CODES))
 
     def test_the_documents_state_the_retained_records_are_never_promoted(self) -> None:
-        for text in (RUNBOOK_PATH.read_text(), lm.__doc__ or ""):
+        for text in (RUNBOOK_PATH.read_text(encoding="utf-8"), lm.__doc__ or ""):
             flat = normalized(text)
             assert "never reclassified" in flat
             assert (
@@ -17063,7 +17239,9 @@ class TestNoRetroactiveAcceptance:
                 or "never passed to the classifier or the shell gate (whose" in flat
             )
             assert "never promoted" in flat
-        assert "calls any of them a pass or a partial pass" in normalized(RUNBOOK_PATH.read_text())
+        assert "calls any of them a pass or a partial pass" in normalized(
+            RUNBOOK_PATH.read_text(encoding="utf-8")
+        )
 
 
 # ============================================================================
@@ -17125,10 +17303,10 @@ def status_table_rows(text: str) -> list[list[str]]:
 
 def user_facing_texts() -> dict[str, str]:
     return {
-        "runbook": RUNBOOK_PATH.read_text(),
-        "experimental": EXPERIMENTAL_PATH.read_text(),
-        "example": EXAMPLE_FILE.read_text(),
-        "changelog": CHANGELOG_FRAGMENT.read_text(),
+        "runbook": RUNBOOK_PATH.read_text(encoding="utf-8"),
+        "experimental": EXPERIMENTAL_PATH.read_text(encoding="utf-8"),
+        "example": EXAMPLE_FILE.read_text(encoding="utf-8"),
+        "changelog": CHANGELOG_FRAGMENT.read_text(encoding="utf-8"),
         "docstring": lm.__doc__ or "",
     }
 
@@ -17137,7 +17315,7 @@ class TestClaimsAndDocs:
     """H62: the four claims and nothing stronger, in every user-facing file."""
 
     def test_the_runbook_states_the_four_claims_and_the_literal_sentence(self) -> None:
-        flat = normalized(RUNBOOK_PATH.read_text())
+        flat = normalized(RUNBOOK_PATH.read_text(encoding="utf-8"))
         assert normalized(PRECEDENCE_SENTENCE) in flat
         for claim in (
             "readiness reports a usable first-party subscription login",
@@ -17148,7 +17326,7 @@ class TestClaimsAndDocs:
             assert claim in flat, claim
 
     def test_the_status_table_reads_as_the_design_says(self) -> None:
-        rows = {r[0]: r for r in status_table_rows(RUNBOOK_PATH.read_text())}
+        rows = {r[0]: r for r in status_table_rows(RUNBOOK_PATH.read_text(encoding="utf-8"))}
         assert rows["`auto` + API key ⇒ `metered_api`"][3] == "out of scope"
         assert "unproven" in rows["`auto` + API key ⇒ `metered_api`"][4]
         assert rows["`auth_mode` resolution and env blanking"][3].startswith("not applicable")
@@ -17169,13 +17347,13 @@ class TestClaimsAndDocs:
             assert not re.search(token, text), (name, token)
 
     def test_experimental_md_holds_the_post_evidence_clause_only(self) -> None:
-        flat = normalized(EXPERIMENTAL_PATH.read_text())
+        flat = normalized(EXPERIMENTAL_PATH.read_text(encoding="utf-8"))
         assert normalized(POST_EVIDENCE_CLAUSE) in flat
         assert normalized(EXPERIMENTAL_VALIDATION_CLAUSE) not in flat
         assert "has not yet been validated against a live" not in flat
 
     def test_workflow_syntax_md_agrees_with_the_post_evidence_state(self) -> None:
-        flat = normalized(WORKFLOW_SYNTAX_PATH.read_text())
+        flat = normalized(WORKFLOW_SYNTAX_PATH.read_text(encoding="utf-8"))
         assert normalized(WORKFLOW_SYNTAX_POST_EVIDENCE_CLAUSE) in flat
         assert "has not yet been validated against a live" not in flat
 
@@ -17185,7 +17363,7 @@ class TestClaimsAndDocs:
     def public_texts() -> dict[str, str]:
         return {
             **user_facing_texts(),
-            "workflow_syntax": WORKFLOW_SYNTAX_PATH.read_text(),
+            "workflow_syntax": WORKFLOW_SYNTAX_PATH.read_text(encoding="utf-8"),
         }
 
     @pytest.mark.parametrize(
@@ -17205,7 +17383,7 @@ class TestClaimsAndDocs:
     def test_the_runbook_states_the_provisional_observation_and_what_revalidation_needs(
         self,
     ) -> None:
-        flat = normalized(RUNBOOK_PATH.read_text())
+        flat = normalized(RUNBOOK_PATH.read_text(encoding="utf-8"))
         for fragment in (
             "A prior readiness-plus-inference run observed a first-party subscription login",
             "provisional, not official evidence",
@@ -17232,7 +17410,7 @@ class TestClaimsAndDocs:
             assert word not in window, word
 
     def test_billing_documentation_matches_the_derivation(self) -> None:
-        text = normalized(RUNBOOK_PATH.read_text())
+        text = normalized(RUNBOOK_PATH.read_text(encoding="utf-8"))
         assert "an inherited value forces the billing source to `unknown`" in text
         assert "Custom headers and proxy variables" in text
         assert "billing derivation does not inspect them" in text
@@ -17246,20 +17424,23 @@ class TestClaimsAndDocs:
         assert guaranteed.findall(flat) == [], name
 
     def test_an_attempt_is_one_inference_capable_workflow_not_one_model_request(self) -> None:
-        flat = normalized(RUNBOOK_PATH.read_text())
+        flat = normalized(RUNBOOK_PATH.read_text(encoding="utf-8"))
         assert "one inference-capable workflow run" in flat
         assert "not one guaranteed model request" in flat
         assert "several SDK turns and internal model requests" in flat
         assert "those are not counted" in flat
         assert "`max_agent_iterations` is not set to 1" in flat
-        example = normalized(EXAMPLE_FILE.read_text())
+        example = normalized(EXAMPLE_FILE.read_text(encoding="utf-8"))
         assert "one inference-capable workflow attempt" in example
         assert "internal model requests" in example
-        assert "max_agent_iterations" not in EXAMPLE_FILE.read_text().split("workflow:", 1)[1]
+        assert (
+            "max_agent_iterations"
+            not in EXAMPLE_FILE.read_text(encoding="utf-8").split("workflow:", 1)[1]
+        )
         assert "not one guaranteed model request" in normalized(lm.__doc__ or "")
 
     def test_the_runbook_documents_the_fail_closed_gate_and_the_truthful_disposal(self) -> None:
-        flat = normalized(RUNBOOK_PATH.read_text())
+        flat = normalized(RUNBOOK_PATH.read_text(encoding="utf-8"))
         for fragment in (
             "or when the environment cannot be listed or checked",
             "a failing `env` or `grep` is never read as a clean result",
@@ -17270,7 +17451,7 @@ class TestClaimsAndDocs:
             assert fragment in flat, fragment
 
     def test_the_runbook_contains_the_literal_approval_sentence(self) -> None:
-        flat = normalized(RUNBOOK_PATH.read_text())
+        flat = normalized(RUNBOOK_PATH.read_text(encoding="utf-8"))
         assert normalized(APPROVAL_SENTENCE) in flat
         for fragment in (
             "repeating the readiness-only check",
@@ -17281,7 +17462,7 @@ class TestClaimsAndDocs:
             assert fragment in flat or fragment.capitalize() in flat, fragment
 
     def test_the_runbook_procedure_wording(self) -> None:
-        text = RUNBOOK_PATH.read_text()
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
         flat = normalized(text)
         assert normalized(NOTHING_PUSHED_SENTENCE) in flat
         assert "After a failure record, nothing is pushed" not in flat  # the revision-17 form
@@ -17535,7 +17716,7 @@ class TestDecisionTableOracle:
                         assert len(oracle_rows(ctx)) == 1, ctx
 
     def test_the_runbook_reproduces_each_row_identifier_predicate_and_token_in_order(self) -> None:
-        text = RUNBOOK_PATH.read_text()
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
         table = text.split("### Reading an official run", 1)[1]
         rows = [
             [c.strip() for c in line.strip().strip("|").split("|")]
@@ -17674,7 +17855,7 @@ class TestEvidenceCellPins:
         assert RETIRED_VALIDATED_CELL not in {PROVISIONAL_CELL, *LIVE_PROVEN_CELLS.values()}
 
     def test_the_real_runbook_matches_the_pins(self) -> None:
-        text = RUNBOOK_PATH.read_text()
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
         assert evidence_cell_problems(text, LIVE_PROVEN_CELLS, RUNBOOK_STATUS_STATEMENT) == []
         flat = normalized(text)
         assert (
@@ -17685,7 +17866,7 @@ class TestEvidenceCellPins:
 
     def test_the_post_evidence_state_is_checked_exactly(self) -> None:
         """The checked-in runbook itself is in the post-evidence state, and drift is reported."""
-        text = RUNBOOK_PATH.read_text()
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
         validated = dict.fromkeys(LIVE_PROVEN_CELLS, PROVISIONAL_CELL)
         assert evidence_cell_problems(text, validated, RUNBOOK_STATUS_STATEMENT) == []
         # the checker reads its argument: each departure of the real text from the pins is reported
@@ -17702,7 +17883,7 @@ class TestEvidenceCellPins:
         assert "No passing official evidence exists" not in normalized(text)
 
     def test_the_checker_catches_each_drift(self) -> None:
-        text = RUNBOOK_PATH.read_text()
+        text = RUNBOOK_PATH.read_text(encoding="utf-8")
         cells = dict(LIVE_PROVEN_CELLS)
         first = next(iter(cells))
         assert evidence_cell_problems(text, cells, RUNBOOK_STATUS_STATEMENT) == []
@@ -17728,7 +17909,7 @@ class TestEvidenceCellPins:
         assert evidence_cell_problems("\n".join(lines), cells, RUNBOOK_STATUS_STATEMENT)
 
     def test_no_other_literal_holds_a_state_dependent_value(self) -> None:
-        source = Path(__file__).read_text()
+        source = Path(__file__).read_text(encoding="utf-8")
         assert source.count("*not " + "yet*") == 1  # only ``NOT_YET_CELL``
         assert source.count("No passing official evidence exists " + "yet") == 0  # retired
 
@@ -17819,7 +18000,7 @@ class TestGateModuleBoundary:
     """H66: retired names absent, literal tables, scope shapes and the standalone controls."""
 
     def tree(self) -> ast.Module:
-        return ast.parse(Path(__file__).read_text())
+        return ast.parse(Path(__file__).read_text(encoding="utf-8"))
 
     def test_no_retired_class_name_or_reference(self) -> None:
         tree = self.tree()
@@ -17904,7 +18085,7 @@ class TestGateModuleBoundary:
         assert len(INJECTED_CALLABLE_CALLS) == 30
         assert not [p for p in INJECTED_CALLABLE_CALLS if p[0] == "probe_readiness.preflight"]
         assert PENDING_DRAIN_TIMEOUT_S == 1.0 and CONTROL_TIMEOUT_S == 10.0
-        source = Path(__file__).read_text()
+        source = Path(__file__).read_text(encoding="utf-8")
         assert re.search(r"^PENDING_DRAIN_TIMEOUT_S = 1\.0$", source, flags=re.MULTILINE)
         assert re.search(r"^CONTROL_TIMEOUT_S = 10\.0$", source, flags=re.MULTILINE)
 
@@ -17945,12 +18126,12 @@ class TestGateModuleBoundary:
         )
 
     def test_every_raise_is_preceded_by_a_record(self) -> None:
-        assert raise_ordering_problems(Path(__file__).read_text()) == []
+        assert raise_ordering_problems(Path(__file__).read_text(encoding="utf-8")) == []
         scratch = "def f(violations):\n    raise CountingFakeViolation()\n"
         assert raise_ordering_problems(scratch) != []
 
     def test_every_scope_body_has_one_of_the_two_await_forms(self) -> None:
-        assert scope_shape_problems(Path(__file__).read_text()) == []
+        assert scope_shape_problems(Path(__file__).read_text(encoding="utf-8")) == []
         template = "async def f(v):\n    async with scoped_tripwires(v):\n{body}\n"
         good = ("        await call()", "        observation = await call()")
         for body in good:
@@ -18047,7 +18228,7 @@ class TestGateModuleBoundary:
 
 def fixture_closure(test: Callable[..., Any]) -> set[str]:
     """The transitive set of fixture names a test requests, through this module's fixtures."""
-    tree = ast.parse(Path(__file__).read_text())
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
     fixtures: dict[str, list[str]] = {}
     for node in tree.body:
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and any(
@@ -18202,7 +18383,7 @@ def sdk_logger_source_facts() -> tuple[bool, str]:
         isinstance(node, ast.Assign)
         and [t.id for t in node.targets if isinstance(t, ast.Name)] == ["logger"]
         and ast.unparse(node.value) == "logging.getLogger(__name__)"
-        for node in ast.parse(source.read_text()).body
+        for node in ast.parse(source.read_text(encoding="utf-8")).body
     )
     return bound, dotted
 
@@ -18220,7 +18401,7 @@ class TestRealSdkLoggerIsCaught:
         assert SDK_CHILD_LOGGER.startswith(SDK_PARENT_LOGGER + ".")
 
     def test_no_dotted_module_name_is_given_to_find_spec(self) -> None:
-        tree = ast.parse(Path(__file__).read_text())
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -18380,7 +18561,7 @@ class TestV7ReadingPin:
     """V7 is the neutral reading, never a dirty-tree-only one."""
 
     def test_the_v7_reading_names_every_non_case_condition_and_presumes_no_cause(self) -> None:
-        table = RUNBOOK_PATH.read_text().split("### Reading an official run", 1)[1]
+        table = RUNBOOK_PATH.read_text(encoding="utf-8").split("### Reading an official run", 1)[1]
         line = next(ln for ln in table.splitlines() if ln.startswith("| **V7**"))
         reading = normalized([c.strip() for c in line.strip().strip("|").split("|")][2])
         for needed in (
@@ -18391,3 +18572,347 @@ class TestV7ReadingPin:
             "no cause is presumed",
         ):
             assert needed in reading, needed
+
+
+# ============================================================================
+# Windows corrections: socketpair, UTF-8, child home, absolute paths
+# ============================================================================
+
+# ``socket.socketpair`` as CPython's own pure-Python (Windows) fallback builds it: a loopback
+# ``connect``.  Installed before the tripwires arm, so the guard wraps this one.
+WINDOWS_SOCKETPAIR = """
+import socket
+
+
+def windows_socketpair(family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
+    lsock = socket.socket(family, type, proto)
+    try:
+        lsock.bind(("127.0.0.1", 0))
+        lsock.listen()
+        csock = socket.socket(family, type, proto)
+        try:
+            csock.connect(lsock.getsockname())
+            ssock, _ = lsock.accept()
+        except BaseException:
+            csock.close()
+            raise
+    finally:
+        lsock.close()
+    return ssock, csock
+"""
+
+TRIPWIRE_SOCKETPAIR_SCRIPT = (
+    WINDOWS_SOCKETPAIR
+    + """
+import asyncio
+import os
+import sys
+
+REAL_PAIR = socket.socketpair
+REAL_CONNECT = socket.socket.connect
+socket.socketpair = windows_socketpair
+sys.path.insert(0, os.getcwd())
+import tripwires
+
+GUARDED = socket.socketpair is not windows_socketpair
+if sys.argv[1] == "unguarded":  # control: the same Windows-shaped pair without the guard
+    socket.socketpair = windows_socketpair
+outcome = []
+try:
+    asyncio.new_event_loop().close()
+    outcome.append("loop-ok")
+except AssertionError as exc:
+    outcome.append("loop-blocked:" + str(exc))
+try:
+    socket.socket().connect(("127.0.0.1", 9))
+    outcome.append("connect-allowed")
+except AssertionError as exc:
+    outcome.append("connect-blocked:" + str(exc))
+print("|".join(outcome), GUARDED, socket.socket.connect is not REAL_CONNECT)
+tripwires.pytest_sessionfinish(None, 0)
+print(socket.socketpair is windows_socketpair, socket.socket.connect is REAL_CONNECT)
+"""
+)
+
+NON_ASCII = "caf\u00e9 \u2014 \u2713 \u65e5\u672c"
+
+
+class TestWindowsSocketpairGuard:
+    def run_script(self, tmp_path: Path, mode: str) -> list[str]:
+        (tmp_path / "tripwires.py").write_text(LAYER1_PLUGIN, encoding="utf-8")
+        script = tmp_path / "script.py"
+        script.write_text(TRIPWIRE_SOCKETPAIR_SCRIPT, encoding="utf-8")
+        env = {**windows_base_env(sys.platform, os.environ), "PYTHONDONTWRITEBYTECODE": "1"}
+        done = subprocess.run(  # noqa: S603 - the existing interpreter on a scratch script
+            [sys.executable, "-I", str(script), mode],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+            check=False,
+        )
+        assert done.returncode == 0, done.stderr
+        return done.stdout.splitlines()
+
+    def test_event_loop_creation_works_but_a_direct_connect_still_fails(
+        self, tmp_path: Path
+    ) -> None:
+        first, restored = self.run_script(tmp_path, "guarded")
+        assert first == "loop-ok|connect-blocked:tripwire: socket.connect True True"
+        assert restored == "True True"  # socketpair and connect both put back at session finish
+        assert (tmp_path / "tripwire_hits.txt").read_text(encoding="utf-8").split() == [
+            "socket.connect"  # the one direct connect; the socketpair's own is not a hit
+        ]
+
+    def test_without_the_guard_the_windows_shaped_socketpair_is_blocked(
+        self, tmp_path: Path
+    ) -> None:
+        first, _ = self.run_script(tmp_path, "unguarded")
+        assert first.startswith("loop-blocked:tripwire: socket.connect|connect-blocked")
+
+    def test_the_boundary_helper_stands_down_only_inside_socketpair(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import socket
+
+        namespace: dict[str, Any] = {}
+        exec(WINDOWS_SOCKETPAIR, namespace)  # noqa: S102 - a fixed literal defined above
+        monkeypatch.setattr(socket, "socketpair", namespace["windows_socketpair"])
+        hits = armed_boundaries(monkeypatch)
+        asyncio.new_event_loop().close()  # creates the self-pipe through the guarded socketpair
+        assert hits == []
+        with pytest.raises(AssertionError, match="tripwire: socket.connect"):
+            socket.socket().connect(("127.0.0.1", 9))
+        assert hits == ["socket.connect"]
+        with pytest.raises(AssertionError, match="tripwire: socket.connect"):
+            socket.socket.connect(socket.socket(), ("127.0.0.1", 9))  # still armed after the pair
+
+
+class TestExplicitUtf8:
+    """Repository text is read and written as UTF-8, never as the platform's default codec."""
+
+    FILES = (Path(__file__), LIVE_MODULE)
+
+    @staticmethod
+    def untyped_text_io(source: str) -> list[int]:
+        found = []
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name not in ("read_text", "write_text", "open"):
+                continue
+            mode = next((k.value for k in node.keywords if k.arg == "mode"), None)
+            if name == "open" and len(node.args) > 1:
+                mode = node.args[1]
+            binary = isinstance(mode, ast.Constant) and "b" in str(mode.value)
+            if not binary and not any(k.arg == "encoding" for k in node.keywords):
+                found.append(node.lineno)
+        return found
+
+    @pytest.mark.parametrize("path", FILES, ids=lambda p: p.name)
+    def test_every_text_read_write_and_open_names_the_encoding(self, path: Path) -> None:
+        assert self.untyped_text_io(path.read_text(encoding="utf-8")) == []
+
+    def test_generated_scratch_sources_name_the_encoding(self) -> None:
+        for source in (LAYER1_PLUGIN, SEAM_PLUGIN):
+            assert self.untyped_text_io(source) == []
+
+    def test_the_check_is_load_bearing(self) -> None:
+        assert self.untyped_text_io("p.read_text()\np.write_text('x')\nopen(p)\nopen(p, 'w')") == [
+            1,
+            2,
+            3,
+            4,
+        ]
+        assert self.untyped_text_io("open(p, 'rb')\nopen(p, encoding='utf-8')") == []
+
+    def test_non_ascii_content_is_read_independently_of_the_platform_codec(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "doc.md"
+        target.write_text(NON_ASCII, encoding="utf-8")
+        script = (
+            "import locale, pathlib, sys\n"
+            "p = pathlib.Path(sys.argv[1])\n"
+            "default = locale.getpreferredencoding(False)\n"
+            "try:\n"
+            "    p.read_text()\n"
+            "    print('default-read-ok')\n"
+            "except UnicodeDecodeError:\n"
+            "    print('default-read-fails')\n"
+            "print(p.read_text(encoding='utf-8'))\n"
+        )
+        env = {
+            **windows_base_env(sys.platform, os.environ),
+            "PYTHONUTF8": "0",
+            "PYTHONCOERCECLOCALE": "0",
+            "PYTHONIOENCODING": "utf-8",
+            "LC_ALL": "C",
+        }
+        done = subprocess.run(  # noqa: S603 - the existing interpreter on a fixed script
+            [sys.executable, "-c", script, str(target)],
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+            check=False,
+        )
+        assert done.returncode == 0, done.stderr
+        lines = done.stdout.splitlines()
+        if lines[0] == "default-read-ok":  # a codec that happens to decode it (a UTF-8 default)
+            pytest.skip("this platform's default codec already decodes UTF-8")
+        assert lines == ["default-read-fails", NON_ASCII]
+
+
+class TestWindowsChildIsolation:
+    @pytest.fixture
+    def win(self, scratch: Sandbox) -> Sandbox:
+        scratch.platform = "win32"
+        return scratch
+
+    def test_a_windows_child_gets_userprofile_equal_to_the_isolated_home(
+        self, win: Sandbox
+    ) -> None:
+        env = win.child_environment()
+        assert env["USERPROFILE"] == env["HOME"]
+        assert Path(env["HOME"]).resolve().is_relative_to(win.pytester.path.resolve())
+
+    def test_a_posix_child_gets_no_userprofile(self, scratch: Sandbox) -> None:
+        scratch.platform = "linux"
+        assert "USERPROFILE" not in scratch.child_environment()
+        assert home_environment("darwin", Path("/h")) == {"HOME": str(Path("/h"))}
+
+    def test_assert_isolated_rejects_a_missing_or_foreign_userprofile(
+        self, win: Sandbox, tmp_path: Path
+    ) -> None:
+        env = win.child_environment()
+        win.assert_isolated(env)
+        without = {k: v for k, v in env.items() if k != "USERPROFILE"}
+        with pytest.raises(AssertionError, match="USERPROFILE"):
+            win.assert_isolated(without)
+        with pytest.raises(AssertionError, match="USERPROFILE"):
+            win.assert_isolated({**env, "USERPROFILE": str(tmp_path)})
+        win.platform = "linux"  # the rule is Windows-only
+        win.assert_isolated(without)
+
+    def test_the_sandbox_home_is_what_path_home_returns_in_the_child(
+        self, scratch: Sandbox, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = scratch.child_environment()
+        for name in ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("HOME", env["HOME"])
+        if sys.platform == "win32":
+            monkeypatch.setenv("USERPROFILE", env["USERPROFILE"])
+        assert Path.home().resolve() == Path(env["HOME"]).resolve()
+
+    def test_the_other_child_builder_carries_userprofile_on_windows(self, tmp_path: Path) -> None:
+        env = ClassC(tmp_path).environment()
+        assert ("USERPROFILE" in env) is (sys.platform == "win32")
+        if sys.platform == "win32":
+            assert env["USERPROFILE"] == env["HOME"]
+
+
+class TestPlatformCorrectAbsolutePaths:
+    @pytest.mark.parametrize(
+        ("platform", "value", "expected"),
+        [
+            ("win32", "C:\\Users\\planted", True),
+            ("win32", "D:/data", True),
+            ("win32", "\\\\server\\share\\x", True),
+            ("win32", "relative\\x", False),
+            ("win32", "C:drive-relative", False),
+            ("linux", "/Users/planted", True),
+            ("darwin", "/tmp", True),
+            ("linux", "relative/x", False),
+            ("linux", "C:\\Users\\planted", False),
+        ],
+    )
+    def test_detection_follows_the_platform_syntax(
+        self, platform: str, value: str, expected: bool
+    ) -> None:
+        assert is_absolute_for(platform, value) is expected
+
+    @pytest.mark.parametrize(
+        ("platform", "value", "expected"),
+        [
+            ("win32", "/Users/planted", True),  # rooted, no drive: the current drive's root
+            ("win32", "\\Windows", True),
+            ("win32", "C:\\Users\\x", True),
+            ("win32", "\\\\server\\share\\x", True),
+            ("win32", "relative\\x", False),
+            ("win32", "C:drive-relative", False),
+            ("linux", "\\Windows", False),  # not rooted in POSIX syntax
+            ("linux", "/Users/planted", True),
+        ],
+    )
+    def test_rootedness_follows_the_platform_syntax(
+        self, platform: str, value: str, expected: bool
+    ) -> None:
+        assert is_rooted_for(platform, value) is expected
+
+    def test_a_unc_path_is_judged_lexically_and_never_resolved(
+        self, scratch: Sandbox, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scratch.platform = "win32"
+        env = scratch.child_environment()
+        root = scratch.pytester.path.resolve()
+
+        real_resolve = Path.resolve
+
+        def resolving(self: Path, *args: Any, **kwargs: Any) -> Path:
+            if "server" in str(self):
+                raise RuntimeError(f"resolve() called on {self}")  # a network lookup on Windows
+            return real_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", resolving)
+        assert inside_root("win32", "\\\\server\\share\\x", root) is False
+        with pytest.raises(AssertionError, match="PLANTED_DIR"):
+            scratch.assert_isolated({**env, "PLANTED_DIR": "\\\\server\\share\\x"})
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "C:\\Users\\planted",
+            "D:/data",
+            "\\\\server\\share\\x",
+            "/Users/planted",
+            "\\Windows",
+        ],
+    )
+    def test_an_absolute_windows_path_outside_the_sandbox_is_rejected(
+        self, scratch: Sandbox, value: str
+    ) -> None:
+        scratch.platform = "win32"
+        env = scratch.child_environment()
+        with pytest.raises(AssertionError, match="PLANTED_DIR"):
+            scratch.assert_isolated({**env, "PLANTED_DIR": value})
+        scratch.assert_isolated({**env, "PLANTED_DIR": "relative\\inside"})  # not absolute
+
+    def test_windows_systemroot_is_the_only_named_exemption(
+        self, scratch: Sandbox, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scratch.platform = "win32"
+        env = scratch.child_environment()
+        monkeypatch.setenv("SYSTEMROOT", "C:\\Windows")
+        scratch.assert_isolated({**env, "SYSTEMROOT": "C:\\Windows"})
+        with pytest.raises(AssertionError, match="SYSTEMROOT"):  # only the inherited value
+            scratch.assert_isolated({**env, "SYSTEMROOT": "C:\\planted"})
+        with pytest.raises(AssertionError, match="WINDIR"):
+            scratch.assert_isolated({**env, "WINDIR": "C:\\Windows"})
+
+    @pytest.mark.parametrize("value", ["/Users/planted", "/etc", "/"])
+    def test_an_absolute_posix_path_outside_the_sandbox_is_still_rejected(
+        self, scratch: Sandbox, value: str
+    ) -> None:
+        scratch.platform = "linux"
+        env = scratch.child_environment()
+        with pytest.raises(AssertionError, match="PLANTED_DIR"):
+            scratch.assert_isolated({**env, "PLANTED_DIR": value})
+        inside = str(scratch.pytester.path / "_sbx" / "tmp")
+        scratch.assert_isolated({**env, "PLANTED_DIR": inside})
